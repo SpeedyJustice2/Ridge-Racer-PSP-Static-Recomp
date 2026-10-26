@@ -23,7 +23,7 @@ robocopy "%SRC%\online" "%PUB%\online" /E /XD node_modules .wrangler /NFL /NDL /
 if exist "%SRC%\github-meta" robocopy "%SRC%\github-meta" "%PUB%\.github" /E /NFL /NDL /NJH /NJS >nul
 robocopy "%SRC%\tests" "%PUB%\tests" *.cpp synthetic_* /NFL /NDL /NJH /NJS >nul
 robocopy "%SRC%\profiles\ridgeracer" "%PUB%\profiles\ridgeracer" /E /XD build generated game analysis captures progress /NFL /NDL /NJH /NJS >nul
-for %%F in (CMakeLists.txt build.ps1 build-web.ps1 build-web.cmd build-web.sh installer.ps1 "Install Ridge Racer.cmd" make-release.cmd make-source-zip.cmd publish-github.cmd sign-release.example.cmd test-in-sandbox.cmd build-unix.sh build-linux.sh LICENSE .gitignore README-BETA.md) do if exist "%SRC%\%%~F" copy /Y "%SRC%\%%~F" "%PUB%\" >nul
+for %%F in (CMakeLists.txt build.ps1 build-web.ps1 build-web.cmd build-web.sh installer.ps1 "Install Ridge Racer.cmd" make-release.cmd make-source-zip.cmd publish-github.cmd sign-release.example.cmd test-in-sandbox.cmd LICENSE .gitignore README-BETA.md) do if exist "%SRC%\%%~F" copy /Y "%SRC%\%%~F" "%PUB%\" >nul
 copy /Y "%SRC%\README-GITHUB.md" "%PUB%\README.md" >nul
 
 echo == Safety check (game data, keys, generated code, large binaries)

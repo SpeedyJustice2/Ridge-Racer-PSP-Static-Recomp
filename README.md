@@ -2,7 +2,7 @@
 
 A native PC port of Ridge Racer (PSP), made by statically recompiling the game's own code. You build it on your own computer from **your own, legally obtained copy** of the game.
 
-> **Beta.** Windows is the main target. Linux builds and boots; macOS is untested. Not affiliated with or endorsed by the game's publisher.
+> **Beta.** Windows only for now. Not affiliated with or endorsed by the game's publisher.
 
 **This repository contains no game files, no keys, no decryption code and no generated game code.** You need your own copy of the game; the setup tool turns it into a PC program on your machine.
 
@@ -26,14 +26,6 @@ A native PC port of Ridge Racer (PSP), made by statically recompiling the game's
 ### Your game copy must be decrypted
 The port reads the game's executable (`PSP_GAME/SYSDIR/BOOT.BIN`). It must be the decrypted form (it starts with `ELF`); an encrypted one (starts with `~PSP`) is rejected with a clear message. This project does not provide, link to or explain any way of dumping or decrypting a game; that is up to you. No decryption tools or keys are provided here.
 
-## Linux and macOS (experimental)
-Needs a C++20 compiler, CMake, Ninja and SDL2 (`sudo apt install build-essential cmake ninja-build libsdl2-dev`, or `brew install cmake ninja sdl2` on macOS).
-
-    ./build-unix.sh /path/to/RidgeRacer.iso
-    ./RidgeRacer-Unix/RidgeRacerNative
-
-There is no settings window on these platforms (edit `ridgeracer.ini`).
-
 ## Controls
 | Action | Keyboard | Controller |
 |---|---|---|
@@ -55,7 +47,6 @@ Car LOD pop-in, some intro camera shots and Time Attack on some tracks are not f
 - Windows: `build.ps1 -Game <iso or BOOT.BIN>` (uses the zig/clang compiler in `toolchain\zig`). `make-release.cmd` builds `Setup.exe`.
 - Browser build (local use only, never host it: it contains code translated from your game): `build-web.ps1`, then `web-dist\serve.cmd`.
 - Online room service (server list and relay): `online/worker` (Cloudflare Worker).
-- Linux/macOS: `build-unix.sh` as above.
 
 ## Project status and contributions
 This is a hobby project that is not actively maintained. Fixes and updates may come, but there is no schedule and no promise. **Pull requests and code suggestions will most likely not be reviewed or merged.** You are free to copy, fork and change it under the licence below (GPL v2 or later); a fork of your own is the best way to get your changes. Bug reports are welcome (use the bug report zip from the game, see above), but they may not get a reply.
