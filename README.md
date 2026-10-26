@@ -23,6 +23,8 @@ A native PC port of Ridge Racer (PSP), made by statically recompiling the game's
 3. Pick where to install it (any drive). Setup builds the game in the background; this can take 20 minutes or more on the first install and needs no other downloads.
 4. Press *Finish*. A settings window opens on the first start.
 
+`README-BETA.md` in this repository is the player's guide (install, controls, bug reports). Setup copies it into the game folder as `README.txt`.
+
 ### Your game copy must be decrypted
 The port reads the game's executable (`PSP_GAME/SYSDIR/BOOT.BIN`). It must be the decrypted form (it starts with `ELF`); an encrypted one (starts with `~PSP`) is rejected with a clear message. This project does not provide, link to or explain any way of dumping or decrypting a game; that is up to you. No decryption tools or keys are provided here.
 
