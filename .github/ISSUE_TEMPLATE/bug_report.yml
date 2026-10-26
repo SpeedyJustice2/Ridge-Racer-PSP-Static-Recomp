@@ -1,0 +1,50 @@
+name: Bug report
+description: Something went wrong in the game, the installer or online play
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. This is a hobby project that is not actively maintained, so there may be no reply or fix.
+        **Anything you attach here is public.** The bug report zip holds logs, settings, crash files and a short PC summary, and these can include folder paths with your Windows user name. Look inside before attaching if that matters to you.
+        The game makes the report for you: Ctrl+F12 in game, the **Bug report...** button in the settings window (hold Shift while starting the game), or automatically after a crash. The zip is on your Desktop (`RidgeRacer-bug-report-<date>.zip`).
+  - type: input
+    id: version
+    attributes:
+      label: Game version
+      description: Written at the top of the bug report.
+      placeholder: beta 1
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What were you doing, and what did you expect to happen instead?
+    validations:
+      required: true
+  - type: input
+    id: where
+    attributes:
+      label: Track, mode and online or not
+      placeholder: "Greenpeak, Grand Prix, online with 3 players"
+  - type: dropdown
+    id: stage
+    attributes:
+      label: When did it happen?
+      options:
+        - Installing (Setup.exe)
+        - Starting the game
+        - Menus
+        - In a race
+        - Online play (lobby, server browser, joining)
+        - Other
+  - type: textarea
+    id: pc
+    attributes:
+      label: Your PC and controller
+      placeholder: "Windows 11, RTX 3060, Xbox controller"
+  - type: textarea
+    id: files
+    attributes:
+      label: Bug report zip
+      description: Drag the zip here to attach it (GitHub allows about 25 MB per file).

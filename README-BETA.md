@@ -5,6 +5,8 @@ A native Windows port of Ridge Racer (PSP), made by statically recompiling the g
 
 This port is not affiliated with or endorsed by Bandai Namco.
 
+AI disclosure: all of this project's code was written by AI (Claude, by Anthropic); the project's owner directed and tested it. It is a beta, so please send bug reports (see below).
+
 ## What you need
 - Windows 10 or 11 (64-bit), a GPU with OpenGL 3.3 or newer
 - Your own **decrypted** disc image of the game (`.iso`), or its `PSP_GAME` folder
