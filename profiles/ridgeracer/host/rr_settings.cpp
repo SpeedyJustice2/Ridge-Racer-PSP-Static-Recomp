@@ -94,7 +94,9 @@ PlayerSettings load_settings(const fs::path &file) {
         else if (k == "window_scale") s.window_scale = to_int(v, s.window_scale, 1, 8);
         else if (k == "fullscreen") s.fullscreen = to_bool(v, s.fullscreen);
         else if (k == "fps") s.fps = v == "monitor" ? 0 : to_int(v, s.fps, 0, 480);
+        else if (k == "frame_skip") s.frame_skip = (v == "auto") ? 0 : to_int(v, s.frame_skip, 0, 4);
         else if (k == "low_latency") s.low_latency = to_bool(v, s.low_latency);
+        else if (k == "smooth_menus") s.smooth_menus = to_bool(v, s.smooth_menus);
         else if (k == "antialiasing") s.aa = v == "off" ? 0 : v == "fxaa" ? 1 : v == "msaa2" ? 2 : v == "msaa4" ? 3 : v == "msaa8" ? 4 : s.aa;
         else if (k == "anisotropic") s.aniso = to_int(v, s.aniso, 1, 16);
         else if (k == "mipmaps") s.mipmaps = to_bool(v, s.mipmaps);
@@ -103,6 +105,12 @@ PlayerSettings load_settings(const fs::path &file) {
         else if (k == "smooth_cutouts") s.smooth_cutouts = to_bool(v, s.smooth_cutouts);
         else if (k == "volume") s.volume = to_int(v, s.volume, 0, 150);
         else if (k == "menu_volume") s.menu_volume = to_int(v, s.menu_volume, 0, 200);
+        else if (k == "button_prompts") s.button_prompts = v == "auto" ? 0 : v == "xbox" ? 1 : v == "playstation" ? 2 : v == "nintendo" ? 3 : v == "keyboard" ? 4 : to_int(v, s.button_prompts, 0, 4);
+        else if (k == "trigger_buttons") s.trigger_buttons = to_bool(v, s.trigger_buttons);
+        else if (k == "online") s.online = to_bool(v, s.online);
+        else if (k == "room_visibility") s.room_visibility = to_int(v, s.room_visibility, 0, 2);
+        else if (k == "room_password") s.room_password = v.substr(0, 32);
+        else if (k == "performance_report") s.perf_report = to_bool(v, s.perf_report);
     }
     return s;
 }
@@ -111,6 +119,7 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
     std::ofstream o(file, std::ios::trunc);
     if (!o) return false;
     static const char *const aa_names[] = {"off", "fxaa", "msaa2", "msaa4", "msaa8"};
+    static const char *const kPromptNames[] = {"auto", "xbox", "playstation", "nintendo", "keyboard"};
     o << "# Ridge Racer settings. Written by the settings window (start the game with Shift held, or with --launcher, to open it).\n"
       << "game_path=" << s.game_path << "\n"
       << "show_launcher=" << (s.show_launcher ? 1 : 0) << "\n"
@@ -120,7 +129,11 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
       << "window_scale=" << s.window_scale << "\n"
       << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n"
       << "fps=" << (s.fps == 0 ? std::string("monitor") : std::to_string(s.fps)) << "\n"
+      << "# frame_skip: 1 = draw every picture; auto = for slow PCs, skip pictures only while the game falls behind real time (game speed stays full); 2 or 3 = always draw only every 2nd / 3rd picture during races\n"
+      << "frame_skip=" << (s.frame_skip == 0 ? std::string("auto") : std::to_string(s.frame_skip)) << "\n"
       << "low_latency=" << (s.low_latency ? 1 : 0) << "\n"
+      << "# smooth_menus: 1 = the menus run at the high frame rate too; 0 = menus at 60 (the race still uses the frame rate above)\n"
+      << "smooth_menus=" << (s.smooth_menus ? 1 : 0) << "\n"
       << "\n[quality]\n"
       << "antialiasing=" << aa_names[std::clamp(s.aa, 0, 4)] << "\n"
       << "anisotropic=" << s.aniso << "\n"
@@ -130,7 +143,21 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
       << "smooth_cutouts=" << (s.smooth_cutouts ? 1 : 0) << "\n"
       << "\n[audio]\n"
       << "volume=" << s.volume << "\n"
-      << "menu_volume=" << s.menu_volume << "\n";
+      << "menu_volume=" << s.menu_volume << "\n"
+      << "\n[controls]\n"
+      << "# button_prompts: which button pictures the game shows: auto (the controller or keyboard you used last), xbox, playstation, nintendo, keyboard\n"
+      << "button_prompts=" << kPromptNames[std::clamp(s.button_prompts, 0, 4)] << "\n"
+      << "# trigger_buttons: 1 = the right trigger accelerates and the left trigger brakes (they act as CROSS and SQUARE)\n"
+      << "trigger_buttons=" << (s.trigger_buttons ? 1 : 0) << "\n"
+      << "\n[network]\n"
+      << "# 1 = Wireless Battle works over the internet (the game then contacts the room list service when you open a room or a search)\n"
+      << "online=" << (s.online ? 1 : 0) << "\n"
+      << "# rooms you host (chosen in the game): room_visibility 0 = anyone can join, 1 = with room_password, 2 = only with the room code\n"
+      << "room_visibility=" << s.room_visibility << "\n"
+      << "room_password=" << s.room_password << "\n"
+      << "\n[diagnostics]\n"
+      << "# 1 = write performance-report.txt next to the game (frame times, CPU and GPU names, power state) - handy when the game runs slowly\n"
+      << "performance_report=" << (s.perf_report ? 1 : 0) << "\n";
     return static_cast<bool>(o);
 }
 
@@ -268,8 +295,17 @@ std::vector<std::string> to_args(const PlayerSettings &s, int monitor_hz) {
     int fps = s.fps == 0 ? monitor_hz : s.fps;
     if (fps < 62) fps = 60;   // 59.94 / 60 Hz monitors: the game's own rate
     fps = std::min(fps, 240);
-    if (fps != 60) { a.push_back("--fps"); a.push_back(std::to_string(fps)); a.push_back("--fps-patch"); a.push_back("car"); }
+    if (fps != 60) { a.push_back("--fps"); a.push_back(std::to_string(fps)); a.push_back("--fps-patch"); a.push_back("car"); a.push_back(s.smooth_menus ? "--menu-native" : "--no-menu-native"); }
+    if (s.frame_skip == 0) { a.push_back("--frame-skip"); a.push_back("auto"); }
+    else { a.push_back("--frame-skip"); a.push_back(std::to_string(std::clamp(s.frame_skip, 1, 4))); }
     a.push_back(s.low_latency ? "--low-latency" : "--no-low-latency");
+    a.push_back(s.online ? "--online" : "--no-online");
+    {
+        static const char *const prompt_names[] = {"auto", "xbox", "playstation", "nintendo", "keyboard"};
+        a.push_back("--button-prompts"); a.push_back(prompt_names[std::clamp(s.button_prompts, 0, 4)]);
+    }
+    a.push_back(s.trigger_buttons ? "--triggers" : "--no-triggers");
+    if (s.perf_report) { a.push_back("--perf-report"); a.push_back((executable_dir() / "performance-report.txt").string()); }
     a.push_back("--volume"); a.push_back(std::to_string(s.volume));
     a.push_back("--menu-volume"); a.push_back(std::to_string(s.menu_volume));
     return a;

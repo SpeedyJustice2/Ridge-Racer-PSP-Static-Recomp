@@ -199,7 +199,7 @@ $txtLog.Font = New-Object System.Drawing.Font("Consolas", 8.5)
 $pages[3].Controls.Add($txtLog)
 
 # page 4: done
-$lblDone = New-Label $pages[4] "" 28 24 624 90
+$lblDone = New-Label $pages[4] "" 28 24 624 104
 $chkShortcut = New-Object System.Windows.Forms.CheckBox
 $chkShortcut.Text = "Create a desktop shortcut"; $chkShortcut.Checked = $true
 $chkShortcut.Location = New-Object System.Drawing.Point(28, 130); $chkShortcut.Size = New-Object System.Drawing.Size(400, 26)
@@ -209,6 +209,7 @@ $chkPlay.Text = "Start Ridge Racer now"; $chkPlay.Checked = $true
 $chkPlay.Location = New-Object System.Drawing.Point(28, 162); $chkPlay.Size = New-Object System.Drawing.Size(400, 26)
 $pages[4].Controls.Add($chkPlay)
 $btnOpen = New-Button $pages[4] "Open install folder" 28 204 170 30
+$btnReadme = New-Button $pages[4] "Read me (controls, bug reports)" 210 204 240 30
 
 # bottom bar
 $bottom = New-Object System.Windows.Forms.Panel
@@ -293,6 +294,10 @@ $btnLog.Add_Click({
   if ($txtLog.Visible) { $btnLog.Text = "Hide details" } else { $btnLog.Text = "Show details" }
 })
 $btnOpen.Add_Click({ if (Test-Path -LiteralPath $script:installDir) { Start-Process explorer.exe -ArgumentList ('"' + $script:installDir + '"') } })
+$btnReadme.Add_Click({
+  $readme = Join-Path $script:installDir "README.txt"
+  if (Test-Path -LiteralPath $readme) { Start-Process notepad.exe -ArgumentList ('"' + $readme + '"') }
+})
 
 # ---- the install
 $stageInfo = @{
@@ -315,6 +320,7 @@ function Start-Install() {
     Show-Message ("The install folder could not be created:`r`n" + $_.Exception.Message) "Error"; Show-Page 2; return
   }
   $script:logPath = Join-Path $script:installDir "install.log"
+  $script:startedAt = Get-Date
   Set-Content -LiteralPath $script:logPath -Value "" -Encoding ASCII
   $script:logPos = 0L; $script:stage = "compiler"; $script:stageFrac = 0.0; $script:fileDone = 0; $script:fileTotal = 0
   $script:sawDone = $false; $script:lastError = ""; $script:phase = "build"; $script:started = Get-Date
@@ -406,7 +412,11 @@ function Finish-Success() {
   $timer.Stop()
   $script:phase = "finished"
   $bar.Value = 1000
-  $lblDone.Text = "Ridge Racer is installed in:`r`n$($script:installDir)`r`n`r`nThe first time you press Play, the game opens its settings window. Your saved games are kept in the 'savedata' folder there."
+  # the beta README next to the game (controls, online play, how to send a bug report), as plain text for Notepad
+  try { Copy-Item -LiteralPath (Join-Path $kit "README-BETA.md") -Destination (Join-Path $script:installDir "README.txt") -Force } catch { }
+  $took = ""
+  if ($script:startedAt) { $mins = ((Get-Date) - $script:startedAt).TotalMinutes; $took = " (took {0:N1} minutes)" -f $mins; Add-Content -LiteralPath $script:logPath -Value ("Install time: {0:N1} minutes" -f $mins) -ErrorAction SilentlyContinue }
+  $lblDone.Text = "Ridge Racer is installed in:`r`n$($script:installDir)$took`r`n`r`nThe first time you press Play, the game opens its settings window. Your saved games are kept in the 'savedata' folder there. Something wrong? Press Ctrl+F12 in the game to make a bug report."
   Show-Page 4
 }
 

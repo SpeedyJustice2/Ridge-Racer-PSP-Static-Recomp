@@ -1,5 +1,6 @@
 // The settings window shown before the game starts (Windows).  Plain Win32 controls, no resource file.
 #include "rr_settings.hpp"
+#include "rr_report.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -27,10 +28,10 @@ namespace fs = std::filesystem;
 
 enum : int {
     kIdPath = 100, kIdBrowse, kIdBrowseIso, kIdStatus,
-    kIdRenderer, kIdRenderScale, kIdWindowScale, kIdFps, kIdFullscreen, kIdLowLatency,
+    kIdRenderer, kIdRenderScale, kIdWindowScale, kIdFps, kIdFullscreen, kIdLowLatency, kIdSmoothMenus,
     kIdAa, kIdAniso, kIdSharpen, kIdHud, kIdMipmaps, kIdCutouts,
     kIdVolume, kIdVolumeText, kIdMenuVolume, kIdMenuVolumeText,
-    kIdShowAtStart, kIdDefaults,
+    kIdShowAtStart, kIdDefaults, kIdPrompts, kIdTriggers, kIdBugReport,
 };
 
 const int kFpsValues[] = {0, 60, 90, 120, 144, 165, 180, 240};
@@ -127,8 +128,9 @@ struct Launcher {
             if (std::find(fps_items.begin(), fps_items.end(), s.fps) == fps_items.end()) { fps_items.push_back(s.fps); v.push_back(std::to_wstring(s.fps)); }
             combo(kIdFps, cx, gy + 120, cw, v);
         }
-        check(kIdFullscreen, L"Fullscreen  (F11 or Alt+Enter in game)", lx, gy + 154, gw - 24);
-        check(kIdLowLatency, L"Low input latency  (may stutter)", lx, gy + 184, gw - 24);
+        check(kIdFullscreen, L"Fullscreen  (F11 or Alt+Enter in game)", lx, gy + 148, gw - 24);
+        check(kIdSmoothMenus, L"Menus at the high frame rate too", lx, gy + 172, gw - 24);
+        check(kIdLowLatency, L"Low input latency  (may stutter)", lx, gy + 196, gw - 24);
 
         // Image quality
         const int qx = 316, qlx = qx + 12, qcx = qx + 128, qcw = gw - 140;
@@ -141,8 +143,8 @@ struct Launcher {
         combo(kIdSharpen, qcx, gy + 88, qcw, {L"Off", L"Mild", L"Medium", L"Strong"});
         label(L"HUD and text", qlx, gy + 120, 112);
         combo(kIdHud, qcx, gy + 120, qcw, {L"Original (soft)", L"Sharper", L"Crispest"});
-        check(kIdMipmaps, L"Mipmaps  (less shimmer in the distance)", qlx, gy + 154, gw - 24);
-        check(kIdCutouts, L"Smooth edges on trees and fences", qlx, gy + 184, gw - 24);
+        check(kIdMipmaps, L"Mipmaps  (less shimmer in the distance)", qlx, gy + 148, gw - 24);
+        check(kIdCutouts, L"Smooth edges on trees and fences", qlx, gy + 172, gw - 24);
 
         // Audio
         const int ay = 328;
@@ -154,10 +156,18 @@ struct Launcher {
         slider(kIdMenuVolume, 136, ay + 52, W - 136 - 90, 200);
         add(L"STATIC", L"", SS_LEFT, W - 84, ay + 57, 60, 18, kIdMenuVolumeText);
 
-        check(kIdShowAtStart, L"Show this window when the game starts  (hold Shift while starting to open it anyway)", 14, 424, W - 28);
-        add(L"BUTTON", L"Defaults", BS_PUSHBUTTON | WS_TABSTOP, 12, 456, 90, 28, kIdDefaults);
-        add(L"BUTTON", L"Quit", BS_PUSHBUTTON | WS_TABSTOP, W - 12 - 90 - 8 - 110, 456, 90, 28, IDCANCEL);
-        add(L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, W - 12 - 110, 456, 110, 28, IDOK);
+        // Controller
+        const int cy = 424;
+        group(L"Controller", 12, cy, W - 24, 58);
+        label(L"Button pictures", 24, cy + 24, 112);
+        combo(kIdPrompts, 136, cy + 24, 200, {L"Automatic (what you use)", L"Xbox", L"PlayStation", L"Nintendo Switch", L"Keyboard"});
+        check(kIdTriggers, L"Triggers accelerate and brake", 352, cy + 24, W - 352 - 24);
+
+        check(kIdShowAtStart, L"Show this window when the game starts  (hold Shift while starting to open it anyway)", 14, 492, W - 28);
+        add(L"BUTTON", L"Defaults", BS_PUSHBUTTON | WS_TABSTOP, 12, 524, 90, 28, kIdDefaults);
+        add(L"BUTTON", L"Bug report...", BS_PUSHBUTTON | WS_TABSTOP, 110, 524, 110, 28, kIdBugReport);
+        add(L"BUTTON", L"Quit", BS_PUSHBUTTON | WS_TABSTOP, W - 12 - 90 - 8 - 110, 524, 90, 28, IDCANCEL);
+        add(L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, W - 12 - 110, 524, 110, 28, IDOK);
     }
 
     void set_combo(int id, int index) { SendMessageW(item(id), CB_SETCURSEL, static_cast<WPARAM>(std::max(index, 0)), 0); }
@@ -174,6 +184,7 @@ struct Launcher {
         set_combo(kIdFps, static_cast<int>(std::find(fps_items.begin(), fps_items.end(), s.fps) - fps_items.begin()));
         set_check(kIdFullscreen, s.fullscreen);
         set_check(kIdLowLatency, s.low_latency);
+        set_check(kIdSmoothMenus, s.smooth_menus);
         set_combo(kIdAa, std::clamp(s.aa, 0, 4));
         set_combo(kIdAniso, static_cast<int>(std::find(std::begin(kAnisoValues), std::end(kAnisoValues), s.aniso) - std::begin(kAnisoValues)) % 5);
         set_combo(kIdSharpen, std::clamp(s.sharpen, 0, 3));
@@ -183,6 +194,8 @@ struct Launcher {
         SendMessageW(item(kIdVolume), TBM_SETPOS, TRUE, s.volume);
         SendMessageW(item(kIdMenuVolume), TBM_SETPOS, TRUE, s.menu_volume);
         set_check(kIdShowAtStart, s.show_launcher);
+        set_combo(kIdPrompts, std::clamp(s.button_prompts, 0, 4));
+        set_check(kIdTriggers, s.trigger_buttons);
         refresh();
     }
 
@@ -197,6 +210,7 @@ struct Launcher {
         s.fps = f >= 0 && f < static_cast<int>(fps_items.size()) ? fps_items[static_cast<std::size_t>(f)] : 0;
         s.fullscreen = get_check(kIdFullscreen);
         s.low_latency = get_check(kIdLowLatency);
+        s.smooth_menus = get_check(kIdSmoothMenus);
         s.aa = get_combo(kIdAa);
         s.aniso = kAnisoValues[std::clamp(get_combo(kIdAniso), 0, 4)];
         s.sharpen = get_combo(kIdSharpen);
@@ -206,6 +220,8 @@ struct Launcher {
         s.volume = get_slider(kIdVolume);
         s.menu_volume = get_slider(kIdMenuVolume);
         s.show_launcher = get_check(kIdShowAtStart);
+        s.button_prompts = std::clamp(get_combo(kIdPrompts), 0, 4);
+        s.trigger_buttons = get_check(kIdTriggers);
     }
 
     void refresh() {
@@ -299,6 +315,11 @@ struct Launcher {
             if (id == IDCANCEL) { DestroyWindow(wnd); return 0; }
             if (id == kIdBrowse) { browse(); return 0; }
             if (id == kIdBrowseIso) { browse_iso(); return 0; }
+            if (id == kIdBugReport) {   // logs of the last session, settings, crash reports and a PC summary in one zip
+                SetCursor(LoadCursor(nullptr, IDC_WAIT));
+                rr::report::announce(rr::report::make_bug_report("settings window"), false);
+                return 0;
+            }
             if (id == kIdDefaults) {
                 read_settings();
                 PlayerSettings d;
@@ -419,7 +440,7 @@ bool run_launcher(PlayerSettings &settings) {
     RegisterClassExW(&wc);
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r{0, 0, L.px(620), L.px(496)};
+    RECT r{0, 0, L.px(620), L.px(564)};
     AdjustWindowRectEx(&r, style, FALSE, 0);
     const int ww = r.right - r.left, wh = r.bottom - r.top;
     const int sx = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2, sy = (GetSystemMetrics(SM_CYSCREEN) - wh) / 2;

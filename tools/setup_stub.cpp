@@ -66,6 +66,21 @@ static unsigned long long image_end(const unsigned char* d, unsigned long long s
   return end;
 }
 
+// Where a code signature starts (the PE certificate table is always at the end of the file), or `size` if unsigned.  A
+// signed Setup.exe is stub + payload + signature, so the payload ends where the signature begins.
+static unsigned long long signature_start(const unsigned char* d, unsigned long long size) {
+  if (size < 0x40 || d[0] != 'M' || d[1] != 'Z') return size;
+  unsigned pe = *(const unsigned*)(d + 0x3C);
+  if (pe + 24 + 2 > size || memcmp(d + pe, "PE\0\0", 4) != 0) return size;
+  const unsigned long long opt = pe + 24;
+  const unsigned short magic = *(const unsigned short*)(d + opt);
+  const unsigned long long dir = opt + (magic == 0x20B ? 112 : 96) + 4 * 8;   // DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY]
+  if (dir + 8 > size) return size;
+  const unsigned off = *(const unsigned*)(d + dir), len = *(const unsigned*)(d + dir + 4);
+  if (off == 0 || len == 0 || off >= size || (unsigned long long)off + len > size) return size;
+  return off;
+}
+
 // hide_ui=false for the setup window: SW_HIDE would be inherited by the first window the child creates and hide it.
 static bool run_wait(std::wstring cmd, const std::wstring& dir, DWORD* code, bool hide_ui = true) {
   STARTUPINFOW si{}; si.cb = sizeof si;
@@ -96,6 +111,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
   const unsigned char* d = map ? (const unsigned char*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) : nullptr;
   if (!d) fail(L"Could not read the setup file.");
   unsigned long long total = (unsigned long long)sz.QuadPart, start = image_end(d, total);
+  if (start) { const unsigned long long sig = signature_start(d, total); if (sig > start) total = sig; }   // (signed: payload ends at the signature)
   if (!start || start + 4 > total || memcmp(d + start, "PK", 2) != 0) fail(L"This setup file is damaged (no payload). Please download it again.");
 
   wchar_t tmp[MAX_PATH];

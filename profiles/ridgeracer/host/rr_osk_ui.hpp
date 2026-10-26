@@ -13,6 +13,8 @@ enum class OskState { Active, Accepted, Cancelled };
 
 // Starts a session.  `limit` = maximum number of characters (0 = default 15).
 void osk_ui_begin(const std::u16string &description, const std::u16string &initial, std::uint32_t limit);
+// Optional (after osk_ui_begin): the small page title (default "NAME ENTRY") and the first help line for the keyboard.
+void osk_ui_set_texts(const char *title, const char *keyboard_help);
 // Call once per frame.  `typed` holds characters typed since the last call (8 = backspace, 13 = Enter, 27 = Esc);
 // `pad` holds PSP button bits from the gamepad only.
 OskState osk_ui_update(const std::vector<char16_t> &typed, std::uint32_t pad);

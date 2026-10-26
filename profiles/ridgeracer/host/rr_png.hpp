@@ -10,4 +10,6 @@ void write_png_async(std::string path, std::vector<std::uint8_t> rgba, std::uint
 // Writes raw bytes to a file on the same background thread pool.
 void write_file_async(std::string path, std::vector<std::uint8_t> bytes);
 bool write_png(const char *path, const std::uint8_t *rgba, std::uint32_t width, std::uint32_t height);
+// Raw deflate (RFC 1951) of the bytes, as a zip file entry needs it.
+std::vector<std::uint8_t> deflate_raw(const std::uint8_t *data, std::size_t size);
 }

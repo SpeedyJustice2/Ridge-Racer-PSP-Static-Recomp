@@ -56,6 +56,13 @@ struct Channel {
     std::size_t prime = kPrimeBase, quiet = 0, idle = 1u << 30;
     double frac = 0.0;                 // read position between two queued frames (drift correction, see audio_mix)
     double avg_count = 0.0;            // smoothed backlog the drift correction steers
+    // Time stretch (see stretch_render): the game makes sound slower than real time while the frame rate is below target.
+    bool stretching = false;
+    double st_pos = 0.0;               // nominal read position (frames after head) of the next segment
+    std::size_t st_nat = 0;            // where the previous segment naturally continues (frames after head)
+    std::vector<float> st_tail = std::vector<float>(1024u, 0.0f);   // second half of the previous segment (stereo, kStretchHop frames)
+    std::vector<float> st_out;         // stretched frames made but not played yet (stereo)
+    std::size_t st_out_at = 0;
 };
 constexpr int kEdgeFrames = 128;      // fade-in length when a channel (re)starts
 constexpr int kTailFrames = 661;      // when a channel runs dry its last sample decays to zero over ~15 ms instead of stepping
@@ -63,6 +70,12 @@ constexpr std::size_t kHoldMaxFrames = 4410;   // a started stream waits at most
 constexpr std::size_t kTrimHigh = 8192;   // backlog above this (~186 ms) is cut back to kTrimTarget
 constexpr std::size_t kTrimTarget = 3072;
 constexpr int kSpliceFrames = 192;
+// Time stretch: segments of 2 x kStretchHop frames overlap by half; each new segment starts within +-kStretchSearch frames of
+// its nominal place, at the offset where it best matches how the previous one would have continued (WSOLA), so the sound
+// slows down without changing pitch and without gaps.
+constexpr std::size_t kStretchHop = 384;
+constexpr std::size_t kStretchSearch = 192;
+constexpr double kStretchMin = 0.80;      // slowest playback (the game itself is then running at 80 % speed)
 
 std::mutex g_mutex;
 Channel g_channels[kAudioChannels];
@@ -155,6 +168,9 @@ void audio_channel_push(int channel, const std::int16_t *pcm, std::uint32_t fram
     }
 }
 
+std::atomic<bool> g_stretch_on{true};
+void audio_set_time_stretch(bool on) { g_stretch_on = on; }
+
 void audio_channel_set_trim(int channel, bool on) {
     if (channel < 0 || channel >= kAudioChannels) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -184,6 +200,9 @@ void audio_channel_clear(int channel) {
     g_channels[channel].off_n = 0;
     g_channels[channel].holding = false;
     g_channels[channel].tail_n = 0;
+    g_channels[channel].stretching = false;
+    g_channels[channel].st_out.clear();
+    g_channels[channel].st_out_at = 0;
 }
 
 AudioStats audio_take_stats() {
@@ -212,6 +231,83 @@ void audio_volume_step(int steps) {
     g_muted = false;
 }
 void audio_mute_toggle() { g_muted = !g_muted; }
+
+namespace {
+// Volume-scaled sample of frame `i` after the channel's head (k = 0 left, 1 right).
+inline float ring_sample(const Channel &c, std::size_t i, int k) {
+    const std::size_t at = ((c.head + i) % kRingFrames) * 2u + static_cast<std::size_t>(k);
+    return static_cast<float>((c.ring[at] * static_cast<int>(c.vols[at])) >> 15);
+}
+
+// Starts stretching at the channel's current read position: the first hop is played as it is.
+void stretch_begin(Channel &c) {
+    c.stretching = true;
+    c.st_out.clear(); c.st_out_at = 0;
+    for (std::size_t i = 0; i < kStretchHop; ++i)
+        for (int k = 0; k < 2; ++k) {
+            c.st_out.push_back(ring_sample(c, i, k));
+            c.st_tail[i * 2u + static_cast<std::size_t>(k)] = ring_sample(c, kStretchHop + i, k);
+        }
+    c.st_nat = kStretchHop;
+    c.st_pos = static_cast<double>(kStretchHop);
+}
+
+// Makes one more hop of stretched output (consuming `rate` x kStretchHop input frames on average).  False when the queue
+// does not hold enough audio for the search and the next segment.
+bool stretch_hop(Channel &c, double rate) {
+    const std::size_t need = static_cast<std::size_t>(c.st_pos) + kStretchSearch + 2u * kStretchHop + 1u;
+    if (c.count < need || c.st_nat + 2u * kStretchHop > c.count) return false;
+    // Best start near the nominal position: highest correlation (mono, every 2nd frame) with the natural continuation.
+    const long nominal = static_cast<long>(c.st_pos);
+    const long lo = std::max(0L, nominal - static_cast<long>(kStretchSearch)), hi = nominal + static_cast<long>(kStretchSearch);
+    static thread_local std::vector<float> ref, cand;
+    ref.resize(kStretchHop / 2u);
+    for (std::size_t i = 0; i < kStretchHop / 2u; ++i) ref[i] = ring_sample(c, c.st_nat + i * 2u, 0) + ring_sample(c, c.st_nat + i * 2u, 1);
+    const std::size_t span = static_cast<std::size_t>(hi - lo) + kStretchHop;
+    cand.resize(span);
+    for (std::size_t i = 0; i < span; ++i) cand[i] = ring_sample(c, static_cast<std::size_t>(lo) + i, 0) + ring_sample(c, static_cast<std::size_t>(lo) + i, 1);
+    long best = nominal; double best_score = -1e300;
+    for (long s = lo; s <= hi; ++s) {
+        const float *x = &cand[static_cast<std::size_t>(s - lo)];
+        double xy = 0.0, xx = 1e-9;
+        for (std::size_t i = 0; i < kStretchHop / 2u; ++i) { const float v = x[i * 2u]; xy += static_cast<double>(v) * ref[i]; xx += static_cast<double>(v) * v; }
+        const double score = xy / std::sqrt(xx);
+        if (score > best_score) { best_score = score; best = s; }
+    }
+    const std::size_t s0 = static_cast<std::size_t>(best);
+    // Cross-fade the previous segment's second half into this segment's first half.
+    for (std::size_t i = 0; i < kStretchHop; ++i) {
+        const float w = 0.5f - 0.5f * std::cos(3.14159265f * (static_cast<float>(i) + 0.5f) / static_cast<float>(kStretchHop));
+        for (int k = 0; k < 2; ++k) {
+            const std::size_t j = i * 2u + static_cast<std::size_t>(k);
+            c.st_out.push_back(c.st_tail[j] * (1.0f - w) + ring_sample(c, s0 + i, k) * w);
+            c.st_tail[j] = ring_sample(c, s0 + kStretchHop + i, k);
+        }
+    }
+    c.st_nat = s0 + kStretchHop;
+    c.st_pos += static_cast<double>(kStretchHop) * rate;
+    // Drop what no later segment can reach.
+    const double keep = std::min(c.st_pos - static_cast<double>(kStretchSearch), static_cast<double>(c.st_nat));
+    if (keep >= 1.0) {
+        const std::size_t a = static_cast<std::size_t>(keep);
+        c.head = (c.head + a) % kRingFrames; c.count -= a;
+        c.st_pos -= static_cast<double>(a); c.st_nat -= a;
+        g_stats.played += a;
+    }
+    return true;
+}
+
+// Stops stretching: the queue continues where the last segment ended (st_nat), so the join is seamless once the
+// frames already made have been played.
+void stretch_end(Channel &c) {
+    c.stretching = false;
+    const std::size_t a = std::min(c.st_nat, c.count);
+    c.head = (c.head + a) % kRingFrames; c.count -= a;
+    g_stats.played += a;
+    c.st_nat = 0; c.st_pos = 0.0;
+    c.frac = 0.0;
+}
+} // namespace
 
 void audio_mix(std::int16_t *out, std::size_t frames) {
     std::vector<std::int32_t> acc(frames * 2u, 0);
@@ -242,6 +338,66 @@ void audio_mix(std::int16_t *out, std::size_t frames) {
                 rate = std::clamp(1.0 + (c.avg_count - target) * 4e-6, 0.996, 1.004);
                 if (std::fabs(rate - 1.0) < 0.0002) rate = 1.0;
             } else c.avg_count = static_cast<double>(c.count);
+            {
+                // Time stretch when the queue keeps running low (the game is producing sound slower than real time because the
+                // frame rate dropped): play slower without changing pitch instead of running dry and going silent.
+                static const bool stretch_off = std::getenv("RR_AUDIO_STRETCH_OFF") != nullptr;
+                const double target = static_cast<double>(c.prime) + 768.0;
+                const double srate = std::clamp(1.0 + (c.avg_count - target) * 8e-5, kStretchMin, 1.0);
+                if (!stretch_off && c.trim && (g_stretch_on.load(std::memory_order_relaxed) || c.stretching)) {
+                    if (!c.stretching && g_stretch_on.load(std::memory_order_relaxed) && srate < 0.99 && c.count >= 2u * kStretchHop + kStretchSearch + 2u) { stretch_begin(c); ++g_stats.stretch_starts; }
+                    std::size_t done = 0;
+                    if (c.stretching) {
+                        const bool leave = srate > 0.997 || !g_stretch_on.load(std::memory_order_relaxed);
+                        while (done < frames) {
+                            if (c.st_out_at >= c.st_out.size()) {
+                                c.st_out.clear(); c.st_out_at = 0;
+                                if (leave) break;
+                                if (!stretch_hop(c, srate)) break;
+                            }
+                            const std::size_t take = std::min(frames - done, (c.st_out.size() - c.st_out_at) / 2u);
+                            for (std::size_t i = 0; i < take; ++i) {
+                                int l = static_cast<int>(c.st_out[c.st_out_at + i * 2u]), r = static_cast<int>(c.st_out[c.st_out_at + i * 2u + 1u]);
+                                if (c.fade_in > 0) { l = l * (kEdgeFrames - c.fade_in) / kEdgeFrames; r = r * (kEdgeFrames - c.fade_in) / kEdgeFrames; --c.fade_in; }
+                                c.last_l = l; c.last_r = r;
+                                if (&c == &g_channels[kMenuMixChannel]) {
+                                    const float mg = g_menu_gain.load(std::memory_order_relaxed);
+                                    l = static_cast<int>(static_cast<float>(l) * mg); r = static_cast<int>(static_cast<float>(r) * mg);
+                                }
+                                acc[(done + i) * 2u] += l; acc[(done + i) * 2u + 1u] += r;
+                            }
+                            c.st_out_at += take * 2u;
+                            done += take;
+                            g_stats.stretched += take;
+                        }
+                        if (done < frames) {
+                            stretch_end(c);
+                            if (!leave) {   // not enough audio queued even for stretching: the old behaviour (fade out, refill)
+                                c.primed = false;
+                                ++g_stats.underruns;
+                                c.prime = std::min(kPrimeMax, c.prime + 1024u);
+                                c.quiet = 0;
+                                c.tail_l = c.last_l; c.tail_r = c.last_r; c.tail_n = kTailFrames;
+                                render_tail(done);
+                                continue;
+                            }
+                            c.splice = false;
+                        } else continue;
+                    }
+                    if (done != 0u) {
+                        // Finished stretching part-way through this buffer: play the rest normally from where the stretch ended.
+                        const std::size_t n2 = std::min(frames - done, c.count);
+                        for (std::size_t i = 0; i < n2; ++i) {
+                            const int l = static_cast<int>(ring_sample(c, i, 0)), r = static_cast<int>(ring_sample(c, i, 1));
+                            c.last_l = l; c.last_r = r;
+                            acc[(done + i) * 2u] += l; acc[(done + i) * 2u + 1u] += r;
+                        }
+                        c.head = (c.head + n2) % kRingFrames; c.count -= n2; g_stats.played += n2;
+                        if (done + n2 < frames) { c.primed = false; ++g_stats.underruns; c.tail_l = c.last_l; c.tail_r = c.last_r; c.tail_n = kTailFrames; render_tail(done + n2); }
+                        continue;
+                    }
+                }
+            }
             const bool interp = rate != 1.0 || c.frac > 0.0;
             std::size_t n = std::min(frames, c.count);
             double pos = c.frac;
@@ -579,6 +735,11 @@ void audio_stop() {
     if (g_sdl_dev != 0) { SDL_CloseAudioDevice(g_sdl_dev); g_sdl_dev = 0; }
     g_started = false;
 }
+#elif defined(__EMSCRIPTEN__)
+// Browser: the engine thread mixes into a shared ring that an AudioWorklet plays (rr_present_web.cpp pumps it once per frame).
+std::uint32_t audio_latency_trim_frames() { return 0u; }
+bool audio_start() { g_started = true; return true; }
+void audio_stop() { g_started = false; }
 #else
 std::uint32_t audio_latency_trim_frames() { return 0u; }
 bool audio_start() { g_started = true; return false; }

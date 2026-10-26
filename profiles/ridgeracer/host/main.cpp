@@ -7,7 +7,7 @@
 // such import, and that report is the to-do list for the next stage.
 //
 // Usage:
-//   RidgeRacerNative <decrypted ELF> [disc root] [--max-dispatches N] [--log FILE] [--quiet] [--trace-all] [--no-window] [--scale N] [--gpu] [--internal-scale N] [--low-latency] [--no-low-latency] [--latency-log] [--fps N] [--fps-mult X] [--fps-patch [all|physics|car]] [--fps-everywhere] [--fps-gate ADDR]... [--trace-tools] [--shot-dir DIR] [--shot-mode window|native|both|raw] [--aa none|fxaa|taa|ssaa|msaa] [--msaa N] [--ssaa-factor X] [--fxaa] [--no-fxaa] [--supersample] [--sharpen X] [--no-mipmaps] [--aniso N] [--ui-crisp X] [--smooth-cutouts] [--draw-distance N] [--alpha-cutoff N] [--volume PERCENT] [--menu-volume PERCENT] [--fullscreen] [--unthrottled] [--screenshots DIR EVERY_N_FRAMES [MAX]] [--replay-input LOG] [--stop-after-frame N]
+//   RidgeRacerNative <decrypted ELF> [disc root] [--max-dispatches N] [--log FILE] [--quiet] [--trace-all] [--no-window] [--scale N] [--gpu] [--internal-scale N] [--low-latency] [--no-low-latency] [--latency-log] [--fps N] [--fps-mult X] [--fps-patch [all|physics|car]] [--fps-everywhere] [--fps-gate ADDR]... [--trace-tools] [--shot-dir DIR] [--shot-mode window|native|both|raw] [--aa none|fxaa|taa|ssaa|msaa] [--msaa N] [--ssaa-factor X] [--fxaa] [--no-fxaa] [--supersample] [--sharpen X] [--no-mipmaps] [--aniso N] [--ui-crisp X] [--smooth-cutouts] [--online|--no-online] [--button-prompts auto|xbox|playstation|nintendo|keyboard] [--triggers|--no-triggers] [--perf-report FILE] [--draw-distance N] [--frame-skip N] [--alpha-cutoff N] [--volume PERCENT] [--menu-volume PERCENT] [--fullscreen] [--unthrottled] [--screenshots DIR EVERY_N_FRAMES [MAX]] [--replay-input LOG] [--stop-after-frame N]
 //
 // <decrypted ELF>  e.g. ...\RidgeRacerPSPFiles\PSP_GAME\SYSDIR\BOOT.BIN
 // [disc root]      folder that contains PSP_GAME (default: derived from the
@@ -16,7 +16,11 @@
 #include "rr_hle.hpp"
 #include "rr_env.hpp"
 #include "rr_log.hpp"
+#include "rr_net.hpp"
+#include "rr_pad.hpp"
+#include "rr_report.hpp"
 #include "rr_settings.hpp"
+#include "rr_sysinfo.hpp"
 #include <cstdio>
 
 #include "psprecomp/common.hpp"
@@ -65,6 +69,9 @@ bool apply_launcher(int &argc, char **&argv, std::vector<std::string> &store, st
         const std::filesystem::path found = rr::find_game_files();
         if (!found.empty()) s.game_path = found.string();
     }
+    if (!ini_exists && rr::weak_graphics_only()) {   // first run on an integrated / basic graphics chip: start with light settings
+        s.render_scale = 2; s.aa = 0; s.aniso = 1; s.ui_crisp = 1; s.smooth_cutouts = false; s.frame_skip = 0;
+    }
     const bool game_ok = rr::check_game_file(rr::resolve_game_path(s.game_path)).empty();
     if (launcher_flag || !ini_exists || s.show_launcher || !game_ok || rr::launcher_shift_held()) {
         if (!rr::run_launcher(s)) return false;
@@ -84,7 +91,52 @@ bool apply_launcher(int &argc, char **&argv, std::vector<std::string> &store, st
 
 } // namespace
 
+#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+#define RR_HAVE_SAMPLER 1
+// Dev-only sampling profiler (RR_SAMPLER=file): SIGPROF every 1 ms of CPU time, records the interrupted instruction address and thread.
+#include <csignal>
+#include <sys/time.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <link.h>
+namespace {
+struct Sample { unsigned long long ip; int tid; };
+Sample g_samples[400000];
+volatile int g_nsamples = 0;
+const char *g_sampler_path = nullptr;
+void sampler_handler(int, siginfo_t *, void *uc) {
+    const int n = g_nsamples;
+    if (n >= 400000) return;
+    g_samples[n].ip = static_cast<unsigned long long>(static_cast<ucontext_t *>(uc)->uc_mcontext.gregs[REG_RIP]);
+    g_samples[n].tid = static_cast<int>(syscall(SYS_gettid));
+    g_nsamples = n + 1;
+}
+void sampler_dump() {
+    if (!g_sampler_path) return;
+    FILE *f = std::fopen(g_sampler_path, "w");
+    if (!f) return;
+    dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *arg) -> int { std::fprintf(static_cast<FILE *>(arg), "BASE %llx\n", static_cast<unsigned long long>(info->dlpi_addr)); return 1; }, f);
+    for (int i = 0; i < g_nsamples; ++i) std::fprintf(f, "%d %llx\n", g_samples[i].tid, g_samples[i].ip);
+    std::fclose(f);
+}
+void sampler_start() {
+    g_sampler_path = std::getenv("RR_SAMPLER");
+    if (!g_sampler_path || !*g_sampler_path) { g_sampler_path = nullptr; return; }
+    struct sigaction sa; std::memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sampler_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGPROF, &sa, nullptr);
+    itimerval it; it.it_interval.tv_sec = 0; it.it_interval.tv_usec = 1000; it.it_value = it.it_interval;
+    setitimer(ITIMER_PROF, &it, nullptr);
+    std::atexit(sampler_dump);
+}
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef RR_HAVE_SAMPLER
+    sampler_start();
+#endif
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--dev") rr::g_rr_dev = true;
 #ifdef _WIN32
     if (!rr::g_rr_dev) {
@@ -95,6 +147,11 @@ int main(int argc, char **argv) {
         for (const auto &n : names) _putenv_s(n.c_str(), "");
     }
 #endif
+    // "--bug-report <reason>": pack logs, settings and crash files into a zip on the Desktop and say where it is (started by
+    // the crash handler after a crash; also usable by hand).
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--bug-report") return rr::report::run_report_mode(i + 1 < argc ? argv[i + 1] : "by hand");
+    rr::report::install_crash_handler();
     // Used by the installer: copy the files out of a disc image (once) and print progress lines, then exit.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::string(argv[i]) != "--prepare-game") continue;
@@ -125,6 +182,7 @@ int main(int argc, char **argv) {
         float ui_crisp = 0.8f;
         bool smooth_cutouts = false;
         int draw_cells = 0;
+        int frame_skip = 0;   // automatic: pictures are skipped only while the PC cannot keep the game at full speed
         float volume = 1.0f, menu_volume = 1.0f;
         int alpha_cutoff = 0;
         bool fullscreen = false;
@@ -132,6 +190,8 @@ int main(int argc, char **argv) {
         int fps_patch = 0;
         bool trace_tools = false;
         bool fps_everywhere = false;
+        bool menu_interp = std::getenv("RR_MENU_INTERP") != nullptr;
+        bool menu_native = [] { const char *e = std::getenv("RR_MENU_NATIVE"); return e == nullptr || std::string(e) != "0"; }();   // on by default (--no-menu-native / RR_MENU_NATIVE=0: menus at 60)
         std::vector<std::uint32_t> fps_gates;
         std::string shot_dir = "screenshots";
         int shot_mode = 0;
@@ -203,6 +263,10 @@ int main(int argc, char **argv) {
                 fps_gates.push_back(static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 0)));
             } else if (arg == "--fps-everywhere") {
                 fps_everywhere = true;
+            } else if (arg == "--menu-interp" || arg == "--no-menu-interp") {
+                menu_interp = arg == "--menu-interp";
+            } else if (arg == "--menu-native" || arg == "--no-menu-native") {
+                menu_native = arg == "--menu-native";
             } else if (arg == "--trace-tools") {
                 trace_tools = true;
             } else if (arg == "--fps-patch") {
@@ -239,8 +303,22 @@ int main(int argc, char **argv) {
             } else if (arg == "--draw-distance") {
                 if (i + 1 >= argc) throw psprecomp::Error("--draw-distance needs a number (0 = the game's own, 2-8 = draw scenery from that many track cells further)");
                 draw_cells = std::clamp(std::atoi(argv[++i]), 0, 64);
+            } else if (arg == "--frame-skip") {
+                if (i + 1 >= argc) throw psprecomp::Error("--frame-skip needs a number (1 = off, 2 = draw every 2nd frame in races, 3 = every 3rd) or auto (skip pictures only while the game runs behind real time)");
+                { const std::string v = argv[++i]; frame_skip = (v == "auto") ? 0 : std::clamp(std::atoi(v.c_str()), 0, 4); }
             } else if (arg == "--smooth-cutouts") {
                 smooth_cutouts = true;
+            } else if (arg == "--perf-report") {
+                if (i + 1 >= argc) throw psprecomp::Error("--perf-report needs a file name");
+                rr::set_perf_report(argv[++i]);
+            } else if (arg == "--button-prompts") {
+                if (i + 1 >= argc) throw psprecomp::Error("--button-prompts needs auto, xbox, playstation, nintendo or keyboard");
+                rr::pad::set_prompts(rr::pad::parse_prompts(argv[++i], rr::pad::Prompts::Auto));
+            } else if (arg == "--triggers" || arg == "--no-triggers") {
+                rr::pad::set_triggers(arg == "--triggers");
+            } else if (arg == "--online" || arg == "--no-online") {
+                rr::net::request_online(arg == "--online");
+                if (arg == "--online") rr::net::set_log_file((rr::executable_dir() / "online-log.txt").string());
             } else if (arg == "--ui-crisp") {
                 if (i + 1 >= argc) throw psprecomp::Error("--ui-crisp needs a number (0 = off, 0.8 default, 1 = crispest)");
                 ui_crisp = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f);
@@ -367,6 +445,7 @@ int main(int argc, char **argv) {
         hle_options.ui_crisp = ui_crisp;
         hle_options.smooth_cutouts = smooth_cutouts;
         hle_options.draw_cells = draw_cells;
+        hle_options.frame_skip = frame_skip;
         hle_options.volume = volume;
         hle_options.alpha_cutoff = alpha_cutoff;
         hle_options.menu_volume = menu_volume;
@@ -374,6 +453,8 @@ int main(int argc, char **argv) {
         hle_options.fps_mult = fps_mult;
         hle_options.fps_patch = fps_patch;
         hle_options.fps_race_only = !fps_everywhere;
+        hle_options.menu_interp = menu_interp;
+        hle_options.menu_native = menu_native;
         hle_options.fps_gates = fps_gates;
         hle_options.trace_tools = trace_tools;
         hle_options.shot_dir = shot_dir;
@@ -437,7 +518,7 @@ int main(int argc, char **argv) {
             exit_code = 4;
         }
         rr::report_summary();
-        if (exit_code == 4 && g_from_launcher) rr::show_error_box("The game stopped because of an error. The details are in ridgeracer.log.");
+        if (exit_code == 4 && g_from_launcher) rr::report::announce(rr::report::make_bug_report("error"), true);   // (the game stopped on an error)
 
         if (runtime.stopped()) log("stopped: " + runtime.stop_reason());
         else log("run ended (dispatch limit reached) without a stop request");

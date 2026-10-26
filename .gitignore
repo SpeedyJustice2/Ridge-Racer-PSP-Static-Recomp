@@ -114,3 +114,17 @@ install.log
 *.raw
 *.png
 !/profiles/**/*.png
+# Browser build output: contains the game's translated code, must never be published
+/build-web/
+/web-dist/
+
+# Ridge Racer: the bundled SDL2 runtime is part of the source (the *.dll rule above would drop it)
+!profiles/ridgeracer/third_party/sdl2/SDL2.dll
+# Crash and bug reports written next to the game
+/reports/
+RidgeRacer-bug-report-*.zip
+# Cloudflare / wrangler local state (account ids)
+.wrangler/
+node_modules/
+# Code signing settings (your Azure account details); the example file is published
+/sign-release.cmd

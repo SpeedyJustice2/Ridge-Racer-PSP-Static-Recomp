@@ -27,6 +27,10 @@ namespace psprecomp { class GuestMemory; }
 
 namespace rr {
 
+// What the OpenGL driver says it is ("AMD Radeon(TM) Graphics / OpenGL 4.6 ..."), for the performance report; empty before the context exists.
+const std::string &gl_description();
+
+
 class GlBackend final : public GpuBackend {
 public:
     using GetProc = void *(*)(const char *);
@@ -47,6 +51,8 @@ public:
     void set_read_reason(const char *reason) override { rb_reason_ = reason; }
     void vram_write(std::uint32_t address, std::uint32_t length) override;
     void sync() override { flush(); }
+    [[nodiscard]] bool wants_full_triangles() const override { return interp_on_; }
+    void record_full(const GpuDraw &state, const GpuVertex *vertices, std::size_t count, int cull) override;
 
     // Visual enhancements (all optional): FXAA + sharpening when the screen is presented, trilinear/anisotropic
     // filtering for 3D textures.  Call once after construction, with the GL context current.
@@ -73,6 +79,18 @@ public:
     // Same for a CPU-side 480x272 RGBA frame (movies, loading screens drawn by the CPU, software fallbacks).
     void present_rgba(const std::uint8_t *rgba, int width, int height, int win_w, int win_h);
 
+    // Menu frame interpolation (high refresh rates outside races; see rr_gl.cpp).  While recording, every draw into a
+    // 512-wide screen buffer is also kept (state, palette, vertices) with a snapshot of the buffer taken before its first
+    // draw.  interp_frame_done(fb) closes the game frame shown from buffer `fb`; interp_render(t) then redraws that frame
+    // into a private target with each draw's vertices moved from where the matching draw of the previous frame had them
+    // (t = 0) to where they are now (t = 1), and present_interp() shows it like present_target().
+    void interp_set_recording(bool on);
+    void interp_frame_done(std::uint32_t shown_fb);
+    bool interp_render(float t);
+    bool present_interp(int win_w, int win_h);
+    bool read_interp_native(std::uint8_t *rgba);   // the last interp_render() picture at 480x272 (screenshots / tests)
+    struct InterpStats { std::uint64_t frames{}, usable{}, draws{}, matched{}, lerped{}, snapped_3d{}, bad_sw{}, bad_self{}, bad_cpu{}, bad_base{}, bad_big{}, cleared{}, exact{}; };
+    [[nodiscard]] const InterpStats &interp_stats() const { return istats_; }
     struct Stats { std::uint64_t gl_draws{}, sw_draws{}, texture_uploads{}, texture_hits{}, readbacks{}, uploads{}, tex_failed{}, readback_rows{}, merged_draws{}, rt_tex{}, readback_skipped{}; };
     [[nodiscard]] const Stats &stats() const { return stats_; }
     // Milliseconds spent submitting batched draws to the GL driver since the last call.
@@ -185,6 +203,30 @@ private:
     std::unique_ptr<psprecomp::GuestMemory> shadow_;
     std::unique_ptr<SoftwareBackend> shadow_sw_;
     std::uint32_t events_budget_{3000};
+    // Menu frame interpolation.
+    struct RecDraw { GpuDraw d; GpuPrim prim{}; std::uint32_t v0{}, n{}; std::int32_t clut{-1}; std::uint64_t key{}; std::int32_t match{-1}; bool lerp{}; std::int8_t cull{-1}; };
+    struct FrameRec {
+        std::uint32_t fb{}, fb_bytes{};
+        std::vector<RecDraw> draws;
+        std::vector<GpuVertex> verts;
+        std::vector<std::uint8_t> cluts;   // 1024 bytes per palette
+        bool bad{}, has_base{}, cleared{};
+        void clear() { fb = 0u; fb_bytes = 0u; draws.clear(); verts.clear(); cluts.clear(); bad = false; has_base = false; cleared = false; }
+    };
+    void interp_record(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count, int cull = -1);
+    bool full_pending_{false};   // record_full() already recorded the draw that follows
+    bool make_private_rt(Rt &rt);
+    void copy_rt(const Rt &src, Rt &dst);
+    Rt *base_for(std::uint32_t fb);
+    bool interp_on_{false};
+    std::vector<FrameRec> rec_;                 // frames being recorded (one per screen buffer drawn this game frame)
+    FrameRec cur_, prev_;                        // the last two finished frames
+    bool cur_ok_{false}, prev_ok_{false}, all3d_matched_{false};
+    std::vector<std::pair<std::uint32_t, std::unique_ptr<Rt>>> bases_;   // per screen buffer: its contents before the frame's first draw
+    std::unique_ptr<Rt> irt_;                    // the in-between picture
+    Rt *rt_override_{nullptr};                   // draw_gl() target while replaying
+    std::vector<GpuVertex> ivert_;
+    InterpStats istats_;
 };
 
 } // namespace rr

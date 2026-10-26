@@ -1,7 +1,9 @@
 #include "rr_gl.hpp"
+#include "rr_crumb.hpp"
 #include "rr_png.hpp"
 #include "rr_tuning.hpp"
 #include "rr_prof.hpp"
+#include "rr_log.hpp"
 
 #include "psprecomp/guest_memory.hpp"
 
@@ -18,6 +20,10 @@
 #define RR_GLAPI __stdcall
 #else
 #define RR_GLAPI
+#endif
+
+#ifdef __EMSCRIPTEN__
+extern "C" void glGetBufferSubData(unsigned int target, std::ptrdiff_t offset, std::ptrdiff_t size, void *data);
 #endif
 
 namespace rr {
@@ -540,7 +546,35 @@ void bleed_transparent_texels(std::vector<std::uint32_t> &px, std::uint32_t w, s
     }
 }
 
+// Uniform cache for the main draw program: its uniforms keep their values between draws, so a value that did not change is
+// not sent again.  Matters in the browser, where every uniform call is a checked command to the GPU process (the Rally-X
+// loading game makes thousands of small draws a frame and spent most of its time there).
+struct UniformCache {
+    static constexpr int kSlots = 256;
+    unsigned char kind[kSlots]{};   // 0 = unknown, 1 = int, 2 = float(s)
+    GLint i[kSlots]{};
+    float f[kSlots][3]{};
+    void reset() { for (auto &k : kind) k = 0; }
+} g_ucache;
+const bool g_ucache_off = std::getenv("RR_UCACHE_OFF") != nullptr;   // (test switch: send every uniform every time)
+template <class G> inline void uc_1i(G &g, GLint loc, GLint v) {
+    if (loc < 0) return;
+    if (loc < UniformCache::kSlots && !g_ucache_off) { if (g_ucache.kind[loc] == 1 && g_ucache.i[loc] == v) return; g_ucache.kind[loc] = 1; g_ucache.i[loc] = v; }
+    g.Uniform1i(loc, v);
+}
+template <class G> inline bool uc_same(GLint loc, float a, float b, float c) {
+    if (loc < 0 || loc >= UniformCache::kSlots || g_ucache_off) return false;
+    auto &e = g_ucache.f[loc];
+    if (g_ucache.kind[loc] == 2 && e[0] == a && e[1] == b && e[2] == c) return true;
+    g_ucache.kind[loc] = 2; e[0] = a; e[1] = b; e[2] = c;
+    return false;
+}
+template <class G> inline void uc_1f(G &g, GLint loc, GLfloat a) { if (loc >= 0 && !uc_same<G>(loc, a, 0.0f, 0.0f)) g.Uniform1f(loc, a); }
+template <class G> inline void uc_2f(G &g, GLint loc, GLfloat a, GLfloat b) { if (loc >= 0 && !uc_same<G>(loc, a, b, 0.0f)) g.Uniform2f(loc, a, b); }
+template <class G> inline void uc_3f(G &g, GLint loc, GLfloat a, GLfloat b, GLfloat c) { if (loc >= 0 && !uc_same<G>(loc, a, b, c)) g.Uniform3f(loc, a, b, c); }
+
 } // namespace
+
 
 struct GlBackend::Gl {
 #define X(ret, name, args) ret(RR_GLAPI *name) args = nullptr;
@@ -550,6 +584,8 @@ struct GlBackend::Gl {
     void *(RR_GLAPI *FenceSync)(GLenum, GLbitfield) = nullptr;
     GLenum(RR_GLAPI *ClientWaitSync)(void *, GLbitfield, unsigned long long) = nullptr;
     void(RR_GLAPI *DeleteSync)(void *) = nullptr;
+    // WebGL 2 has no buffer mapping for reading; the browser build copies pixel-buffer contents out with this instead
+    void(RR_GLAPI *GetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void *) = nullptr;
     unsigned program{}, vao{}, vbo{};
     int loc_rt{-1}, loc_pt{-1}, loc_clear{-1}, loc_tex_enable{-1}, loc_tex_func{-1}, loc_tex_alpha{-1}, loc_tex_double{-1}, loc_tex_env{-1},
         loc_tex_size{-1}, loc_tex_off{-1}, loc_tex_snap{-1}, loc_dst_scale{-1}, loc_rt_psp_filter{-1}, loc_ui_ramp{-1}, loc_dbg{-1}, loc_acut{-1}, loc_atest{-1}, loc_atest_func{-1}, loc_atest_ref{-1}, loc_atest_mask{-1}, loc_ctest{-1}, loc_ct_func{-1}, loc_ct_ref{-1}, loc_ct_mask{-1}, loc_alpha_mode{-1}, loc_tex{-1}, loc_fog{-1}, loc_fog_color{-1};
@@ -574,6 +610,9 @@ struct GlBackend::Gl {
     int up_w{}, up_h{};
 };
 
+static std::string g_gl_description;
+const std::string &gl_description() { return g_gl_description; }
+
 GlBackend::GlBackend(psprecomp::GuestMemory &memory, GetProc get_proc, bool gles, int scale)
     : memory_(memory), gl_(std::make_unique<Gl>()), sw_(memory), gles_(gles), scale_(std::max(1, std::min(scale, 8))) {
     if (const char *e = std::getenv("RR_GL_EVENTS")) events_budget_ = static_cast<std::uint32_t>(std::max(0, std::atoi(e)));   // diagnostic line budget (default 3000)
@@ -587,9 +626,18 @@ GlBackend::GlBackend(psprecomp::GuestMemory &memory, GetProc get_proc, bool gles
     RR_GL_FUNCTIONS(X)
 #undef X
     if (missing) { error_ = "missing GL functions:" + error_; return; }
+    {
+        const auto *renderer = reinterpret_cast<const char *>(gl_->GetString(GL_RENDERER));
+        const auto *version = reinterpret_cast<const char *>(gl_->GetString(GL_VERSION));
+        g_gl_description = std::string(renderer != nullptr ? renderer : "unknown GPU") + " / OpenGL " + (version != nullptr ? version : "?");
+    }
     gl_->FenceSync = reinterpret_cast<void *(RR_GLAPI *)(GLenum, GLbitfield)>(get_proc("glFenceSync"));
     gl_->ClientWaitSync = reinterpret_cast<GLenum(RR_GLAPI *)(void *, GLbitfield, unsigned long long)>(get_proc("glClientWaitSync"));
     gl_->DeleteSync = reinterpret_cast<void(RR_GLAPI *)(void *)>(get_proc("glDeleteSync"));
+#ifdef __EMSCRIPTEN__
+    // (not in emscripten_GetProcAddress's table, so linked directly; it is part of emscripten's WebGL 2 library)
+    gl_->GetBufferSubData = &glGetBufferSubData;
+#endif
     if (!compile_programs()) return;
     compile_post();   // optional: without it the screen is presented with a plain filtered blit
 
@@ -628,6 +676,8 @@ GlBackend::GlBackend(psprecomp::GuestMemory &memory, GetProc get_proc, bool gles
 GlBackend::~GlBackend() {
     if (!gl_ || !gl_->DeleteTextures) return;
     for (auto &rt : rts_) destroy_rt(*rt);
+    for (auto &[fb, rt] : bases_) destroy_rt(*rt);
+    if (irt_) destroy_rt(*irt_);
     for (auto &[key, t] : textures_) gl_->DeleteTextures(1, &t.tex);
 }
 
@@ -677,6 +727,7 @@ bool GlBackend::compile_programs() {
     g.loc_ctest = loc("u_ctest"); g.loc_ct_func = loc("u_ct_func"); g.loc_ct_ref = loc("u_ct_ref"); g.loc_ct_mask = loc("u_ct_mask");
     g.loc_atest_ref = loc("u_atest_ref"); g.loc_atest_mask = loc("u_atest_mask"); g.loc_alpha_mode = loc("u_alpha_mode"); g.loc_fog = loc("u_fog"); g.loc_fog_color = loc("u_fog_color");
     g.loc_tex = loc("u_tex"); g.loc_jit = loc("u_jit");
+    g_ucache.reset();
     return true;
 }
 
@@ -746,6 +797,7 @@ bool GlBackend::compile_post() {
 }
 
 void GlBackend::set_enhance(const Enhance &e) {
+    RR_CRUMB(2, 25);
     enhance_ = e;
     if (!ok_) return;
     Gl &g = *gl_;
@@ -799,6 +851,7 @@ bool GlBackend::post_wanted(bool cpu_frame) const {
 }
 
 unsigned GlBackend::taa_pass(Rt &rt) {
+    RR_CRUMB(2, 17);
     Gl &g = *gl_;
     if (g.taa_prog == 0u) return rt.tex;
     if (g.taa_tex[0] == 0u || g.taa_w != rt.w || g.taa_h != rt.h) {
@@ -850,6 +903,7 @@ unsigned GlBackend::taa_pass(Rt &rt) {
 
 // Draws `tex` (top row first, source_w x source_h texels) into the letterboxed area of the default framebuffer.
 void GlBackend::post_pass(unsigned tex, int src_w, int src_h, int vis_w, int win_w, int win_h) {
+    RR_CRUMB(2, 16);
     Gl &g = *gl_;
     int lx, ly, lw, lh;
     letterbox(win_w, win_h, lx, ly, lw, lh);
@@ -938,6 +992,7 @@ void GlBackend::destroy_rt(Rt &rt) {
 }
 
 GlBackend::Rt *GlBackend::get_rt(const GpuDraw &d) {
+    RR_CRUMB(2, 14);
     if (Rt *existing = find_rt(d.fb_addr)) {
         if (existing->stride == d.fb_stride) return existing;
         // The game re-used this memory with a different layout: write the old contents back and start over.
@@ -1012,6 +1067,7 @@ GlBackend::Rt *GlBackend::get_rt(const GpuDraw &d) {
 // wants to write back, the CPU (or a DMA) wrote there in between and memory is the newer copy: the guest keeps textures
 // in VRAM next to / underneath stale render targets, and writing the stale target back would wipe them.
 void GlBackend::sync_rows(Rt &rt, const std::uint8_t *mem, std::uint32_t row0, std::uint32_t row1) {
+    RR_CRUMB(2, 20);
     if (mem == nullptr) return;
     if (rt.row_hash.size() != rt.rows) { rt.row_hash.assign(rt.rows, 0u); rt.row_hash_ok.assign(rt.rows, 0u); }
     const std::uint32_t bpp = rt.format == 3u ? 4u : 2u;
@@ -1023,6 +1079,7 @@ void GlBackend::sync_rows(Rt &rt, const std::uint8_t *mem, std::uint32_t row0, s
 }
 
 void GlBackend::resolve_rt(Rt &rt, bool with_depth) {
+    RR_CRUMB(2, 18);
     if (rt.ms_fbo == 0u) return;
     const bool color = rt.ms_dirty, depth = with_depth && rt.ms_depth_dirty;
     if (!color && !depth) return;
@@ -1040,6 +1097,7 @@ void GlBackend::resolve_rt(Rt &rt, bool with_depth) {
 }
 
 void GlBackend::upload_from_vram(Rt &rt) {
+    RR_CRUMB(2, 15);
     const prof::Scope prof_scope(prof::kUpload);
     Gl &g = *gl_;
     resolve_rt(rt, false);   // keep what the multisampled buffer holds for the rows that are not replaced
@@ -1121,6 +1179,7 @@ void GlBackend::upload_from_vram(Rt &rt) {
 }
 
 void GlBackend::readback(Rt &rt, std::uint32_t row0, std::uint32_t row1) {
+    RR_CRUMB(2, 7);
     const prof::Scope prof_scope(prof::kReadback);
     // RR_RB_TIME=ms: log every readback that takes longer than that (wall time, includes the wait for the GPU).
     static const double rb_time_ms = [] { const char *e = std::getenv("RR_RB_TIME"); return e ? std::atof(e) : -1.0; }();
@@ -1208,6 +1267,7 @@ static void vis_log(std::vector<std::string> &events, std::uint32_t addr, std::u
 // as a texture, for instance).  Here stencil lives in the RT's stencil buffer, so before alpha is read it is rebuilt
 // from there: alpha = stencil value (0/255 for 5551, replicated nibbles for 4444).
 void GlBackend::resolve_stencil(Rt &rt) {
+    RR_CRUMB(2, 21);
     static const bool off = std::getenv("RR_NO_RESOLVE") != nullptr;   // A/B switch
     if (!rt.alpha_stale) return;
     rt.alpha_stale = false;
@@ -1228,12 +1288,12 @@ void GlBackend::resolve_stencil(Rt &rt) {
     g.Clear(GL_COLOR_BUFFER_BIT);
     g.UseProgram(g.program);
     g.BindVertexArray(g.vao);
-    g.Uniform2f(g.loc_rt, static_cast<float>(rt.stride), 272.0f);
-    g.Uniform2f(g.loc_pt, 0.0f, 0.0f);
-    g.Uniform1i(g.loc_clear, 1);
-    g.Uniform1i(g.loc_alpha_mode, 0);
-    g.Uniform1i(g.loc_fog, 0);
-    g.Uniform2f(g.loc_jit, 0.0f, 0.0f);
+    uc_2f(g, g.loc_rt, static_cast<float>(rt.stride), 272.0f);
+    uc_2f(g, g.loc_pt, 0.0f, 0.0f);
+    uc_1i(g, g.loc_clear, 1);
+    uc_1i(g, g.loc_alpha_mode, 0);
+    uc_1i(g, g.loc_fog, 0);
+    uc_2f(g, g.loc_jit, 0.0f, 0.0f);
     const float x1 = static_cast<float>(rt.stride), y1 = 272.0f;
     const auto pass = [&](GLenum func, GLint ref, GLuint mask, float alpha) {
         GpuVertex v[6];
@@ -1265,6 +1325,7 @@ void GlBackend::resolve_stencil(Rt &rt) {
 // Copies rows [row0, row1] of the GPU target, sampled back down to native resolution, into `dst` laid out like
 // emulated VRAM.
 void GlBackend::readback_to(Rt &rt, std::uint8_t *dst, std::uint32_t visible, std::uint32_t row0, std::uint32_t row1) {
+    RR_CRUMB(2, 8);
     const auto st0 = std::chrono::steady_clock::now();
     resolve_stencil(rt);
     const auto st1 = std::chrono::steady_clock::now();
@@ -1310,13 +1371,50 @@ void GlBackend::readback_to(Rt &rt, std::uint8_t *dst, std::uint32_t visible, st
         // buffers instead and use the previous frame's pixels (one frame = 8 ms late, invisible in a brightness probe).
         // RR_RB_LAG=0 turns this off.
         static const bool lag_on = std::getenv("RR_RB_LAG") == nullptr || std::string(std::getenv("RR_RB_LAG")) != "0";
-        const bool lag = lag_on && std::strcmp(rb_reason_, "gltex") == 0 && g.MapBufferRange != nullptr && g.UnmapBuffer != nullptr &&
-                         (rt.addr == 0x041FC000u || rb_lag_);
+        static const bool lag_all = std::getenv("RR_RB_LAG_ALL") != nullptr;   // (test: every readback takes the lagged path)
+        const bool lag = lag_on && (std::strcmp(rb_reason_, "gltex") == 0 || lag_all) && ((g.MapBufferRange != nullptr && g.UnmapBuffer != nullptr) || g.GetBufferSubData != nullptr) &&
+                         (rt.addr == 0x041FC000u || rb_lag_ || lag_all);
         if (lag) {
             constexpr GLenum kPack = 0x88EB, kStreamRead = 0x88E1;
             constexpr GLbitfield kMapRead = 0x0001;
             const std::size_t bytes = static_cast<std::size_t>(w1) * rows * 4u;
             static const bool fences = std::getenv("RR_RB_FENCE_OFF") == nullptr;
+#ifdef __EMSCRIPTEN__
+            // Browser: no sync objects at all (glClientWaitSync froze Chrome's GPU work on an AMD card, twice, at the first
+            // sun probe).  A ring of 4 pixel buffers is filled one per frame and the one filled 3 frames ago is copied out;
+            // by then the GPU has long finished it, so glGetBufferSubData does not wait.
+            if (g.GetBufferSubData != nullptr) {
+                constexpr int kRing = 4;
+                struct WebRing { GLuint pbo[kRing]{}; std::size_t bytes{0}; int cur{0}; int filled{0}; std::uint64_t last_frame{0}; std::vector<std::uint8_t> last; };
+                static std::map<std::uint64_t, WebRing> wrings;
+                const std::uint64_t key = (static_cast<std::uint64_t>(rt.addr) << 24u) ^ (static_cast<std::uint64_t>(row0) << 12u) ^ rows;
+                WebRing &W = wrings[key];
+                if (W.pbo[0] == 0u) g.GenBuffers(kRing, W.pbo);
+                if (bytes != W.bytes) {
+                    for (int i = 0; i < kRing; ++i) { g.BindBuffer(kPack, W.pbo[i]); g.BufferData(kPack, static_cast<GLsizeiptr>(bytes), nullptr, kStreamRead); }
+                    W.bytes = bytes; W.filled = 0; W.last.clear();
+                }
+                if (frame_ > W.last_frame + 3u) { W.filled = 0; W.last.clear(); }   // not read for a while: old pixels are no use
+                RR_CRUMB(3, 30);
+                static bool told = false;
+                if (!told) { told = true; log_line(category::kGe, "sun probe readback: browser ring (no sync objects)"); }
+                g.BindBuffer(kPack, W.pbo[W.cur]);
+                g.ReadPixels(0, 0, w1, static_cast<GLsizei>(rows), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                W.cur = (W.cur + 1) % kRing;
+                if (W.filled < kRing) ++W.filled;
+                RR_CRUMB(3, 31);
+                if (W.filled == kRing) {   // W.cur now names the oldest buffer (filled kRing-1 frames ago)
+                    W.last.resize(bytes);
+                    g.BindBuffer(kPack, W.pbo[W.cur]);
+                    g.GetBufferSubData(kPack, 0, static_cast<GLsizeiptr>(bytes), W.last.data());
+                }
+                RR_CRUMB(3, 32);
+                g.BindBuffer(kPack, 0);
+                if (W.last.size() == bytes) std::memcpy(readback_scratch_.data(), W.last.data(), bytes);
+                else std::memset(readback_scratch_.data(), 0, bytes);
+                W.last_frame = frame_;
+            } else
+#endif
             if (fences && g.FenceSync != nullptr && g.ClientWaitSync != nullptr && g.DeleteSync != nullptr) {
                 // Ring of pixel buffers, each with a fence: queue this frame's read, then take the newest read the GPU has
                 // already finished (never waits).  Before any is finished, the last pixels taken are used again.  Only the
@@ -1349,15 +1447,28 @@ void GlBackend::readback_to(Rt &rt, std::uint8_t *dst, std::uint32_t visible, st
                     if (!R.fence[i] || (best >= 0 && R.when[i] < R.when[best])) continue;
                     static const bool first_wait = std::getenv("RR_RB_FIRST_WAIT") != nullptr;
                     const bool want_wait = first_wait && R.last.empty() && i == slot;   // nothing to show yet: wait for this one
+                    RR_CRUMB(3, 10);
+                    #ifdef __EMSCRIPTEN__
+                    const GLenum r = g.ClientWaitSync(R.fence[i], 0u, 0ull);   // (WebGL: never waits; the status updates between frames)
+#else
                     const GLenum r = g.ClientWaitSync(R.fence[i], 0x1 /*FLUSH*/, want_wait ? 50000000ull : 0ull);
+#endif
+                    RR_CRUMB(3, 11);
                     if (r == 0x911A || r == 0x911C) best = i;   // ALREADY_SIGNALED / CONDITION_SATISFIED
                 }
                 static const bool first_wait2 = std::getenv("RR_RB_FIRST_WAIT") != nullptr;
                 if (best < 0 && R.last.empty() && first_wait2) best = slot;   // driver gave up waiting: map anyway
                 if (best >= 0) {
                     g.BindBuffer(kPack, R.pbo[best]);
-                    const void *mapped = g.MapBufferRange(kPack, 0, static_cast<GLsizeiptr>(bytes), kMapRead);
-                    if (mapped != nullptr) { R.last.assign(static_cast<const std::uint8_t *>(mapped), static_cast<const std::uint8_t *>(mapped) + bytes); g.UnmapBuffer(kPack); }
+                    RR_CRUMB(3, 12);
+                    if (g.GetBufferSubData != nullptr) {   // (browser)
+                        R.last.resize(bytes);
+                        g.GetBufferSubData(kPack, 0, static_cast<GLsizeiptr>(bytes), R.last.data());
+                    } else {
+                        const void *mapped = g.MapBufferRange(kPack, 0, static_cast<GLsizeiptr>(bytes), kMapRead);
+                        if (mapped != nullptr) { R.last.assign(static_cast<const std::uint8_t *>(mapped), static_cast<const std::uint8_t *>(mapped) + bytes); g.UnmapBuffer(kPack); }
+                    }
+                    RR_CRUMB(3, 13);
                     // older reads than the one taken are no longer needed
                     for (int i = 0; i < kRing; ++i) if (R.fence[i] && R.when[i] <= R.when[best]) { g.DeleteSync(R.fence[i]); R.fence[i] = nullptr; }
                 }
@@ -1379,11 +1490,18 @@ void GlBackend::readback_to(Rt &rt, std::uint8_t *dst, std::uint32_t visible, st
             }
             if (frame_ > L.last_frame + 3u) L.have_prev = false;   // stale (sun just came into view): take this frame's pixels
             g.BindBuffer(kPack, L.pbo[L.cur]);
+            RR_CRUMB(3, 20);
             g.ReadPixels(0, 0, w1, static_cast<GLsizei>(rows), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            RR_CRUMB(3, 21);
             const int src = L.have_prev ? L.cur ^ 1 : L.cur;
             g.BindBuffer(kPack, L.pbo[src]);
-            const void *mapped = g.MapBufferRange(kPack, 0, static_cast<GLsizeiptr>(bytes), kMapRead);
-            if (mapped != nullptr) { std::memcpy(readback_scratch_.data(), mapped, bytes); g.UnmapBuffer(kPack); }
+            if (g.GetBufferSubData != nullptr) {   // (browser)
+                g.GetBufferSubData(kPack, 0, static_cast<GLsizeiptr>(bytes), readback_scratch_.data());
+            } else {
+                const void *mapped = g.MapBufferRange(kPack, 0, static_cast<GLsizeiptr>(bytes), kMapRead);
+                if (mapped != nullptr) { std::memcpy(readback_scratch_.data(), mapped, bytes); g.UnmapBuffer(kPack); }
+            }
+            RR_CRUMB(3, 22);
             g.BindBuffer(kPack, 0);
             L.cur ^= 1; L.have_prev = true; L.last_frame = frame_;
             }
@@ -1428,6 +1546,7 @@ bool GlBackend::hits_columns(const Rt &rt, std::uint32_t address, std::uint32_t 
 }
 
 void GlBackend::vram_read(std::uint32_t address, std::uint32_t length) {
+    RR_CRUMB(2, 2);
     const prof::Scope prof_scope(prof::kVramRead);
     if (!ok_) return;
     if (batch_active_) {
@@ -1454,6 +1573,7 @@ void GlBackend::vram_read(std::uint32_t address, std::uint32_t length) {
 }
 
 void GlBackend::vram_read_late_ok(std::uint32_t address, std::uint32_t length) {
+    RR_CRUMB(2, 3);
     // The sun glare renders its brightness into a 256-entry palette row (0x04195140) and loads it as a CLUT in the same
     // frame.  A synchronous read stops the CPU until the GPU has finished the frame so far (CPU and GPU then run one after
     // the other: ~125 fps instead of 144 while the sun is on screen).  Take it through the late-read ring instead.
@@ -1467,8 +1587,12 @@ void GlBackend::vram_read_late_ok(std::uint32_t address, std::uint32_t length) {
 }
 
 void GlBackend::vram_write(std::uint32_t address, std::uint32_t length) {
+    RR_CRUMB(2, 4);
     if (!ok_ || length == 0u) return;
     flush();
+    if (interp_on_)   // the CPU / a transfer wrote into a screen buffer being recorded: the draw list alone no longer rebuilds it
+        for (FrameRec &f : rec_)
+            if (!f.bad && address < f.fb + f.fb_bytes && address + length > f.fb) { f.bad = true; ++istats_.bad_cpu; }
     for (auto &rt : rts_) {
         const std::uint32_t visible = std::min<std::uint32_t>(480u, rt->stride);
         if (!hits_columns(*rt, address, length, 0u, visible)) continue;
@@ -1483,6 +1607,7 @@ void GlBackend::vram_write(std::uint32_t address, std::uint32_t length) {
 }
 
 void GlBackend::end_frame() {
+    RR_CRUMB(2, 5);
     flush();
     if (const int a = g_aniso.load(std::memory_order_relaxed); a != aniso_applied_ && gl_->mip_ready) {
         aniso_applied_ = a;
@@ -1497,6 +1622,7 @@ void GlBackend::end_frame() {
 }
 
 void GlBackend::purge_textures() {
+    RR_CRUMB(2, 22);
     constexpr std::uint64_t kLimit = 192ull * 1024 * 1024;
     if (texture_bytes_ <= kLimit / 2) return;
     for (auto it = textures_.begin(); it != textures_.end();) {
@@ -1509,6 +1635,7 @@ void GlBackend::purge_textures() {
 }
 
 unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
+    RR_CRUMB(2, 13);
     const prof::Scope prof_scope(prof::kTexture);
     valid = false;
     using Clk = std::chrono::steady_clock;
@@ -1683,6 +1810,7 @@ unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
 }
 
 void GlBackend::fallback_software(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count) {
+    RR_CRUMB(2, 27);
     const prof::Scope prof_scope(prof::kSoftware);
     flush();
     const std::uint32_t target_bytes = d.fb_stride * 272u * (d.fb_format == 3u ? 4u : 2u);
@@ -1768,6 +1896,7 @@ bool GlBackend::same_state(const GpuDraw &a, const GpuDraw &b) {
 }
 
 void GlBackend::flush() {
+    RR_CRUMB(2, 12);
     if (!batch_active_) return;
     batch_active_ = false;
     Rt *rt = batch_rt_;
@@ -1792,13 +1921,14 @@ void bound_through_triangles(GpuVertex *t, std::size_t n) {
 } // namespace
 
 void GlBackend::queue_gl(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count) {
+    RR_CRUMB(2, 11);
     const prof::Scope prof_scope(prof::kQueue);
     if (count == 0u) return;
     if (!ok_ || !gl_target(d)) { flush(); fallback_software(d, prim, v, count); return; }
     if (prim == GpuPrim::Lines || prim == GpuPrim::Points) { flush(); draw_gl(d, prim, v, count); return; }
-    Rt *rt = get_rt(d);
+    Rt *rt = rt_override_ != nullptr ? rt_override_ : get_rt(d);
     if (rt == nullptr) { flush(); fallback_software(d, prim, v, count); return; }
-    if (d.tex_enable && !d.clear_mode && d.tex_addr >= rt->addr && d.tex_addr < rt->addr + rt->bytes()) {
+    if (rt_override_ == nullptr && d.tex_enable && !d.clear_mode && d.tex_addr >= rt->addr && d.tex_addr < rt->addr + rt->bytes()) {
         // A draw that reads the very buffer it writes (the game blurs its glow buffer in place with a shifted copy of
         // itself) depends on the draws before it: no batching.  The GPU samples a snapshot of the buffer taken before
         // the draw; a layout the snapshot cannot express goes to the software renderer.
@@ -1851,7 +1981,12 @@ void GlBackend::queue_gl(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std
 }
 
 void GlBackend::draw(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count) {
+    RR_CRUMB(2, 1);
     if (count == 0u) return;
+    if (interp_on_ && d.fb_stride == 512u) {
+        if (full_pending_) full_pending_ = false;   // recorded by record_full() (before culling)
+        else interp_record(d, prim, v, count);
+    }
     if (ok_ && gl_target(d) && d.scissor_x1 >= 480 && d.fb_stride > 480u) {
         // The columns beyond the visible 480 hold the game's palette strips and are read by the CPU/GE straight from
         // memory.  They never live on the GPU: that part of the draw is done by the software renderer directly in
@@ -1885,13 +2020,17 @@ void GlBackend::draw(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::si
 }
 
 void GlBackend::draw_gl(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count) {
+    RR_CRUMB(2, 9);
     const prof::Scope prof_scope(prof::kDirect);
     if (count == 0u) return;
-    if (!ok_ || !gl_target(d)) { fallback_software(d, prim, v, count); return; }
-    Rt *rt = get_rt(d);
-    if (rt == nullptr) { fallback_software(d, prim, v, count); return; }
-    rt->format = d.fb_format;
-    if (rt->cpu_dirty) upload_from_vram(*rt);
+    Rt *rt = rt_override_;
+    if (rt == nullptr) {
+        if (!ok_ || !gl_target(d)) { fallback_software(d, prim, v, count); return; }
+        rt = get_rt(d);
+        if (rt == nullptr) { fallback_software(d, prim, v, count); return; }
+        rt->format = d.fb_format;
+        if (rt->cpu_dirty) upload_from_vram(*rt);
+    }
 
     // Build the vertex list the GPU will draw.
     const GpuVertex *data = v;
@@ -1984,6 +2123,7 @@ GlBackend::Rt *GlBackend::find_source_rt(const GpuDraw &d, const Rt &dst, std::u
 }
 
 void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data, std::size_t n, Rt &rt_ref) {
+    RR_CRUMB(2, 10);
     if (const int hide = g_hide_class.load(std::memory_order_relaxed); hide != 0 && !d.clear_mode) {
         const bool through = d.through;
         const bool blend = d.blend, atest = d.alpha_test;
@@ -2238,14 +2378,14 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
             jx = (halton(idx, 2u) - 0.5f) / static_cast<float>(scale_);
             jy = (halton(idx, 3u) - 0.5f) / static_cast<float>(scale_);
         }
-        g.Uniform2f(g.loc_jit, jx, jy);
+        uc_2f(g, g.loc_jit, jx, jy);
     }
-    g.Uniform2f(g.loc_rt, static_cast<float>(rt->stride), 272.0f);
-    g.Uniform2f(g.loc_pt, mode == GL_POINTS ? static_cast<float>(scale_) : 0.0f, 0.0f);
-    g.Uniform1i(g.loc_clear, d.clear_mode ? 1 : 0);
-    g.Uniform1i(g.loc_tex, 0);
+    uc_2f(g, g.loc_rt, static_cast<float>(rt->stride), 272.0f);
+    uc_2f(g, g.loc_pt, mode == GL_POINTS ? static_cast<float>(scale_) : 0.0f, 0.0f);
+    uc_1i(g, g.loc_clear, d.clear_mode ? 1 : 0);
+    uc_1i(g, g.loc_tex, 0);
     const bool use_tex = tex_valid && !d.clear_mode;
-    g.Uniform1i(g.loc_tex_enable, use_tex ? 1 : 0);
+    uc_1i(g, g.loc_tex_enable, use_tex ? 1 : 0);
     if (use_tex) {
         g.ActiveTexture(GL_TEXTURE0);
         g.BindTexture(GL_TEXTURE_2D, tex);
@@ -2283,50 +2423,50 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
             static bool told = false;
             if (!told) { told = true; char b[160]; std::snprintf(b, sizeof b, "GLARERAMP off for tex=%08X src=%u dst=%u tex_alpha=%d ui_crisp=%.2f", d.tex_addr, d.blend_src, d.blend_dst, d.tex_alpha ? 1 : 0, static_cast<double>(enhance_.ui_crisp)); events_.emplace_back(b); }
         }
-        g.Uniform1f(g.loc_ui_ramp, (enhance_.ui_crisp > 0.0f && src_rt == nullptr && d.through && d.tex_linear && d.tex_alpha && (glare_crisp || (d.tex_addr != 0x04195540u && d.blend_src != 6u)))
+        uc_1f(g, g.loc_ui_ramp, (enhance_.ui_crisp > 0.0f && src_rt == nullptr && d.through && d.tex_linear && d.tex_alpha && (glare_crisp || (d.tex_addr != 0x04195540u && d.blend_src != 6u)))
                                        ? 1.0f - 0.85f * std::min(enhance_.ui_crisp, 1.0f) : 0.0f);
-        g.Uniform1i(g.loc_tex_func, static_cast<GLint>(d.tex_func));
-        g.Uniform1i(g.loc_tex_alpha, d.tex_alpha ? 1 : 0);
-        g.Uniform1i(g.loc_tex_double, d.tex_double ? 1 : 0);
-        g.Uniform3f(g.loc_tex_env, static_cast<float>(d.tex_env & 255u) / 255.0f, static_cast<float>((d.tex_env >> 8u) & 255u) / 255.0f,
+        uc_1i(g, g.loc_tex_func, static_cast<GLint>(d.tex_func));
+        uc_1i(g, g.loc_tex_alpha, d.tex_alpha ? 1 : 0);
+        uc_1i(g, g.loc_tex_double, d.tex_double ? 1 : 0);
+        uc_3f(g, g.loc_tex_env, static_cast<float>(d.tex_env & 255u) / 255.0f, static_cast<float>((d.tex_env >> 8u) & 255u) / 255.0f,
                     static_cast<float>((d.tex_env >> 16u) & 255u) / 255.0f);
         if (src_rt != nullptr && src_onepx) {
             // every coordinate lands on the probe pixel's top-left corner (texel 0 of its scaled block, clamped)
-            g.Uniform2f(g.loc_tex_size, 1.0e9f, 1.0e9f);
-            g.Uniform2f(g.loc_tex_off, 0.0f, static_cast<float>(src_row0) * 1.0e9f / 272.0f);
-            g.Uniform1i(g.loc_tex_snap, 0);
-            g.Uniform1f(g.loc_dst_scale, 0.0f);
+            uc_2f(g, g.loc_tex_size, 1.0e9f, 1.0e9f);
+            uc_2f(g, g.loc_tex_off, 0.0f, static_cast<float>(src_row0) * 1.0e9f / 272.0f);
+            uc_1i(g, g.loc_tex_snap, 0);
+            uc_1f(g, g.loc_dst_scale, 0.0f);
         } else if (src_rt != nullptr) {
-            g.Uniform2f(g.loc_tex_size, static_cast<float>(src_rt->stride), 272.0f);
-            g.Uniform2f(g.loc_tex_off, 0.0f, static_cast<float>(src_row0));
-            g.Uniform1i(g.loc_tex_snap, (d.tex_linear || force_lin) ? 0 : 1);
-            g.Uniform1f(g.loc_dst_scale, static_cast<float>(rt->w) / static_cast<float>(rt->stride));
+            uc_2f(g, g.loc_tex_size, static_cast<float>(src_rt->stride), 272.0f);
+            uc_2f(g, g.loc_tex_off, 0.0f, static_cast<float>(src_row0));
+            uc_1i(g, g.loc_tex_snap, (d.tex_linear || force_lin) ? 0 : 1);
+            uc_1f(g, g.loc_dst_scale, static_cast<float>(rt->w) / static_cast<float>(rt->stride));
             // A 3D surface mapped with a render target (the cars' 64x64 reflection map 0x041FE000): keep the target's full
             // internal resolution.  2D copies (the glow buffers) still filter between PSP texels to avoid blocky boxes.
             static const bool env_sharp_off = std::getenv("RR_ENVMAP_SHARP_OFF") != nullptr;
             // RR_RT_PSP_FILTER_OFF=1: never filter between PSP texels (A/B test for the sun glare looking soft; the glow
             // buffers may then show as blocks).
             static const bool psp_filter_off = std::getenv("RR_RT_PSP_FILTER_OFF") != nullptr;
-            g.Uniform1i(g.loc_rt_psp_filter, (!psp_filter_off && (d.through || env_sharp_off)) ? 1 : 0);
+            uc_1i(g, g.loc_rt_psp_filter, (!psp_filter_off && (d.through || env_sharp_off)) ? 1 : 0);
         } else {
-            g.Uniform2f(g.loc_tex_size, static_cast<float>(d.tex_width), static_cast<float>(d.tex_height));
-            g.Uniform2f(g.loc_tex_off, 0.0f, 0.0f);
-            g.Uniform1i(g.loc_tex_snap, 0);
-            g.Uniform1f(g.loc_dst_scale, 0.0f);
+            uc_2f(g, g.loc_tex_size, static_cast<float>(d.tex_width), static_cast<float>(d.tex_height));
+            uc_2f(g, g.loc_tex_off, 0.0f, 0.0f);
+            uc_1i(g, g.loc_tex_snap, 0);
+            uc_1f(g, g.loc_dst_scale, 0.0f);
         }
     }
-    g.Uniform1i(g.loc_fog, d.fog && !d.clear_mode ? 1 : 0);
-    g.Uniform3f(g.loc_fog_color, static_cast<float>(d.fog_color & 255u) / 255.0f, static_cast<float>((d.fog_color >> 8u) & 255u) / 255.0f,
+    uc_1i(g, g.loc_fog, d.fog && !d.clear_mode ? 1 : 0);
+    uc_3f(g, g.loc_fog_color, static_cast<float>(d.fog_color & 255u) / 255.0f, static_cast<float>((d.fog_color >> 8u) & 255u) / 255.0f,
                 static_cast<float>((d.fog_color >> 16u) & 255u) / 255.0f);
     const bool atest = d.alpha_test && !d.clear_mode;
-    g.Uniform1i(g.loc_atest, atest ? 1 : 0);
+    uc_1i(g, g.loc_atest, atest ? 1 : 0);
     // RR_HUD_FAINT_CUT=n (1..40): in 2D blended draws, fragments whose alpha is below n/255 are dropped (some HUD sprites carry
     // an almost transparent but not empty background that shows as a faint box).
     static const int hud_faint_cut = [] { const char *e = std::getenv("RR_HUD_FAINT_CUT"); return e ? std::clamp(std::atoi(e), 0, 80) : 0; }();
     // default (no env var): only the speedometer's 128x128 render-target sprite (0x041D3FC0), whose empty texels carry alpha 1-5; the
     // title screen's big faint circle got a hard edge when the cut covered every 2D blend.
     static const bool hud_cut_explicit = std::getenv("RR_HUD_FAINT_CUT") != nullptr;
-    g.Uniform1i(g.loc_acut, (atest && d.blend && !d.through && src_rt == nullptr) ? g_alpha_cutoff.load(std::memory_order_relaxed)
+    uc_1i(g, g.loc_acut, (atest && d.blend && !d.through && src_rt == nullptr) ? g_alpha_cutoff.load(std::memory_order_relaxed)
                            : (hud_cut_explicit ? (hud_faint_cut > 0 && d.through && d.blend && d.tex_enable && !d.clear_mode && src_rt == nullptr && d.tex_addr != 0x04195540u && d.blend_src != 6u)
                                                   : (d.through && d.blend && d.tex_enable && !d.clear_mode && src_rt == nullptr && d.tex_addr == 0x041D3FC0u && d.tex_width == 128u && d.tex_height == 128u)) ? (hud_cut_explicit ? hud_faint_cut : 8) : 0);
     {
@@ -2340,15 +2480,15 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
             //  blended draws that are also alpha-tested are marked red / yellow)
             if (d.blend) { if (atest) { r = 1; gg = lin ? 1.0f : 0.0f; } else { b = 1; gg = lin ? 1.0f : 0.0f; } }
         }
-        g.Uniform3f(g.loc_dbg, r, gg, b);
+        uc_3f(g, g.loc_dbg, r, gg, b);
     }
-    g.Uniform1i(g.loc_atest_func, static_cast<GLint>(d.atest_func));
-    g.Uniform1i(g.loc_atest_ref, static_cast<GLint>(d.atest_ref));
-    g.Uniform1i(g.loc_atest_mask, static_cast<GLint>(d.atest_mask));
-    g.Uniform1i(g.loc_ctest, d.color_test && !d.clear_mode ? 1 : 0);
-    g.Uniform1i(g.loc_ct_func, static_cast<GLint>(d.ctest_func));
-    g.Uniform1i(g.loc_ct_ref, static_cast<GLint>(d.ctest_ref));
-    g.Uniform1i(g.loc_ct_mask, static_cast<GLint>(d.ctest_mask));
+    uc_1i(g, g.loc_atest_func, static_cast<GLint>(d.atest_func));
+    uc_1i(g, g.loc_atest_ref, static_cast<GLint>(d.atest_ref));
+    uc_1i(g, g.loc_atest_mask, static_cast<GLint>(d.atest_mask));
+    uc_1i(g, g.loc_ctest, d.color_test && !d.clear_mode ? 1 : 0);
+    uc_1i(g, g.loc_ct_func, static_cast<GLint>(d.ctest_func));
+    uc_1i(g, g.loc_ct_ref, static_cast<GLint>(d.ctest_ref));
+    uc_1i(g, g.loc_ct_mask, static_cast<GLint>(d.ctest_mask));
 
     // Scissor (in internal-resolution pixels).
     const int sx0 = std::max(d.scissor_x0, 0), sy0 = std::max(d.scissor_y0, 0);
@@ -2464,7 +2604,7 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
     } else {
         g.Disable(GL_BLEND);
     }
-    g.Uniform1i(g.loc_alpha_mode, alpha_mode);
+    uc_1i(g, g.loc_alpha_mode, alpha_mode);
     if (alpha_mode != 0) {
         // The shader's alpha is a blend factor here, not the value to store: write the real alpha in a separate
         // pass first (alpha channel only, no blending, no depth writes), then the colour pass below.
@@ -2472,11 +2612,11 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
             const bool blended_alpha = d.fb_format == 3u;
             if (blended_alpha) {
                 // src alpha factor is applied in the shader (mode 3/4); the destination side uses the GL factor.
-                g.Uniform1i(g.loc_alpha_mode, alpha_mode + 2);
+                uc_1i(g, g.loc_alpha_mode, alpha_mode + 2);
                 g.BlendEquationSeparate(GL_FUNC_ADD, alpha_eq);
                 g.BlendFuncSeparate(GL_ZERO, GL_ZERO, GL_ONE, alpha_fd);
             } else {
-                g.Uniform1i(g.loc_alpha_mode, 0);
+                uc_1i(g, g.loc_alpha_mode, 0);
                 g.Disable(GL_BLEND);
             }
             g.ColorMask(0, 0, 0, 1);
@@ -2486,7 +2626,7 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
             g.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(n * sizeof(GpuVertex)), data, GL_STREAM_DRAW);
             g.DrawArrays(mode, 0, static_cast<GLsizei>(n));
             if (dw) g.DepthMask(1);
-            g.Uniform1i(g.loc_alpha_mode, alpha_mode);
+            uc_1i(g, g.loc_alpha_mode, alpha_mode);
             g.Enable(GL_BLEND);
             g.BlendEquationSeparate(col_eq, alpha_eq);
             g.BlendFuncSeparate(col_fs, col_fd, alpha_fs, alpha_fd);
@@ -2516,6 +2656,7 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
 }
 
 void GlBackend::verify_draw(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count) {
+    RR_CRUMB(2, 28);
     flush();
     Rt *rt = get_rt(d);
     if (rt == nullptr) { draw_gl(d, prim, v, count); return; }
@@ -2609,6 +2750,7 @@ bool GlBackend::has_target(std::uint32_t address) const {
 }
 
 bool GlBackend::read_native_rgba(std::uint32_t address, std::uint8_t *rgba) {
+    RR_CRUMB(2, 23);
     flush();
     Rt *rt = find_rt(address);
     if (rt == nullptr) return false;
@@ -2629,6 +2771,7 @@ bool GlBackend::read_native_rgba(std::uint32_t address, std::uint8_t *rgba) {
 }
 
 bool GlBackend::read_scaled_rgba(std::uint32_t address, std::vector<std::uint8_t> &rgba, int &width, int &height) {
+    RR_CRUMB(2, 24);
     flush();
     Rt *rt = find_rt(address);
     if (rt == nullptr) return false;
@@ -2660,6 +2803,7 @@ void letterbox(int win_w, int win_h, int &x, int &y, int &w, int &h) {
 } // namespace
 
 bool GlBackend::present_target(std::uint32_t address, int win_w, int win_h) {
+    RR_CRUMB(2, 6);
     flush();
     Rt *rt = find_rt(address);
     if (rt == nullptr) return false;
@@ -2689,6 +2833,7 @@ bool GlBackend::present_target(std::uint32_t address, int win_w, int win_h) {
 }
 
 void GlBackend::present_rgba(const std::uint8_t *rgba, int width, int height, int win_w, int win_h) {
+    RR_CRUMB(2, 19);
     Gl &g = *gl_;
     if (g.scratch_tex == 0u || g.scratch_w != width || g.scratch_h != height) {
         if (g.scratch_fbo) g.DeleteFramebuffers(1, &g.scratch_fbo);
@@ -2727,6 +2872,7 @@ void GlBackend::present_rgba(const std::uint8_t *rgba, int width, int height, in
 }
 
 void GlBackend::capture_default_fb(int win_w, int win_h) {
+    RR_CRUMB(2, 26);
     if (!capture_pending_) return;
     capture_pending_ = false;
     Gl &g = *gl_;
@@ -2763,6 +2909,364 @@ std::string GlBackend::brief() const {
                   static_cast<unsigned long long>(stats_.texture_uploads), static_cast<unsigned long long>(stats_.texture_hits),
                   static_cast<unsigned long long>(stats_.readbacks), static_cast<unsigned long long>(stats_.uploads), static_cast<unsigned long long>(stats_.merged_draws), static_cast<unsigned long long>(stats_.tex_failed), static_cast<unsigned long long>(verify_bad_), static_cast<unsigned long long>(verify_total_), static_cast<unsigned long long>(stats_.readback_rows), (unsigned long long)rb_by_reason_[0], (unsigned long long)rb_by_reason_[1], (unsigned long long)rb_by_reason_[2], (unsigned long long)rb_by_reason_[3], (unsigned long long)rb_by_reason_[4], (unsigned long long)rb_by_reason_[5], scale_);
     return b;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Menu frame interpolation.  Outside races the game runs at 59.94 Hz; on a faster screen the port shows extra pictures
+// between two game frames.  Each draw into a screen buffer is recorded with its state, palette and vertices, plus a copy
+// of the buffer from before the frame's first draw.  When a frame is finished its draws are paired with the previous
+// frame's (same primitive, vertex count, texture and blend state, searched in order with a small look-ahead) and an
+// in-between picture redraws the frame from that copy with every paired draw's vertices (position, colour, small uv
+// changes) moved part of the way from their old place to the new one.  Draws that moved too far (a jump, a new screen)
+// and unpaired ones are drawn where they are now.  3D draws move only when all of them were paired (back-face culling
+// changes a model's triangle count as it turns; moving some parts and not others would tear it apart).  Frames that
+// cannot be rebuilt from their draws (the software renderer drew into the buffer, the CPU wrote into it, a draw read the
+// buffer it writes) get no in-between pictures: the finished frame is shown again instead.
+// ---------------------------------------------------------------------------------------------------------------------
+void GlBackend::interp_set_recording(bool on) {
+    if (on == interp_on_) return;
+    interp_on_ = on;
+    rec_.clear();
+    if (!on) { cur_.clear(); prev_.clear(); cur_ok_ = prev_ok_ = false; }
+}
+
+bool GlBackend::make_private_rt(Rt &rt) {
+    Gl &g = *gl_;
+    rt.addr = 0u; rt.stride = 512u; rt.format = 3u; rt.rows = 272u;
+    rt.w = 512 * scale_; rt.h = 272 * scale_;
+    g.GenTextures(1, &rt.tex);
+    g.BindTexture(GL_TEXTURE_2D, rt.tex);
+    g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rt.w, rt.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    g.GenRenderbuffers(1, &rt.depth);
+    g.BindRenderbuffer(GL_RENDERBUFFER, rt.depth);
+    g.RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH32F_STENCIL8, rt.w, rt.h);
+    g.GenFramebuffers(1, &rt.fbo);
+    g.BindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
+    g.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt.tex, 0);
+    g.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rt.depth);
+    if (g.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { destroy_rt(rt); return false; }
+    if (msaa_ > 1) {
+        (void)g.GetError();
+        g.GenRenderbuffers(1, &rt.ms_color);
+        g.BindRenderbuffer(GL_RENDERBUFFER, rt.ms_color);
+        g.RenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_, GL_RGBA8, rt.w, rt.h);
+        g.GenRenderbuffers(1, &rt.ms_depth);
+        g.BindRenderbuffer(GL_RENDERBUFFER, rt.ms_depth);
+        g.RenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_, GL_DEPTH32F_STENCIL8, rt.w, rt.h);
+        g.GenFramebuffers(1, &rt.ms_fbo);
+        g.BindFramebuffer(GL_FRAMEBUFFER, rt.ms_fbo);
+        g.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rt.ms_color);
+        g.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rt.ms_depth);
+        if (g.GetError() != 0u || g.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            if (rt.ms_fbo) g.DeleteFramebuffers(1, &rt.ms_fbo);
+            if (rt.ms_color) g.DeleteRenderbuffers(1, &rt.ms_color);
+            if (rt.ms_depth) g.DeleteRenderbuffers(1, &rt.ms_depth);
+            rt.ms_fbo = rt.ms_color = rt.ms_depth = 0;
+            (void)g.GetError();
+        }
+    }
+    return true;
+}
+
+// Copies colour, depth and stencil of one screen-sized target into another (both 512 x 272 at the internal scale).
+void GlBackend::copy_rt(const Rt &src_c, Rt &dst) {
+    Rt &src = const_cast<Rt &>(src_c);
+    Gl &g = *gl_;
+    g.Disable(GL_SCISSOR_TEST);
+    g.ColorMask(1, 1, 1, 1);
+    g.DepthMask(1);
+    g.StencilMask(0xFF);
+    const int w = std::min(src.w, dst.w), h = std::min(src.h, dst.h);
+    const GLbitfield all = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+    if (src.ms_fbo != 0u && src.ms_fill) {   // rows uploaded into tex that the multisampled copy has not seen yet
+        g.BindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
+        g.BindFramebuffer(GL_DRAW_FRAMEBUFFER, src.ms_fbo);
+        const int y0 = std::max(0, src.ms_fill_y0), y1 = std::min(src.h, src.ms_fill_y1);
+        if (y1 > y0) g.BlitFramebuffer(0, y0, src.w, y1, 0, y0, src.w, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        src.ms_fill = false;
+    }
+    if (src.ms_fbo != 0u && dst.ms_fbo != 0u && src.w == dst.w && src.h == dst.h) {
+        g.BindFramebuffer(GL_READ_FRAMEBUFFER, src.ms_fbo);
+        g.BindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.ms_fbo);
+        g.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, all, GL_NEAREST);
+        dst.ms_dirty = dst.ms_depth_dirty = true;
+        dst.ms_fill = false;
+        return;
+    }
+    resolve_rt(src, true);
+    g.BindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
+    g.BindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
+    g.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, all, GL_NEAREST);
+    if (dst.ms_fbo != 0u) {   // keep the multisampled copy in step (single-sampled source: every sample gets the pixel)
+        g.BindFramebuffer(GL_READ_FRAMEBUFFER, dst.fbo);
+        g.BindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.ms_fbo);
+        g.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, all, GL_NEAREST);
+        dst.ms_dirty = dst.ms_depth_dirty = true;
+    }
+}
+
+GlBackend::Rt *GlBackend::base_for(std::uint32_t fb) {
+    for (auto &[a, r] : bases_) if (a == fb) return r.get();
+    if (bases_.size() >= 4u) return nullptr;
+    auto r = std::make_unique<Rt>();
+    if (!make_private_rt(*r)) return nullptr;
+    bases_.emplace_back(fb, std::move(r));
+    return bases_.back().second.get();
+}
+
+void GlBackend::record_full(const GpuDraw &d, const GpuVertex *v, std::size_t count, int cull) {
+    if (!interp_on_ || d.fb_stride != 512u) return;
+    interp_record(d, GpuPrim::Triangles, v, count, cull);
+    full_pending_ = true;
+}
+
+void GlBackend::interp_record(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count, int cull) {
+    if (d.fb_addr < 0x04000000u || d.fb_addr >= 0x04200000u) return;
+    if (d.scissor_x0 >= 480) return;   // only the palette strips beyond the visible columns
+    FrameRec *f = nullptr;
+    for (FrameRec &r : rec_) if (r.fb == d.fb_addr) { f = &r; break; }
+    if (f == nullptr) {
+        if (rec_.size() >= 4u) return;
+        rec_.emplace_back();
+        f = &rec_.back();
+        f->fb = d.fb_addr;
+        f->fb_bytes = 512u * 272u * (d.fb_format == 3u ? 4u : 2u);
+    }
+    if (f->bad) return;
+    if (!ok_ || !gl_target(d)) { f->bad = true; ++istats_.bad_sw; return; }
+    if (d.tex_enable && !d.clear_mode) {
+        const std::uint32_t tb = std::max<std::uint32_t>(texture_bytes_of(d), 1u);
+        if (d.tex_addr < f->fb + f->fb_bytes && d.tex_addr + tb > f->fb) { f->bad = true; ++istats_.bad_self; return; }
+    }
+    if (!f->has_base && f->draws.empty() && d.clear_mode && d.clear_color && d.clear_depth && prim == GpuPrim::Sprites &&
+        d.scissor_x0 <= 0 && d.scissor_y0 <= 0 && d.scissor_x1 >= 479 && d.scissor_y1 >= 271) {
+        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+        for (std::size_t i = 0; i < count; ++i) { x0 = std::min(x0, v[i].x); y0 = std::min(y0, v[i].y); x1 = std::max(x1, v[i].x); y1 = std::max(y1, v[i].y); }
+        if (x0 <= 0.0f && y0 <= 0.0f && x1 >= 480.0f && y1 >= 272.0f) { f->has_base = true; f->cleared = true; }   // nothing of the old picture survives: no copy needed
+    }
+    if (!f->has_base) {
+        // The buffer as it was before this frame's first draw (the frame is rebuilt on top of it).
+        flush();
+        Rt *src = get_rt(d);
+        Rt *b = src != nullptr && src->stride == 512u ? base_for(d.fb_addr) : nullptr;
+        if (b == nullptr) { f->bad = true; ++istats_.bad_base; return; }
+        if (src->cpu_dirty) upload_from_vram(*src);
+        copy_rt(*src, *b);
+        f->has_base = true;
+    }
+    if (f->draws.size() >= 20000u || f->verts.size() + count > 600000u) { f->bad = true; ++istats_.bad_big; return; }
+    RecDraw r;
+    r.d = d;
+    if (d.fb_stride > 480u && r.d.scissor_x1 >= 480) r.d.scissor_x1 = 479;
+    r.prim = prim;
+    r.cull = static_cast<std::int8_t>(cull);
+    r.v0 = static_cast<std::uint32_t>(f->verts.size());
+    r.n = static_cast<std::uint32_t>(count);
+    f->verts.insert(f->verts.end(), v, v + count);
+    if (d.tex_enable && d.tex_format >= 4u && d.tex_format <= 7u && d.clut != nullptr) {
+        r.clut = static_cast<std::int32_t>(f->cluts.size() / 1024u);
+        f->cluts.insert(f->cluts.end(), d.clut, d.clut + 1024);
+    }
+    r.d.clut = nullptr;
+    std::uint64_t k = 1469598103934665603ull;
+    for (const std::uint64_t part : {static_cast<std::uint64_t>(prim), static_cast<std::uint64_t>(count), static_cast<std::uint64_t>(d.tex_enable ? 1u : 0u),
+                                     static_cast<std::uint64_t>(d.tex_enable ? d.tex_addr : 0u), static_cast<std::uint64_t>(d.tex_enable ? d.tex_format : 0u),
+                                     static_cast<std::uint64_t>(d.through ? 1u : 0u), static_cast<std::uint64_t>(d.clear_mode ? 1u : 0u),
+                                     static_cast<std::uint64_t>(d.blend ? 1u + d.blend_src * 16u + d.blend_dst * 256u : 0u)})
+        k = (k ^ part) * 1099511628211ull;
+    r.key = k;
+    f->draws.push_back(r);
+}
+
+void GlBackend::interp_frame_done(std::uint32_t shown_fb) {
+    flush();
+    ++istats_.frames;
+    FrameRec *f = nullptr;
+    for (FrameRec &r : rec_) if (r.fb == shown_fb) { f = &r; break; }
+    std::swap(prev_, cur_);
+    prev_ok_ = cur_ok_;
+    cur_.clear();
+    cur_ok_ = false;
+    if (interp_on_ && f != nullptr && !f->bad && f->has_base && !f->draws.empty()) { std::swap(cur_, *f); cur_ok_ = true; }
+    rec_.clear();
+    all3d_matched_ = false;
+    if (!cur_ok_ || !prev_ok_ || cur_.fb == 0u) return;
+    ++istats_.usable;
+    if (cur_.cleared) ++istats_.cleared;
+    // Pair each draw with an unpaired draw of the previous frame that looks the same (primitive, vertex count, texture,
+    // blend state) and sits at about the same place in the list: of those, the one whose vertices moved least.  The game
+    // sorts some draws (a car's strips) differently from frame to frame, so the order alone is not enough.
+    static const float jump = [] { const char *e = std::getenv("RR_INTERP_JUMP"); return e ? static_cast<float>(std::atof(e)) : 96.0f; }();
+    // First choice: the draw of the previous frame that read its vertices from the same address (the same model piece).
+    static const float loose = [] { const char *e = std::getenv("RR_INTERP_LOOSE"); return e ? static_cast<float>(std::atof(e)) : 8.0f; }();
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> by_key, by_src;
+    for (std::uint32_t k = 0; k < prev_.draws.size(); ++k) {
+        const std::uint64_t kk = prev_.draws[k].key ^ (static_cast<std::uint64_t>(prev_.draws[k].n) << 40);
+        by_key[kk].push_back(k);
+        if (prev_.draws[k].d.src_addr != 0u) by_src[kk ^ (static_cast<std::uint64_t>(prev_.draws[k].d.src_addr) * 0x9E3779B97F4A7C15ull)].push_back(k);
+    }
+    std::vector<std::uint8_t> used(prev_.draws.size(), 0u);
+    std::uint64_t verts3d = 0, unmoved3d = 0;
+    for (RecDraw &c : cur_.draws) {
+        c.match = -1; c.lerp = false;
+        ++istats_.draws;
+        const std::size_t idx = static_cast<std::size_t>(&c - cur_.draws.data());
+        const std::uint64_t kk = c.key ^ (static_cast<std::uint64_t>(c.n) << 40);
+        float best = 1e30f;
+        bool exact = false;
+        const GpuVertex *b = &cur_.verts[c.v0];
+        const auto pick = [&](const std::vector<std::uint32_t> &cands, std::size_t window) {
+            for (const std::uint32_t k : cands) {
+                if (used[k] != 0u || (k + window < idx) || (k > idx + window)) continue;
+                const GpuVertex *a = &prev_.verts[prev_.draws[k].v0];
+                float md = 0.0f;
+                for (std::uint32_t i = 0; i < c.n && md < best; ++i) md = std::max({md, std::fabs(b[i].x - a[i].x), std::fabs(b[i].y - a[i].y)});
+                if (md < best) { best = md; c.match = static_cast<std::int32_t>(k); if (md == 0.0f) break; }
+            }
+        };
+        if (c.d.src_addr != 0u) {
+            const auto is = by_src.find(kk ^ (static_cast<std::uint64_t>(c.d.src_addr) * 0x9E3779B97F4A7C15ull));
+            if (is != by_src.end()) { pick(is->second, 4096u); exact = c.match >= 0; if (exact) ++istats_.exact; }
+        }
+        if (!exact) {
+            // Vertices built somewhere new every frame: the same-looking draw nearby that moved least, and only a little
+            // (a wrong partner would stretch triangles across the screen).
+            const auto it = by_key.find(kk);
+            if (it != by_key.end()) pick(it->second, 96u);
+            if (c.match >= 0 && !c.d.through && best > loose) c.match = -1;   // (3D only: 2D panels slide much further per frame)
+        }
+        if (c.match >= 0) {
+            used[static_cast<std::size_t>(c.match)] = 1u;
+            ++istats_.matched;
+            c.lerp = best <= jump;
+            if (c.lerp) ++istats_.lerped;
+        }
+        if (!c.d.through && !c.d.clear_mode) { verts3d += c.n; if (!c.lerp) unmoved3d += c.n; }
+        if (!c.d.through && !c.d.clear_mode && !c.lerp) {
+            static const char *ilog = std::getenv("RR_INTERP_LOG");   // RR_INTERP_LOG=first,last (GL frame numbers): why 3D draws were not moved
+            static unsigned long long lf0 = 0, lf1 = 0; static bool lp = false;
+            if (!lp) { lp = true; if (ilog) std::sscanf(ilog, "%llu,%llu", &lf0, &lf1); }
+            if (ilog && frame_ >= lf0 && frame_ <= lf1) {
+                const std::size_t idx = static_cast<std::size_t>(&c - cur_.draws.data());
+                std::string near;
+                for (std::size_t k = idx >= 3u ? idx - 3u : 0u; k < std::min(prev_.draws.size(), idx + 4u); ++k) {
+                    char t[48]; std::snprintf(t, sizeof t, " %zu:%u/%08X%s", k, prev_.draws[k].n, prev_.draws[k].d.tex_addr, prev_.draws[k].key == c.key ? "*" : "");
+                    near += t;
+                }
+                char b[400];
+                std::snprintf(b, sizeof b, "INTERPMISS f=%llu draw %zu/%zu prev %zu n=%u tex=%08X cull=%d match=%d | prev:%s", static_cast<unsigned long long>(frame_), idx, cur_.draws.size(), prev_.draws.size(),
+                              c.n, c.d.tex_addr, c.cull, c.match, near.c_str());
+                events_.emplace_back(b);
+            }
+        }
+    }
+    // 3D draws move together or not at all (moving some parts of a model and not others would tear it apart).  A few
+    // unpaired pieces (strips that turned towards or away from the camera) are drawn where they are now.
+    all3d_matched_ = unmoved3d * 10u <= verts3d;
+    if (!all3d_matched_) ++istats_.snapped_3d;
+}
+
+bool GlBackend::interp_render(float t) {
+    if (!ok_ || !cur_ok_ || !prev_ok_) return false;
+    flush();
+    Rt *b = nullptr;
+    for (auto &[a, r] : bases_) if (a == cur_.fb) b = r.get();
+    if (b == nullptr && !cur_.cleared) return false;
+    if (!irt_) {
+        irt_ = std::make_unique<Rt>();
+        if (!make_private_rt(*irt_)) { irt_.reset(); return false; }
+    }
+    if (!cur_.cleared) copy_rt(*b, *irt_);   // (a frame that starts with a full-screen clear needs no copy: its first draw wipes the target)
+    static const bool no_uv = std::getenv("RR_INTERP_NO_UV") != nullptr;
+    rt_override_ = irt_.get();
+    for (const RecDraw &c : cur_.draws) {
+        const GpuVertex *src = &cur_.verts[c.v0];
+        const bool move = c.lerp && (c.d.through || c.d.clear_mode || all3d_matched_);
+        if (move) {
+            const GpuVertex *p = &prev_.verts[prev_.draws[static_cast<std::size_t>(c.match)].v0];
+            float muv = 0.0f;
+            for (std::uint32_t i = 0; i < c.n; ++i) muv = std::max({muv, std::fabs(src[i].u - p[i].u), std::fabs(src[i].v - p[i].v)});
+            const bool uv = !no_uv && muv <= 16.0f;
+            ivert_.assign(src, src + c.n);
+            const auto mix = [t](float a, float b) { return a + (b - a) * t; };
+            for (std::uint32_t i = 0; i < c.n; ++i) {
+                GpuVertex &o = ivert_[i];
+                const GpuVertex &a = p[i];
+                o.x = mix(a.x, o.x); o.y = mix(a.y, o.y); o.z = mix(a.z, o.z); o.inv_w = mix(a.inv_w, o.inv_w);
+                o.r = mix(a.r, o.r); o.g = mix(a.g, o.g); o.b = mix(a.b, o.b); o.a = mix(a.a, o.a); o.fog = mix(a.fog, o.fog);
+                if (uv) { o.u = mix(a.u, o.u); o.v = mix(a.v, o.v); }
+            }
+            src = ivert_.data();
+        }
+        std::uint32_t n = c.n;
+        if (c.cull >= 0) {
+            // Recorded before back-face culling: cull the (moved) triangles now, the way the GE does.
+            if (src != ivert_.data()) { ivert_.assign(src, src + c.n); src = ivert_.data(); }
+            std::uint32_t o = 0;
+            for (std::uint32_t i = 0; i + 2 < c.n; i += 3) {
+                const GpuVertex &a = ivert_[i], &b = ivert_[i + 1], &e = ivert_[i + 2];
+                const float area = (b.x - a.x) * (e.y - a.y) - (e.x - a.x) * (b.y - a.y);
+                if ((c.cull == 1 && area < 0.0f) || (c.cull == 0 && area > 0.0f)) continue;
+                if (o != i) { ivert_[o] = a; ivert_[o + 1] = b; ivert_[o + 2] = e; }
+                o += 3u;
+            }
+            n = o;
+            if (n == 0u) continue;
+        }
+        GpuDraw d = c.d;
+        d.clut = c.clut >= 0 ? &cur_.cluts[static_cast<std::size_t>(c.clut) * 1024u] : nullptr;
+        queue_gl(d, c.prim, src, n);   // consecutive draws with the same state are merged, as for the real frame
+    }
+    flush();
+    rt_override_ = nullptr;
+    resolve_rt(*irt_, false);
+    return true;
+}
+
+bool GlBackend::present_interp(int win_w, int win_h) {
+    if (!irt_) return false;
+    Gl &g = *gl_;
+    resolve_rt(*irt_, false);
+    if (post_wanted(false)) {
+        post_pass(irt_->tex, irt_->w, irt_->h, 480 * scale_, win_w, win_h);
+        capture_default_fb(win_w, win_h);
+        return true;
+    }
+    int lx, ly, lw, lh;
+    letterbox(win_w, win_h, lx, ly, lw, lh);
+    g.Disable(GL_SCISSOR_TEST);
+    g.ColorMask(1, 1, 1, 1);
+    g.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    g.Disable(GL_STENCIL_TEST);
+    g.Viewport(0, 0, win_w, win_h);
+    g.ClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    g.Clear(GL_COLOR_BUFFER_BIT);
+    g.BindFramebuffer(GL_READ_FRAMEBUFFER, irt_->fbo);
+    g.BlitFramebuffer(0, 0, 480 * scale_, 272 * scale_, lx, ly + lh, lx + lw, ly, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    capture_default_fb(win_w, win_h);
+    return true;
+}
+
+bool GlBackend::read_interp_native(std::uint8_t *rgba) {
+    if (!irt_) return false;
+    Gl &g = *gl_;
+    resolve_rt(*irt_, false);
+    readback_scratch_.resize(static_cast<std::size_t>(irt_->w) * irt_->h * 4u);
+    g.BindFramebuffer(GL_READ_FRAMEBUFFER, irt_->fbo);
+    g.PixelStorei(GL_PACK_ALIGNMENT, 1);
+    g.ReadPixels(0, 0, irt_->w, irt_->h, GL_RGBA, GL_UNSIGNED_BYTE, readback_scratch_.data());
+    const int half = scale_ / 2;
+    for (int y = 0; y < 272; ++y)
+        for (int x = 0; x < 480; ++x) {
+            const std::size_t at = (static_cast<std::size_t>(y * scale_ + half) * irt_->w + x * scale_ + half) * 4u;
+            std::uint8_t *o = rgba + (static_cast<std::size_t>(y) * 480u + x) * 4u;
+            o[0] = readback_scratch_[at]; o[1] = readback_scratch_[at + 1]; o[2] = readback_scratch_[at + 2]; o[3] = 255u;
+        }
+    return true;
 }
 
 } // namespace rr

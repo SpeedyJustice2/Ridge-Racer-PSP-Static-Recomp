@@ -402,6 +402,12 @@ std::vector<std::uint8_t> filter_rows(const std::uint8_t *rgba, std::uint32_t wi
 
 } // namespace
 
+std::vector<std::uint8_t> deflate_raw(const std::uint8_t *data, std::size_t size) {
+    std::vector<std::uint8_t> z = zlib_compress(data, size);   // 2-byte zlib header + deflate data + 4-byte Adler-32
+    if (z.size() < 6u) return {};
+    return std::vector<std::uint8_t>(z.begin() + 2, z.end() - 4);
+}
+
 bool write_png(const char *path, const std::uint8_t *rgba, std::uint32_t width, std::uint32_t height) {
     if (width == 0u || height == 0u) return false;
     const std::vector<std::uint8_t> raw = filter_rows(rgba, width, height);

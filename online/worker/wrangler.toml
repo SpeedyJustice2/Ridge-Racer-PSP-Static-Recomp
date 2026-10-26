@@ -1,0 +1,17 @@
+name = "rr-lobby"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Game versions served (comma separated; see rr_version.hpp in the game).  Add a new version here when you release it, and
+# remove old ones when their players should update.  Empty = any version.
+[vars]
+GAME_VERSIONS = "beta1"
+GAME_LATEST = "beta1"
+
+[[durable_objects.bindings]]
+name = "LOBBY"
+class_name = "Lobby"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Lobby"]

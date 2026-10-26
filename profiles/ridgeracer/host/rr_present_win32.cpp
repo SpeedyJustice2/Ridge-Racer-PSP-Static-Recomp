@@ -1,4 +1,5 @@
 #include "rr_present.hpp"
+#include "rr_pad.hpp"
 #include "rr_audio.hpp"
 #include "rr_tuning.hpp"
 #include "rr_log.hpp"
@@ -47,6 +48,7 @@ int g_lat_frames = 0, g_lat_probes = 0, g_lat_counter = 0;
 void (*g_gl_finish)() = nullptr;
 // Vertical sync (anti-tearing).  RR_VSYNC=0 off, =1 on, unset = auto: on when the monitor's refresh rate is the --fps rate
 // (or a whole multiple of it), so frames are shown on vblanks without slowing the game; off otherwise (pacing alone, may tear).
+bool g_cpu_pacing = false;         // frame skip: pace on the CPU clock, no vsync wait
 int g_swap_interval = 0;            // what the swap chain / GL context currently uses
 HMONITOR g_vsync_monitor = nullptr; // monitor the interval was chosen for
 int g_vsync_check = 0;
@@ -55,6 +57,8 @@ bool g_swap_tear = false;   // WGL_EXT_swap_control_tear (adaptive vsync)
 void update_vsync(bool force);
 
 std::vector<char16_t> g_typed;
+int g_mouse_px = 0, g_mouse_py = 0, g_mouse_clicks = 0, g_mouse_wheel_acc = 0;
+bool g_mouse_seen = false;
 
 bool g_fullscreen = false;
 WINDOWPLACEMENT g_windowed_placement{sizeof(WINDOWPLACEMENT)};
@@ -161,8 +165,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         if (wparam == VK_RETURN) return 0;   // no error beep for Alt+Enter
         return DefWindowProcW(hwnd, message, wparam, lparam);
     case WM_SETCURSOR:
-        if (g_fullscreen && LOWORD(lparam) == HTCLIENT) { SetCursor(nullptr); return TRUE; }
+        // (hidden in full screen, except while one of the port's menu pages - keyboard, server browser - is open)
+        if (g_fullscreen && LOWORD(lparam) == HTCLIENT && !rr::osk_active()) { SetCursor(nullptr); return TRUE; }
         return DefWindowProcW(hwnd, message, wparam, lparam);
+    case WM_MOUSEMOVE:
+        g_mouse_px = static_cast<short>(LOWORD(lparam)); g_mouse_py = static_cast<short>(HIWORD(lparam)); g_mouse_seen = true;
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        g_mouse_px = static_cast<short>(LOWORD(lparam)); g_mouse_py = static_cast<short>(HIWORD(lparam)); g_mouse_seen = true;
+        ++g_mouse_clicks;
+        return 0;
+    case WM_MOUSEWHEEL:
+        g_mouse_wheel_acc += static_cast<short>(HIWORD(wparam));
+        return 0;
     case WM_CHAR:
         if (g_typed.size() < 256u) g_typed.push_back(static_cast<char16_t>(wparam));
         return 0;
@@ -208,6 +224,7 @@ void pad_poll() {
 }
 
 std::uint32_t pad_buttons() {
+    if (rr::pad::sdl_available()) return rr::pad::sdl_buttons();   // every kind of controller (SDL2.dll next to the game)
     pad_poll();
     if (!g_pad_connected) return 0u;
     const WORD b = g_pad_state.Gamepad.wButtons;
@@ -224,11 +241,16 @@ std::uint32_t pad_buttons() {
     if (b & XINPUT_GAMEPAD_B) o |= 0x2000u;                // CIRCLE
     if (b & XINPUT_GAMEPAD_A) o |= 0x4000u;                // CROSS
     if (b & XINPUT_GAMEPAD_X) o |= 0x8000u;                // SQUARE
+    if (rr::pad::triggers()) {                             // right trigger = CROSS (accelerate), left = SQUARE (brake)
+        if (g_pad_state.Gamepad.bRightTrigger > 128) o |= 0x4000u;
+        if (g_pad_state.Gamepad.bLeftTrigger > 128) o |= 0x8000u;
+    }
     return o;
 }
 
 // Left stick -> PSP analog nub (0..255, 128 = centre) with a radial dead zone.
 bool pad_stick(std::uint8_t &lx, std::uint8_t &ly) {
+    if (rr::pad::sdl_available()) return rr::pad::sdl_stick(lx, ly);
     pad_poll();
     if (!g_pad_connected) return false;
     const float x = static_cast<float>(g_pad_state.Gamepad.sThumbLX) / 32767.0f;
@@ -450,6 +472,7 @@ void update_vsync(bool force) {
     if (env != nullptr && env[0] == '0') { why = "RR_VSYNC=0"; }
     else if (env != nullptr && env[0] != '\0') { interval = std::max(1, std::atoi(env)); why = "RR_VSYNC"; }
     else if (!g_throttle) { why = "unthrottled"; }
+    else if (g_cpu_pacing) { why = "frame skip (CPU pacing)"; }
     else if (hz > 0) {
         // whole multiple n of the frame rate within 3 % (144 Hz at --fps 144 -> 1, 120 Hz at --fps 60 -> 2)
         const double n = static_cast<double>(hz) / fps;
@@ -625,6 +648,10 @@ void present_gl_swap() {
     pace_frame();
 }
 
+void present_skip_frame() { present_pump(); pace_frame(); }
+void present_skip_frame_fast() { present_pump(); }
+void present_set_cpu_pacing(bool on) { if (on != g_cpu_pacing) { g_cpu_pacing = on; g_vsync_monitor = nullptr; g_vsync_check = 60; } }
+
 void present_set_frame_period_us(int period_us) {
     if (std::max(1000, period_us) != g_frame_period_us) g_vsync_monitor = nullptr;   // re-choose the swap interval
     g_frame_period_us = std::max(1000, period_us);
@@ -666,9 +693,17 @@ bool present_ramdump_requested() {
     return fire;
 }
 
+bool present_bug_report_requested() {
+    static bool was_down = false;
+    const bool down = key(VK_F12) && key(VK_CONTROL) && g_window != nullptr && GetForegroundWindow() == g_window;
+    const bool fire = down && !was_down;
+    was_down = down;
+    return fire;
+}
+
 bool present_screenshot_requested() {
     static bool was_down = false;
-    const bool down = key(VK_F12);
+    const bool down = key(VK_F12) && !key(VK_CONTROL);
     const bool fire = down && !was_down;
     was_down = down;
     return fire;
@@ -757,6 +792,28 @@ void present_take_typed(std::vector<char16_t> &out) {
 }
 
 std::uint32_t present_gamepad_buttons() { return pad_buttons(); }
+int present_pad_family() {
+    if (rr::pad::sdl_available()) return static_cast<int>(rr::pad::sdl_family());
+    pad_poll();
+    return g_pad_connected ? static_cast<int>(rr::pad::Family::Xbox) : 0;   // XInput: Xbox-style controllers
+}
+bool present_pad_stick_active() { std::uint8_t x = 128, y = 128; return pad_stick(x, y); }
+
+void present_take_mouse(PresentMouse &out) {
+    out = PresentMouse{};
+    if (g_window == nullptr) return;
+    RECT client{};
+    GetClientRect(g_window, &client);
+    if (g_mouse_seen) {
+        POINT pt{};
+        if (GetCursorPos(&pt) && ScreenToClient(g_window, &pt)) { g_mouse_px = pt.x; g_mouse_py = pt.y; }   // (also when it left the window)
+        out.inside = present_map_pointer(g_mouse_px, g_mouse_py, client.right, client.bottom, out.x, out.y);
+    }
+    out.clicks = g_mouse_clicks;
+    out.wheel = g_mouse_wheel_acc / WHEEL_DELTA;
+    g_mouse_wheel_acc -= out.wheel * WHEEL_DELTA;
+    g_mouse_clicks = 0;
+}
 
 void present_close() {
     d3d_close();

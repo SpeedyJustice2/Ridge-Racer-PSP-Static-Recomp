@@ -20,7 +20,9 @@ struct PlayerSettings {
     int window_scale = 3;         // window size, x 480x272
     bool fullscreen = false;      // borderless fullscreen (F11 / Alt+Enter switch in game)
     int fps = 0;                  // race frame rate; 0 = match the monitor, 60 = the PSP's own rate
+    int frame_skip = 0;           // 0 = automatic (default); 1 = off; 0 = automatic (pictures are skipped only while the PC cannot keep up); 2 / 3 = in races only every 2nd / 3rd picture is drawn (the game keeps full speed)
     bool low_latency = false;     // wait for the GPU after every frame (less input delay, can stutter at high settings)
+    bool smooth_menus = true;     // menus run at the high frame rate too (animations at their normal speed); false = menus at 60
     int aa = 3;                   // 0 off, 1 FXAA, 2 MSAA 2x, 3 MSAA 4x, 4 MSAA 8x
     int aniso = 16;               // 1 (off), 2, 4, 8, 16
     bool mipmaps = true;
@@ -29,6 +31,12 @@ struct PlayerSettings {
     bool smooth_cutouts = true;   // smooth the edges of trees, fences and other cut-out art
     int volume = 100;             // percent (0-150)
     int menu_volume = 100;        // percent (0-200)
+    int button_prompts = 0;       // button pictures: 0 automatic (the controller or keyboard used last), 1 Xbox, 2 PlayStation, 3 Nintendo Switch, 4 keyboard
+    bool trigger_buttons = true;  // controller triggers: right = CROSS (accelerate), left = SQUARE (brake)
+    bool perf_report = true;      // write performance-report.txt next to the game (frame times, CPU/GPU, power) for troubleshooting
+    bool online = true;           // Wireless Battle over the internet (talks to the room list service only when you open a room or a search)
+    int room_visibility = 0;      // rooms you host: 0 anyone can join, 1 with a password, 2 only with the room code (set in game)
+    std::string room_password;    // the password for room_visibility = 1
 };
 
 std::filesystem::path settings_file_path();   // ridgeracer.ini beside the executable

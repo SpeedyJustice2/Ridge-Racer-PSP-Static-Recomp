@@ -5,6 +5,7 @@
 #include "rr_log.hpp"
 #include "rr_menusound.hpp"
 #include "rr_osk_ui.hpp"
+#include "rr_lobby_ui.hpp"
 #include "rr_present.hpp"
 
 #include <algorithm>
@@ -173,7 +174,7 @@ void install_utility_hle(Runtime &runtime) {
         else if (d.status == kRunning && &d == &g_osk && osk_ui_active()) {
             std::vector<char16_t> typed;
             present_take_typed(typed);
-            const OskState st = osk_ui_update(typed, present_gamepad_buttons());
+            const OskState st = osk_ui_update(typed, present_gamepad_buttons() | (present_pad_buttons() & 0x00F0u));   // (+ keyboard arrows)
             if (const std::uint32_t ev = osk_ui_take_events(); ev != 0u) {
                 if (ev & (kOskAccept | kOskInsert)) menu_sound_play(MenuSound::Confirm);
                 else if (ev & (kOskCancel | kOskDelete)) menu_sound_play(MenuSound::Back);
@@ -205,5 +206,5 @@ void install_utility_hle(Runtime &runtime) {
 
 namespace rr {
 void utility_set_interactive(bool on) { g_interactive = on; }
-bool osk_active() { return osk_ui_active(); }
+bool osk_active() { return osk_ui_active() || lobby_ui_active(); }   // (any full-screen page of the port: game input paused, Esc is "back")
 }

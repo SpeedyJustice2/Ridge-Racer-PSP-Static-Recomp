@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ridge Racer (browser build)</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d0f14; --fg:#e8eaf0; --muted:#8a90a0; --acc:#ff3b3b; --panel:#171a22; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; }
+  header { width:100%; padding:14px 16px; border-bottom:1px solid #222736; display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  header span { color:var(--muted); font-size:13px; }
+  main { width:100%; max-width:1280px; padding:16px; display:flex; flex-direction:column; gap:14px; align-items:center; }
+  #setup { background:var(--panel); border:1px solid #222736; border-radius:10px; padding:18px; width:100%; max-width:560px; display:flex; flex-direction:column; gap:12px; }
+  #setup label { display:flex; flex-direction:column; gap:4px; color:var(--muted); font-size:13px; }
+  #setup label.check span { display:flex; align-items:center; gap:8px; color:var(--text, #ddd); }
+  select, input[type=file] { background:#0f1218; color:var(--fg); border:1px solid #2a3042; border-radius:6px; padding:8px; font:inherit; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:10px 16px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.sec { background:#2a3042; }
+  #stage { display:none; width:100%; flex-direction:column; align-items:center; gap:10px; }
+  canvas { background:#000; width:100%; max-width:960px; aspect-ratio:480/272; image-rendering:auto; border-radius:4px; outline:none; }
+  #status { color:var(--muted); min-height:1.4em; text-align:center; }
+  #err { color:#ff8a8a; white-space:pre-wrap; text-align:center; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  details { width:100%; max-width:960px; color:var(--muted); font-size:13px; }
+  pre { background:#0a0c10; padding:10px; border-radius:6px; max-height:220px; overflow:auto; margin:6px 0 0; }
+  .keys { color:var(--muted); font-size:12.5px; text-align:center; max-width:760px; }
+  .note { color:var(--muted); font-size:12.5px; }
+</style>
+</head>
+<body>
+<header><h1>Ridge Racer — browser build</h1><span>runs entirely on your computer; your disc image never leaves it</span></header>
+<main>
+  <section id="setup">
+    <div id="isolation" class="note" hidden>This page must be opened through <b>serve.cmd</b> (or serve.py) from the web build folder. It needs special headers that a plain file open cannot provide.</div>
+    <label>Your decrypted Ridge Racer disc image (.iso)<input id="iso" type="file" accept=".iso,.bin,.img"></label>
+    <label>Rendering resolution
+      <select id="scale"><option value="1">1× (480×272, PSP native)</option><option value="2" selected>2× (960×544)</option><option value="3">3× (1440×816)</option><option value="4">4× (1920×1088)</option></select>
+    </label>
+    <label>Button pictures
+      <select id="prompts"><option value="auto" selected>Automatic (the controller or keyboard you use)</option><option value="xbox">Xbox</option><option value="playstation">PlayStation</option><option value="nintendo">Nintendo Switch</option><option value="keyboard">Keyboard</option></select>
+    </label>
+    <label class="check"><span><input id="online" type="checkbox"> Online play (Wireless Battle over the internet, with PC and browser players)</span></label>
+    <button id="start" disabled>Start</button>
+    <div class="note">Needs a recent Chrome or Edge (137 or newer). The first start loads a large file — give it a moment.</div>
+    <div id="err"></div>
+  </section>
+  <section id="stage">
+    <canvas id="screen" tabindex="0"></canvas>
+    <div id="status"></div>
+    <div class="row"><button id="full" class="sec">Fullscreen</button><button id="mute" class="sec">Mute (F8)</button><button id="stop" class="sec">Stop</button></div>
+    <div class="keys">Arrows steer · Z accelerate · X brake/back · A / S other buttons · Q / E shift · Enter start · Right Shift select · J L I K analog · F8 mute · F9 / F10 volume · F1 anti-aliasing · End anisotropy · Xbox, PlayStation, Switch and most other controllers work too (right trigger accelerates, left brakes)</div>
+    <details><summary>Log</summary><div class="row" style="margin-top:6px"><button id="copylog" class="sec">Copy log</button><button id="savelog" class="sec">Save log to a file</button></div><pre id="log"></pre></details>
+  </section>
+</main>
+<script src="rr-web.js"></script>
+</body>
+</html>

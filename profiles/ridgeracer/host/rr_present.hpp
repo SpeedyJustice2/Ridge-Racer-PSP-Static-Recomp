@@ -32,8 +32,26 @@ void present_pump();
 void present_pad_analog(std::uint8_t &lx, std::uint8_t &ly);
 // Characters typed since the last call (UTF-16; 8 = backspace, 13 = Enter, 27 = Esc).  Used by the on-screen keyboard.
 void present_take_typed(std::vector<char16_t> &out);
+// Mouse since the last call (used by the server browser): pointer position in 480x272 picture units (the letterboxed
+// picture, whatever the window size), left-button presses and wheel steps (+ = away from the user).
+struct PresentMouse { bool inside{false}; float x{0.0f}, y{0.0f}; int clicks{0}; int wheel{0}; };
+void present_take_mouse(PresentMouse &out);
+// Window pixel position -> 480x272 picture units for a picture letterboxed into a win_w x win_h window.
+inline bool present_map_pointer(int px, int py, int win_w, int win_h, float &x, float &y) {
+    if (win_w <= 0 || win_h <= 0) return false;
+    float vw = static_cast<float>(win_w), vh = vw * 272.0f / 480.0f;
+    if (vh > static_cast<float>(win_h)) { vh = static_cast<float>(win_h); vw = vh * 480.0f / 272.0f; }
+    const float ox = (static_cast<float>(win_w) - vw) * 0.5f, oy = (static_cast<float>(win_h) - vh) * 0.5f;
+    x = (static_cast<float>(px) + 0.5f - ox) * 480.0f / vw;
+    y = (static_cast<float>(py) + 0.5f - oy) * 272.0f / vh;
+    return x >= 0.0f && y >= 0.0f && x < 480.0f && y < 272.0f;
+}
 // Gamepad-only PSP button bits (no keyboard), so typed letters are not mistaken for buttons.
 [[nodiscard]] std::uint32_t present_gamepad_buttons();
+// The kind of controller used last (rr::pad::Family as int, 0 = none connected) and whether its left stick is out of the
+// dead zone: decides which button pictures are shown.
+[[nodiscard]] int present_pad_family();
+[[nodiscard]] bool present_pad_stick_active();
 void present_close();
 
 // OpenGL output (used by the GPU renderer).  present_gl_open() creates a GL 3.3 core context on the window and makes
@@ -43,6 +61,12 @@ using GlProc = void *(*)(const char *);
 GlProc present_gl_open();
 void present_gl_size(int &width, int &height);
 void present_gl_swap();
+// Frame skip: a frame that is not drawn is not shown either; this keeps the window responsive and the frame pacing going
+// without a swap.  present_set_cpu_pacing(true) makes pacing run on the CPU clock (no vsync wait), needed while frames are skipped.
+void present_skip_frame();
+// Same without the pacing wait: used while the game is catching up with real time (automatic frame skip).
+void present_skip_frame_fast();
+void present_set_cpu_pacing(bool on);
 // Milliseconds spent inside SwapBuffers and in frame-pacing sleeps since the last call (for the timing heartbeat).
 void present_take_timing(double &swap_ms, double &pace_ms);
 // Input latency measurement: call present_note_pad_read() whenever the game reads the controller. present_take_latency()
@@ -55,6 +79,7 @@ void present_take_latency(PresentLatency &out);
 void present_set_title(const char *title);
 // True once each time F12 is pressed (screenshot request).
 [[nodiscard]] bool present_screenshot_requested();
+[[nodiscard]] bool present_bug_report_requested();   // Ctrl+F12 (F12 alone is a screenshot)
 // True once each time Insert is pressed (RAM snapshot request, for finding game variables).
 [[nodiscard]] bool present_ramdump_requested();
 // True once each time Delete is pressed (car write trace, see rr_hle.cpp).

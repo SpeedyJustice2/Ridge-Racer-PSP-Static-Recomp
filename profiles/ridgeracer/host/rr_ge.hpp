@@ -42,6 +42,9 @@ public:
 
     void report() const;
     void set_frame(std::uint64_t frame);
+    // A picture that will not be shown (frame skip): primitives only move the vertex / index pointers on, without the
+    // vertex transform, clipping and drawing (the drawing was thrown away anyway; the transform was most of a skipped frame's cost).
+    void set_skip_prims(bool skip) { skip_prims_ = skip; }
     [[nodiscard]] double peek_draw_ms() const { return draw_ms_; }
     [[nodiscard]] double take_draw_ms() { const double v = draw_ms_; draw_ms_ = 0.0; return v; }
     [[nodiscard]] std::uint64_t take_frame_purple() { const auto n = frame_purple_; frame_purple_ = 0u; return n; }
@@ -102,12 +105,14 @@ private:
     std::uint32_t bone_cursor_{}, world_cursor_{}, view_cursor_{}, proj_cursor_{}, tex_cursor_{};
     std::array<std::uint8_t, 1024> clut_{};
     std::uint32_t vertex_addr_{}, index_addr_{};
+    bool skip_prims_{false};
     std::uint32_t call_site_{}, call_target_{};   // last GE CALL (diagnostics)
     std::uint32_t offset_{};
     std::deque<List> queue_;
     std::vector<GeInterrupt> interrupts_;
     std::int32_t next_list_id_{1};
     std::vector<GpuVertex> scratch_;
+    std::vector<GpuVertex> full_;   // 3D triangles before back-face culling (menu frame interpolation)
 };
 
 } // namespace rr

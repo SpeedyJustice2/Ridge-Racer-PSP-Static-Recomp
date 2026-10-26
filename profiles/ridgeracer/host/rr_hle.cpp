@@ -6,16 +6,21 @@
 #include "rr_mpeg.hpp"
 #include "rr_menusound.hpp"
 #include "rr_osk_ui.hpp"
+#include "rr_lobby_ui.hpp"
 #include "rr_utility.hpp"
 #include "rr_ge.hpp"
 #include "rr_png.hpp"
 #include "rr_present.hpp"
+#include "rr_pad.hpp"
+#include "rr_report.hpp"
 #include "rr_settings.hpp"
 #include "rr_raster.hpp"
 #include "rr_gl.hpp"
 #include "rr_hle.hpp"
 #include "rr_log.hpp"
+#include "rr_net.hpp"
 #include "rr_prof.hpp"
+#include "rr_sysinfo.hpp"
 #include "rr_arena.hpp"
 
 #include "psprecomp/common.hpp"
@@ -30,6 +35,11 @@ namespace psprecomp { std::uint32_t runtime_watch_register(std::uint32_t index) 
 #include <cmath>
 #include <cstdio>
 #include <thread>
+#ifdef __EMSCRIPTEN__
+#define RR_TITLE_PREFIX "Ridge Racer (browser)"
+#else
+#define RR_TITLE_PREFIX "Ridge Racer (native)"
+#endif
 #include <memory>
 #include <system_error>
 
@@ -38,6 +48,7 @@ namespace psprecomp { std::uint32_t runtime_watch_register(std::uint32_t index) 
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <array>
@@ -341,6 +352,25 @@ struct GePending {
 std::vector<GePending> g_ge_pending;
 std::unique_ptr<SoftwareBackend> g_backend;
 std::unique_ptr<GlBackend> g_gl;
+// Frame skip (--frame-skip N): during a race only every Nth frame is drawn and shown.  The game logic runs every frame;
+// the skipped frames' drawing commands are decoded as usual but not turned into pixels.
+bool g_skip_draws = false;       // the frame being built right now is not drawn
+bool g_no_draw = false;          // RR_NO_DRAW (test rig): nothing is ever drawn
+std::uint64_t g_auto_skipped = 0, g_auto_race_frames = 0;   // automatic frame skip statistics
+std::string g_gpu_status;        // empty = the requested renderer is running; otherwise why the software renderer is used
+class SkipBackend final : public GpuBackend {
+public:
+    explicit SkipBackend(GpuBackend &inner) : inner_(inner) {}
+    void draw(const GpuDraw &s, GpuPrim p, const GpuVertex *v, std::size_t n) override { if (!g_skip_draws && !g_no_draw) inner_.draw(s, p, v, n); }
+    void vram_read(std::uint32_t a, std::uint32_t l) override { inner_.vram_read(a, l); }
+    void vram_read_late_ok(std::uint32_t a, std::uint32_t l) override { inner_.vram_read_late_ok(a, l); }
+    void set_read_reason(const char *r) override { inner_.set_read_reason(r); }
+    void vram_write(std::uint32_t a, std::uint32_t l) override { inner_.vram_write(a, l); }
+    void sync() override { inner_.sync(); }
+private:
+    GpuBackend &inner_;
+};
+std::unique_ptr<SkipBackend> g_skip_backend;
 std::unique_ptr<GeProcessor> g_ge;
 HleOptions g_hle_options;
 std::uint64_t g_frames_presented = 0, g_screenshots_taken = 0;
@@ -735,7 +765,10 @@ void start_watchdog() {
             const bool progress = frames != last_frames || switches != last_switches || vt != last_time;
             last_frames = frames; last_switches = switches; last_time = vt;
             stalled_seconds = progress ? 0u : stalled_seconds + 1u;
-            if (frames == last_dump_frames) { if (++frame_stall_seconds == 5u || frame_stall_seconds % 60u == 0u) g_dump_request = true; }
+            if (frames == last_dump_frames) {
+                if (++frame_stall_seconds == 5u || frame_stall_seconds % 60u == 0u) g_dump_request = true;
+                if (frame_stall_seconds == 15u && frames > 0u && g_hle_options.window) rr::report::write_freeze_report(15u);   // (for bug reports)
+            }
             else { frame_stall_seconds = 0u; last_dump_frames = frames; }
             if ((seconds % 10u) == 0u && g_hle_options.fps_mult != 1.0) {
                 // Frame-rate experiment: how fast the game's own loop runs per second of game time.
@@ -769,6 +802,8 @@ struct ReplayEvent { std::uint64_t read; std::uint32_t buttons; };
 double g_present_ms = 0.0;
 std::vector<ReplayEvent> g_replay;
 std::size_t g_replay_pos = 0;
+double g_ctrl_game60 = 0.0;   // controller reads counted in 59.94 Hz frames of game time
+extern std::uint64_t g_vblank_period_us, g_base_vblank_us;
 bool g_replay_active = false;
 // Test-rig input ("RIG anchor kind a b buttons" lines, made by a script from a play log): button changes timed against anchors
 // so a recorded play-through still lines up when the race runs differently.  Anchors in order: 0 boot (a = read number),
@@ -830,7 +865,7 @@ bool rig_due(const RigEvent &e) {
 
 // Every pool constant the fps patch changed: {address, original bits, patched bits}.
 std::vector<std::array<std::uint32_t, 3>> g_fps_patches;
-namespace gates { bool autopilot_buttons(std::uint32_t &out); }
+namespace gates { bool autopilot_buttons(std::uint32_t &out); extern std::uint64_t scene_frame; }
 std::uint32_t g_opp_state = 0xffffffffu;   // race state machine state (OPPSTATE), for the test autopilot
 using gates::autopilot_buttons;
 std::uint32_t effective_pad_buttons() {
@@ -842,14 +877,32 @@ std::uint32_t effective_pad_buttons() {
         return current;
     }
     if (!g_replay_active) return present_pad_buttons();
+    {   // RR_AUTOPILOT with a replay (netplay tests): the autopilot drives while the race scene runs
+        static const bool ap_replay = std::getenv("RR_AUTOPILOT") != nullptr && std::getenv("RR_AP_REPLAY") != nullptr;
+        std::uint32_t ap = 0u;
+        if (ap_replay && g_frames_presented > 30u && g_frames_presented - gates::scene_frame < 5u && autopilot_buttons(ap)) {   // (race scene on screen)
+            // RR_AP_BRAKE="every_s,hold_s" (netplay tests): full brake for hold_s seconds every every_s seconds of race (wall clock)
+            static const std::pair<double, double> brk = [] { double a = 0, b = 0; if (const char *e = std::getenv("RR_AP_BRAKE")) std::sscanf(e, "%lf,%lf", &a, &b); return std::pair<double, double>{a, b}; }();
+            if (brk.first > 0.0) {
+                static const auto t0 = std::chrono::steady_clock::now();
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (std::fmod(t, brk.first) > brk.first - brk.second) return 0x8000u;
+            }
+            return ap;
+        }
+    }
     static std::uint32_t current = 0u;
-    while (g_replay_pos < g_replay.size() && g_replay[g_replay_pos].read <= g_ctrl_reads) {
+    // RR_REPLAY_GAMETIME=1: the log's read numbers count 59.94 Hz frames of game time (a 60 fps log replayed at any rate)
+    static const bool by_time = std::getenv("RR_REPLAY_GAMETIME") != nullptr;
+    const std::uint64_t now_read = by_time ? static_cast<std::uint64_t>(g_ctrl_game60 + 1e-6) : g_ctrl_reads;
+    while (g_replay_pos < g_replay.size() && g_replay[g_replay_pos].read <= now_read) {
         current = g_replay[g_replay_pos].buttons;
         ++g_replay_pos;
     }
     return current;
 }
 
+bool g_net_race_sync = false;   // a race with other players: catch-up always on (see present_display_frame)
 double g_ft_sum = 0.0, g_ft_max = 0.0;
 std::uint64_t g_ft_frames = 0, g_ft_over20 = 0, g_ft_over33 = 0;
 std::uint64_t g_spike_prev[4] = {0, 0, 0, 0}, g_spikes_logged = 0;
@@ -873,6 +926,408 @@ std::uint32_t g_ctrl_lo = 0u, g_ctrl_hi = 0u;
 std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, std::uint32_t> g_ctrl_writers;
 void hle_watch_sink(bool is_write, std::uint32_t address, std::size_t length, std::uint64_t old_value, std::uint64_t new_value);
 [[nodiscard]] std::uint32_t arena_allocate(std::uint32_t size, std::uint32_t alignment);
+
+// ---------------------------------------------------------------------------
+// Wireless multiplayer over the network (RR_NET=1, see rr_net.hpp): the game's calls into the PSP's ad-hoc libraries
+// are answered by a net::Node, and the node's events (a group was scanned, someone said hello ...) are handed to the
+// handlers the game registered, once per frame from sceKernelCheckCallback on the game's main thread.
+// ---------------------------------------------------------------------------
+struct NetGlue {
+    std::uint32_t ctl_entry{0}, ctl_arg{0}, match_cb{0}, scratch{0};
+};
+NetGlue g_net;
+const bool g_net_logger_installed = (net::set_logger([](const std::string &text) { log_line("NET", text); }), true);
+
+net::Mac net_read_mac(Runtime &rt, std::uint32_t address) {
+    net::Mac mac{};
+    for (std::uint32_t i = 0; i < 6u; ++i) mac[i] = rt.memory().load8(address + i);
+    return mac;
+}
+void net_write_mac(Runtime &rt, std::uint32_t address, const net::Mac &mac) {
+    for (std::uint32_t i = 0; i < 6u; ++i) rt.memory().store8(address + i, mac[i]);
+}
+std::vector<std::uint8_t> net_read_bytes(Runtime &rt, std::uint32_t address, std::uint32_t length) {
+    std::vector<std::uint8_t> out;
+    if (address == 0u) return out;
+    length = std::min<std::uint32_t>(length, 0x1000u);
+    out.resize(length);
+    for (std::uint32_t i = 0; i < length; ++i) out[i] = rt.memory().load8(address + i);
+    return out;
+}
+
+// Logs the game's lobby option bytes when they change (RR_NET_TRACE=1): room info the host advertises.
+void net_log_opt(const char *what, const std::vector<std::uint8_t> &opt) {
+    static const bool on = std::getenv("RR_NET_TRACE") != nullptr;
+    static std::vector<std::uint8_t> last;
+    if (!on || opt == last) return;
+    last = opt;
+    std::string hex;
+    char b[4];
+    for (auto c : opt) { std::snprintf(b, sizeof b, "%02x", c); hex += b; }
+    log_line("NET", std::string(what) + " (" + std::to_string(opt.size()) + " bytes): " + hex);
+}
+
+// ---- server browser (internet mode): see rr_lobby_ui.hpp ----
+// The game starts its network session from one of two places in the Wireless Battle menu and stores which one at
+// 0x089F2168 (0 = Host Race, 1 = Search Race) just before; 0x089F2088 is 1 while a session is being set up, and
+// 0x089F2124 holds the 28-byte room description the host will advertise.  The group scan both paths start with returns
+// from 0x0888C688 (checked, so another version of the game simply keeps the plain behaviour).
+constexpr std::uint32_t kNetPathAddr = 0x089F2168u, kNetSetupAddr = 0x089F2088u, kRoomOptAddr = 0x089F2124u, kScanReturn = 0x0888C688u;
+struct LobbyGlue {
+    bool active{false};
+    int list_gen{-1}, lookup_gen{-1}, probe_gen{-1};
+    std::uint64_t ping_sig{0};
+    std::chrono::steady_clock::time_point ping_at{};
+    std::map<net::Mac, net::RoomInfo> known;   // rooms by id, from lists and code lookups
+    std::uint64_t shot_key{0};
+    int shot_n{0};
+    std::uint32_t frames_open{0};
+    bool browser{false};   // the open page is the server browser (else the room setup)
+} g_lobby;
+
+bool lobby_enabled() {
+    static const bool off = std::getenv("RR_NET_NO_BROWSER") != nullptr;   // (tests: the plain search that joins every room)
+    return !off;
+}
+
+void lobby_load_prefs() {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    std::error_code ec;
+    const auto ini = settings_file_path();
+    if (!std::filesystem::is_regular_file(ini, ec)) return;
+    const PlayerSettings s = load_settings(ini);
+    lobby_host_prefs() = LobbyHostPrefs{s.room_visibility, s.room_password};
+}
+void lobby_save_prefs() {
+    std::error_code ec;
+    const auto ini = settings_file_path();
+    if (!std::filesystem::is_regular_file(ini, ec)) return;
+    PlayerSettings s = load_settings(ini);
+    s.room_visibility = lobby_host_prefs().vis;
+    s.room_password = lobby_host_prefs().password;
+    save_settings(ini, s);
+}
+
+LobbyRoom lobby_room_of(const net::RoomInfo &ri, const net::BrowseState &b) {
+    LobbyRoom r;
+    std::copy(ri.mac.begin(), ri.mac.end(), r.id.begin());
+    lobby_decode_info(ri.info, r);
+    r.players = ri.players; r.max = ri.max; r.vis = ri.vis; r.est_ms = ri.est_ms; r.racing = ri.racing;
+    if (const auto it = b.ping_ms.find(ri.mac); it != b.ping_ms.end()) r.ping_ms = it->second;
+    return r;
+}
+
+// At the game's group scan: opens the browser (Search Race) or the room setup page (Host Race) and holds the scan open.
+bool lobby_try_open(Runtime &rt, AllegrexContext &ctx, net::Node &node) {
+    if (!node.online() || !lobby_enabled()) return false;
+    auto &mem = rt.memory();
+    if (static_cast<std::uint32_t>(ctx.gpr[31]) != kScanReturn || mem.load8(kNetSetupAddr) != 1u) return false;
+    const std::uint32_t path = mem.load32(kNetPathAddr);
+    if (path > 1u) return false;
+    lobby_load_prefs();
+    node.ctl_scan_hold();
+    { std::vector<char16_t> stale; present_take_typed(stale); PresentMouse m; present_take_mouse(m); }
+    g_lobby.active = true;
+    g_lobby.frames_open = 0;
+    g_lobby.list_gen = g_lobby.lookup_gen = g_lobby.probe_gen = -1;
+    g_lobby.ping_sig = 0;
+    g_lobby.browser = path == 1u;
+    if (path == 1u) {
+        log_line("NET", "Search Race: server browser opened");
+        lobby_ui_begin_browser();
+    } else {
+        std::vector<std::uint8_t> opt(28);
+        for (std::uint32_t i = 0; i < 28u; ++i) opt[i] = mem.load8(kRoomOptAddr + i);
+        LobbyRoom room;
+        lobby_decode_info(opt, room);
+        log_line("NET", "Host Race: room setup opened (room code " + node.room_code() + ")");
+        lobby_ui_begin_host(room, node.room_code());
+    }
+    return true;
+}
+
+// Once a frame (from the present path): drives the open page and carries out what it asks for.
+void lobby_frame() {
+    if (!g_lobby.active) return;
+    net::Node *node = net::shared_node();
+    if (node == nullptr) { lobby_ui_end(); g_lobby.active = false; return; }
+    node->poll();
+    const net::BrowseState &b = node->browse();
+    // results that arrived
+    {
+        std::uint64_t sig = b.ping_ms.size();
+        for (const auto &[m, ms] : b.ping_ms) sig = sig * 1000003ull + static_cast<std::uint64_t>(ms) + m[5];
+        if (b.list_gen != g_lobby.list_gen || sig != g_lobby.ping_sig) {
+            const bool new_list = b.list_gen != g_lobby.list_gen;
+            g_lobby.list_gen = b.list_gen;
+            g_lobby.ping_sig = sig;
+            std::vector<LobbyRoom> rooms;
+            if (b.list_status == 200) for (const auto &ri : b.rooms) { g_lobby.known[ri.mac] = ri; rooms.push_back(lobby_room_of(ri, b)); }
+            lobby_ui_set_rooms(rooms, b.list_gen < 0 || b.list_status == 0 ? 0 : b.list_status, new_list);
+            if (new_list && b.list_status == 200) {
+                for (const auto &ri : b.rooms) node->browse_ping(ri.mac);
+                g_lobby.ping_at = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            }
+        }
+        if (b.lookup_gen != g_lobby.lookup_gen && g_lobby.lookup_gen != -1) {
+            if (b.lookup_found) g_lobby.known[b.lookup.mac] = b.lookup;
+            lobby_ui_lookup_result(b.lookup_found, lobby_room_of(b.lookup, b), b.lookup_status, b.lookup_other_version);
+        }
+        g_lobby.lookup_gen = b.lookup_gen;
+        if (b.probe_gen != g_lobby.probe_gen && g_lobby.probe_gen != -1) lobby_ui_probe_result(b.probe_result == "version" ? "version " + b.probe_ep : b.probe_result);
+        lobby_ui_set_update(b.update_to);   // (the room service says this game version is out of date)
+        g_lobby.probe_gen = b.probe_gen;
+        if (std::chrono::steady_clock::now() >= g_lobby.ping_at && !b.rooms.empty()) {   // keep the pings fresh
+            g_lobby.ping_at = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            for (const auto &ri : b.rooms) node->browse_ping(ri.mac);
+        }
+    }
+    // input
+    LobbyInput in;
+    present_take_typed(in.typed);
+    in.pad = effective_pad_buttons() | (g_replay_active ? present_pad_buttons() : 0u);   // (tests: a live keyboard works during a replay)
+    in.gamepad = g_replay_active ? effective_pad_buttons() | present_gamepad_buttons() : present_gamepad_buttons();
+    {
+        PresentMouse m;
+        present_take_mouse(m);
+        in.mouse_inside = m.inside; in.mouse_x = m.x; in.mouse_y = m.y; in.clicks = m.clicks; in.wheel = m.wheel;
+    }
+    {   // RR_LOBBY_SCRIPT="frame:text;frame:@select;..." (tests): typed text ("\\n" = Enter, "\\e" = Esc) or a button
+        // (@select / @start / @cross / @circle / @down / @up / @left / @right) at that many frames after the page opened
+        static const char *script = std::getenv("RR_LOBBY_SCRIPT");
+        ++g_lobby.frames_open;
+        if (script != nullptr) {
+            std::string sc(script);
+            std::size_t pos = 0;
+            while (pos < sc.size()) {
+                std::size_t end = sc.find(';', pos);
+                if (end == std::string::npos) end = sc.size();
+                const std::string item = sc.substr(pos, end - pos);
+                pos = end + 1;
+                const std::size_t colon = item.find(':');
+                // optional page letter: "B120:..." only on the server browser, "H120:..." only on the room setup page
+                const char page = (!item.empty() && (item[0] == 'B' || item[0] == 'H')) ? item[0] : '\0';
+                if (page != '\0' && (page == 'B') != g_lobby.browser) continue;
+                if (colon == std::string::npos || std::strtoul(item.c_str() + (page != '\0' ? 1 : 0), nullptr, 10) != g_lobby.frames_open) continue;
+                const std::string what = item.substr(colon + 1);
+                static const std::pair<const char *, std::uint32_t> buttons[] = {{"@select", 0x1u}, {"@start", 0x8u}, {"@cross", 0x4000u}, {"@circle", 0x2000u},
+                                                                                 {"@up", 0x10u}, {"@right", 0x20u}, {"@down", 0x40u}, {"@left", 0x80u},
+                                                                                 {"@square", 0x8000u}, {"@triangle", 0x1000u}};
+                bool was_button = false;
+                for (const auto &[nm, bit] : buttons) if (what == nm) { in.pad |= bit; in.gamepad |= bit; was_button = true; }
+                if (was_button) continue;
+                for (std::size_t i = 0; i < what.size(); ++i) {
+                    if (what[i] == '\\' && i + 1 < what.size()) { in.typed.push_back(what[i + 1] == 'n' ? 13 : what[i + 1] == 'e' ? 27 : what[i + 1]); ++i; }
+                    else in.typed.push_back(static_cast<unsigned char>(what[i]));
+                }
+            }
+        }
+    }
+    const LobbyRequest rq = lobby_ui_update(in);
+    if (const std::uint32_t ev = lobby_ui_take_events(); ev != 0u) {
+        if (ev & (kOskAccept | kOskInsert)) menu_sound_play(MenuSound::Confirm);
+        else if (ev & (kOskCancel | kOskDelete)) menu_sound_play(MenuSound::Back);
+        else menu_sound_play(MenuSound::Move);
+    }
+    const auto id_of = [](const std::array<std::uint8_t, 6> &a) { net::Mac m{}; std::copy(a.begin(), a.end(), m.begin()); return m; };
+    const auto close = [&]() { lobby_ui_end(); g_lobby.active = false; };
+    switch (rq.kind) {
+    case LobbyRequestKind::None: break;
+    case LobbyRequestKind::Refresh: node->browse_refresh(); if (g_lobby.list_gen < 0) g_lobby.list_gen = b.list_gen; break;
+    case LobbyRequestKind::Lookup: if (g_lobby.lookup_gen == -1) g_lobby.lookup_gen = b.lookup_gen; node->browse_lookup(rq.text); break;
+    case LobbyRequestKind::Probe: if (g_lobby.probe_gen == -1) g_lobby.probe_gen = b.probe_gen; node->browse_probe(id_of(rq.id), rq.text); break;
+    case LobbyRequestKind::Joined: {
+        net::RoomInfo ri = g_lobby.known[id_of(rq.id)];
+        ri.mac = id_of(rq.id);
+        if (!b.probe_ep.empty()) { ri.ep = b.probe_ep; ri.lep = b.probe_lep; }
+        node->set_join_target(ri, rq.text);
+        net::ScanEntry e;
+        std::memcpy(e.name, ri.name, 8);
+        e.bssid = ri.mac;
+        node->ctl_scan_finish({e});
+        log_line("NET", "server browser: joining room " + lobby_room_code(rq.id));
+        close();
+        break;
+    }
+    case LobbyRequestKind::Cancelled:
+        node->clear_join_target();
+        node->ctl_scan_finish({});
+        log_line("NET", "server browser: closed without joining");
+        close();
+        break;
+    case LobbyRequestKind::OpenRoom:
+        node->set_host_options(rq.vis, rq.text);
+        node->ctl_scan_finish({});
+        lobby_save_prefs();
+        log_line("NET", std::string("room setup: ") + (rq.vis == 0 ? "anyone can join" : rq.vis == 1 ? "password" : "room code only") + ", code " + node->room_code());
+        close();
+        break;
+    }
+    // RR_LOBBY_SHOTS=<folder> (tests): a picture of the page whenever it changes
+    static const char *shots = std::getenv("RR_LOBBY_SHOTS");
+    if (shots != nullptr && g_lobby.active) {
+        const std::uint64_t key = lobby_ui_state_key();
+        static std::uint64_t last_shot_frame = 0;   // (at most one picture every 30 frames: the spinner changes every 3)
+        if (key != g_lobby.shot_key && g_frames_presented - last_shot_frame >= 30u) {
+            last_shot_frame = g_frames_presented;
+            g_lobby.shot_key = key;
+            std::vector<std::uint8_t> px(960u * 544u * 4u, 255);
+            lobby_ui_render(px.data(), 960, 544);
+            std::error_code ec; std::filesystem::create_directories(shots, ec);
+            char nm[96]; std::snprintf(nm, sizeof nm, "lobby_%03d_frame%07llu.png", ++g_lobby.shot_n, static_cast<unsigned long long>(g_frames_presented));
+            write_png((std::filesystem::path(shots) / nm).string().c_str(), px.data(), 960u, 544u);
+        }
+    }
+}
+
+// Handles one of the network imports for the real network.  Returns the PSP result code.
+std::uint32_t net_call(Runtime &rt, AllegrexContext &ctx, const std::string &fn, net::Node &node) {
+    auto &mem = rt.memory();
+    const auto arg = [&](int i) { return static_cast<std::uint32_t>(ctx.gpr[i]); };   // a0..a3 = 4..7, t0..t3 = 8..11
+    node.poll();
+    if (fn == "sceNetGetLocalEtherAddr") { net_write_mac(rt, arg(4), node.mac()); return 0u; }
+    if (fn == "sceNetAdhocctlAddHandler") { g_net.ctl_entry = arg(4); g_net.ctl_arg = arg(5); return 1u; }
+    if (fn == "sceNetAdhocctlDelHandler") { g_net.ctl_entry = 0u; return 0u; }
+    if (fn == "sceNetAdhocctlScan") { if (!lobby_try_open(rt, ctx, node)) node.ctl_scan(); return 0u; }
+    if (fn == "sceNetAdhocctlConnect") {
+        char name[8] = {};
+        for (std::uint32_t i = 0; i < 8u; ++i) name[i] = static_cast<char>(mem.load8(arg(4) + i));
+        node.ctl_connect(name);
+        return 0u;
+    }
+    if (fn == "sceNetAdhocctlDisconnect") {
+        node.ctl_disconnect();
+        // the game spins on its own state until the "disconnected" event arrives without ever yielding, so the handler
+        // has to run right now (as on the real PSP firmware) instead of at the next sceKernelCheckCallback
+        int ev = 0;
+        while (node.next_ctl_event(ev)) {}   // stale events are moot once we've left the group
+        if (g_net.ctl_entry != 0u) {
+            ctx.set_gpr(2, 0u);
+            notify_guest_function(rt, ctx, g_net.ctl_entry, 2u, 0u, "adhocctl_handler", "net");
+            ctx.gpr[6] = g_net.ctl_arg;
+        }
+        return 0u;
+    }
+    if (fn == "sceNetAdhocctlGetState") { if (arg(4) != 0u) mem.store32(arg(4), node.ctl_connected() ? 1u : 0u); return 0u; }
+    if (fn == "sceNetAdhocctlGetScanInfo") {
+        // the buffer holds linked 28-byte entries: next, channel, name[8], bssid[6], pad[2], mode
+        const auto found = node.ctl_scan_results();
+        const std::uint32_t size_ptr = arg(4), buf = arg(5);
+        if (size_ptr == 0u) return 0u;
+        const std::uint32_t capacity = mem.load32(size_ptr);
+        const std::uint32_t need = static_cast<std::uint32_t>(found.size()) * 28u;
+        if (buf == 0u) { mem.store32(size_ptr, need); return 0u; }
+        std::uint32_t written = 0u;
+        for (std::size_t i = 0; i < found.size() && written + 28u <= capacity; ++i, written += 28u) {
+            const std::uint32_t e = buf + written;
+            for (std::uint32_t b = 0; b < 28u; ++b) mem.store8(e + b, 0u);
+            mem.store32(e, (i + 1 < found.size() && written + 56u <= capacity) ? e + 28u : 0u);
+            mem.store32(e + 4u, found[i].channel);
+            for (std::uint32_t b = 0; b < 8u; ++b) mem.store8(e + 8u + b, static_cast<std::uint8_t>(found[i].name[b]));
+            net_write_mac(rt, e + 16u, found[i].bssid);
+        }
+        mem.store32(size_ptr, written);
+        return 0u;
+    }
+    if (fn == "sceNetAdhocPdpCreate") return static_cast<std::uint32_t>(node.pdp_create(arg(5)));
+    if (fn == "sceNetAdhocPdpDelete") { node.pdp_delete(static_cast<int>(arg(4))); return 0u; }
+    if (fn == "sceNetAdhocPdpSend") {
+        const auto data = net_read_bytes(rt, arg(7), arg(8));
+        return node.pdp_send(static_cast<int>(arg(4)), net_read_mac(rt, arg(5)), arg(6), data.data(), data.size()) == 0 ? 0u : 0x80410701u;
+    }
+    if (fn == "sceNetAdhocPdpRecv") {
+        net::Mac src{};
+        unsigned src_port = 0;
+        std::uint8_t buf[1500];
+        std::size_t len = 0;
+        const std::uint32_t len_ptr = arg(8);
+        const std::size_t capacity = std::min<std::size_t>(len_ptr != 0u ? mem.load32(len_ptr) : 0u, sizeof buf);
+        if (node.pdp_recv(static_cast<int>(arg(4)), src, src_port, buf, capacity, len) != 0) return 0x80410709u;   // no data
+        net_write_mac(rt, arg(5), src);
+        if (arg(6) != 0u) { mem.store8(arg(6), static_cast<std::uint8_t>(src_port & 0xff)); mem.store8(arg(6) + 1u, static_cast<std::uint8_t>(src_port >> 8)); }
+        for (std::size_t i = 0; i < len; ++i) mem.store8(arg(7) + static_cast<std::uint32_t>(i), buf[i]);
+        if (len_ptr != 0u) mem.store32(len_ptr, static_cast<std::uint32_t>(len));
+        return 0u;
+    }
+    if (fn == "sceNetAdhocMatchingCreate") {
+        g_net.match_cb = mem.load32(arg(29));   // the ninth argument is on the stack
+        return static_cast<std::uint32_t>(node.match_create(static_cast<int>(arg(4)), static_cast<int>(arg(5)), arg(6), arg(8), arg(9)));
+    }
+    if (fn == "sceNetAdhocMatchingStart") {
+        const auto opt = net_read_bytes(rt, arg(10), arg(9));
+        net_log_opt("start opt", opt);
+        return node.match_start(static_cast<int>(arg(4)), opt.data(), opt.size()) == 0 ? 0u : 0x80410701u;
+    }
+    if (fn == "sceNetAdhocMatchingSetHelloOpt") {
+        const auto opt = net_read_bytes(rt, arg(6), arg(5));
+        net_log_opt("hello opt", opt);
+        node.match_set_hello_opt(static_cast<int>(arg(4)), opt.data(), opt.size());
+        return 0u;
+    }
+    if (fn == "sceNetAdhocMatchingSelectTarget" || fn == "sceNetAdhocMatchingCancelTarget") {
+        const auto opt = net_read_bytes(rt, arg(7), arg(6));
+        if (fn == "sceNetAdhocMatchingSelectTarget") node.match_select_target(static_cast<int>(arg(4)), net_read_mac(rt, arg(5)), opt.data(), opt.size());
+        else node.match_cancel_target(static_cast<int>(arg(4)), net_read_mac(rt, arg(5)), opt.data(), opt.size());
+        return 0u;
+    }
+    if (fn == "sceNetAdhocMatchingGetMembers") {
+        // linked 12-byte entries: next, mac[6], pad[2]; the local player is first
+        const auto members = node.match_members(static_cast<int>(arg(4)));
+        const std::uint32_t size_ptr = arg(5), buf = arg(6);
+        if (size_ptr == 0u) return 0u;
+        const std::uint32_t capacity = mem.load32(size_ptr);
+        const std::uint32_t need = static_cast<std::uint32_t>(members.size()) * 12u;
+        if (buf == 0u) { mem.store32(size_ptr, need); return 0u; }
+        std::uint32_t written = 0u;
+        for (std::size_t i = 0; i < members.size() && written + 12u <= capacity; ++i, written += 12u) {
+            const std::uint32_t e = buf + written;
+            mem.store32(e, (i + 1 < members.size() && written + 24u <= capacity) ? e + 12u : 0u);
+            net_write_mac(rt, e + 4u, members[i].mac);
+            mem.store8(e + 10u, 0u); mem.store8(e + 11u, 0u);
+        }
+        mem.store32(size_ptr, written);
+        return 0u;
+    }
+    if (fn == "sceNetAdhocMatchingStop") { node.match_stop(static_cast<int>(arg(4))); return 0u; }
+    if (fn == "sceNetAdhocMatchingDelete") { node.match_delete(static_cast<int>(arg(4))); return 0u; }
+    if (fn == "sceNetAdhocMatchingGetPoolMaxAlloc") return 0x4000u;
+    return 0u;   // Init / Term and the like
+}
+
+// Hands one pending network event to the game's handler (called from sceKernelCheckCallback, so on the main thread
+// and never while another callback is running).  Returns true when a handler was started.
+bool net_deliver(Runtime &rt, AllegrexContext &ctx) {
+    net::Node *node = net::shared_node();
+    if (node == nullptr) return false;
+    node->set_frame_ms(static_cast<double>(g_vblank_period_us) / 1000.0);   // (prediction: the game's display delay is counted in frames)
+    node->poll();
+    const auto active = g_callback_frames.find(g_current_uid);
+    if (active != g_callback_frames.end() && !active->second.empty()) return false;
+    int event = 0;
+    if (g_net.ctl_entry != 0u && node->next_ctl_event(event)) {
+        ctx.set_gpr(2, 0u);
+        notify_guest_function(rt, ctx, g_net.ctl_entry, static_cast<std::uint32_t>(event), 0u, "adhocctl_handler", "net");
+        ctx.gpr[6] = g_net.ctl_arg;   // handler(event, error, arg)
+        return true;
+    }
+    net::MatchEvent me;
+    if (g_net.match_cb != 0u && node->next_match_event(me)) {
+        if (g_net.scratch == 0u) g_net.scratch = arena_allocate(0x400u, 16u);
+        if (g_net.scratch == 0u) return false;
+        net_write_mac(rt, g_net.scratch, me.mac);
+        const std::uint32_t opt_ptr = g_net.scratch + 16u;
+        for (std::size_t i = 0; i < me.opt.size() && i < 0x300u; ++i) rt.memory().store8(opt_ptr + static_cast<std::uint32_t>(i), me.opt[i]);
+        ctx.set_gpr(2, 0u);
+        notify_guest_function(rt, ctx, g_net.match_cb, static_cast<std::uint32_t>(me.id), static_cast<std::uint32_t>(me.event), "matching_callback", "net");
+        ctx.gpr[6] = g_net.scratch;                                            // mac
+        ctx.gpr[7] = static_cast<std::uint32_t>(std::min<std::size_t>(me.opt.size(), 0x300u));   // option length
+        ctx.gpr[8] = opt_ptr;                                                  // option data
+        return true;
+    }
+    return false;
+}
 namespace gates {
 std::vector<std::uint8_t> table;                 // one byte per guest word of kFunctionGateSpan
 std::vector<std::uint32_t> skip;                 // addresses gated at the raised rate
@@ -1425,7 +1880,313 @@ void pvs_hook(psprecomp::AllegrexContext &ctx) {
     m.store32(patched_at, buf);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Native high-rate menus (--menu-native).  The menus are a scene-graph UI engine: 0x0884F290 calls the scene update
+// 0x0895FD20(scene, dt) with dt = the pool float at 0x089A6B34 (1.0 = one frame); the update keeps a fixed-step accumulator
+// and runs whole ticks (traversal 0x089622E0, then 0x08960200), and 0x0884F2B4 -> 0x0895FEE8 draws the scene.  At the
+// raised rate dt becomes 1/mult, so the engine still ticks 60 times a second (nothing speeds up), and between ticks the
+// float values the last tick changed (positions, sizes, angles, colours of every UI node) are drawn blended from their
+// value before the tick to their value after it, by the share of the tick period that has passed.  The true values are
+// put back before the next update, so the engine never sees the blended ones.
+namespace ui {
+constexpr std::uint32_t kUpdateWrap = 0x0884f290u, kSceneUpdate = 0x0895fd20u, kTickTraverse = 0x089622e0u, kTickPost = 0x08960200u,
+                        kSceneDraw = 0x0895fee8u, kDtConst = 0x089a6b34u, kAfterDraw = 0x08825750u;   // (0x0887061C draws, calls 0x08825750, then updates)
+constexpr std::uint32_t kHeapLo = 0x09200000u, kHeapHi = 0x09400000u;   // where the UI nodes live (write traces at several menus)
+std::uint64_t last_frame = 0;            // last presented frame the UI update ran (raises the rate while the menus run)
+bool active() { return g_hle_options.menu_native && g_hle_options.fps_mult > 1.0; }
+std::vector<std::uint32_t> before;       // heap before the first tick of the current update
+bool have_before = false, ticked = false;
+struct Word { std::uint32_t addr, v0, v1; };
+std::vector<Word> words;                 // floats the last tick(s) changed
+struct Saved { std::uint32_t addr, orig, blended; };
+std::vector<Saved> saved;   // values replaced by blended ones (put back before the next update / at the frame's end)
+int steps_since = 0;
+std::uint64_t ticks = 0, blends = 0, rebuilt = 0;
+bool plausible(std::uint32_t v) {
+    if (v == 0u) return true;
+    const float f = std::bit_cast<float>(v);
+    const float a = std::fabs(f);
+    return std::isfinite(f) && a > 1e-5f && a < 1e6f;
+}
+const std::uint32_t *heap(Runtime &rt) {
+    return reinterpret_cast<const std::uint32_t *>(static_cast<const psprecomp::GuestMemory &>(rt.memory()).raw_pointer(kHeapLo, kHeapHi - kHeapLo));
+}
+void restore(Runtime &rt) {
+    if (saved.empty()) return;
+    for (const Saved &e : saved) if (rt.memory().load32(e.addr) == e.blended) rt.memory().store32(e.addr, e.orig);   // (unless reused since)
+    saved.clear();
+}
+void on_entry(Runtime &rt, std::uint32_t address, psprecomp::AllegrexContext &ctx) {
+    if (address == kAfterDraw) return;   // (the GE output of the scene is built after this call: keep the blended values until the update)
+    if (address == kUpdateWrap) {
+        last_frame = g_frames_presented;
+        restore(rt);
+        have_before = false;
+        // dt: 1/mult while the rate is raised, the game's own 1.0 otherwise
+        const float want = gates::fast_rate_active() ? static_cast<float>(1.0 / g_hle_options.fps_mult) : 1.0f;
+        if (rt.memory().load32(kDtConst) != std::bit_cast<std::uint32_t>(want)) rt.memory().store32(kDtConst, std::bit_cast<std::uint32_t>(want));
+        return;
+    }
+    if (address == kTickTraverse && ctx.gpr[31] == 0x0895fe4cu) {
+        if (!have_before) {
+            restore(rt);
+            if (const std::uint32_t *h = heap(rt)) { before.assign(h, h + (kHeapHi - kHeapLo) / 4u); have_before = true; }
+        }
+        return;
+    }
+    if (address == kTickPost && ctx.gpr[31] == 0x0895fe54u) { ticked = true; ++ticks; return; }
+    if (address == kSceneDraw) {
+        restore(rt);
+        if (!gates::fast_rate_active() || std::getenv("RR_MENU_BLEND_OFF") != nullptr) { words.clear(); ticked = false; return; }
+        if (ticked && have_before) {
+            ticked = false;
+            words.clear();
+            if (const std::uint32_t *h = heap(rt)) {
+                static const float jump = [] { const char *e = std::getenv("RR_MENU_BLEND_JUMP"); return e ? static_cast<float>(std::atof(e)) : 160.0f; }();
+                static const std::pair<std::uint32_t, std::uint32_t> rng = [] {
+                    unsigned a = kHeapLo, b = kHeapHi;
+                    if (const char *e = std::getenv("RR_MENU_BLEND_RANGE")) std::sscanf(e, "%x,%x", &a, &b);
+                    return std::pair<std::uint32_t, std::uint32_t>{a, b};
+                }();
+                // Only words that changed in one of the last few ticks too (a running animation, not a node being set up),
+                // and no tick in which pointers that had been still for a while changed (nodes made / freed: the screen is
+                // being rebuilt; pointers that keep changing are display buffers flipping).
+                static std::vector<std::uint32_t> last_change;
+                static std::uint32_t tick_no = 0;
+                ++tick_no;
+                last_change.resize(before.size(), 0u);
+                std::size_t pointer_moves = 0;
+                auto is_ptr = [](std::uint32_t v) { return v >= 0x08800000u && v < 0x0a000000u; };
+                for (std::size_t i = 0; i < before.size(); ++i) {
+                    const std::uint32_t at = kHeapLo + static_cast<std::uint32_t>(i * 4u);
+                    const std::uint32_t v0 = before[i], v1 = h[i];
+                    if (v0 == v1) continue;
+                    const bool recent = last_change[i] != 0u && tick_no - last_change[i] <= 4u;
+                    last_change[i] = tick_no;
+                    if (is_ptr(v0) || is_ptr(v1)) {
+                        if (!recent) {
+                            ++pointer_moves;
+                            static int plog = std::getenv("RR_MENU_PTR_LOG") ? std::atoi(std::getenv("RR_MENU_PTR_LOG")) : 0;
+                            if (plog > 0) { --plog; char b[96]; std::snprintf(b, sizeof b, "MENUPTR frame %llu %08X %08X>%08X", static_cast<unsigned long long>(g_frames_presented), at, v0, v1); log_line(category::kHle, b); }
+                        }
+                        continue;
+                    }
+                    if (!recent) continue;
+                    if (at < rng.first || at >= rng.second) continue;
+                    if (!plausible(v0) || !plausible(v1)) continue;
+                    const float d = std::fabs(std::bit_cast<float>(v1) - std::bit_cast<float>(v0));
+                    if (!(d <= jump)) continue;
+                    words.push_back({kHeapLo + static_cast<std::uint32_t>(i * 4u), v0, v1});
+                }
+                {   // A screen being built or torn down (memory freed and reused) is not an animation: values jump to / from 0.
+                    std::size_t zeroish = 0;
+                    for (const Word &w : words) if (w.v0 == 0u || w.v1 == 0u) ++zeroish;
+                    if (zeroish * 4u > words.size() || pointer_moves > 2u) { ++rebuilt; words.clear(); }
+                }
+                static int blog = std::getenv("RR_MENU_BLEND_LOG") ? std::atoi(std::getenv("RR_MENU_BLEND_LOG")) : 0;
+                if (blog > 0) {
+                    --blog;
+                    std::string l = "MENUBLEND frame " + std::to_string(g_frames_presented) + " words=" + std::to_string(words.size()) + " ptr=" + std::to_string(pointer_moves) + ":";
+                    for (const Word &w : words) { char b[64]; std::snprintf(b, sizeof b, " %08X:%g>%g", w.addr, static_cast<double>(std::bit_cast<float>(w.v0)), static_cast<double>(std::bit_cast<float>(w.v1))); l += b; }
+                    log_line(category::kHle, l);
+                }
+            }
+            steps_since = 0;
+        } else ++steps_since;
+        const int m = std::max(1, static_cast<int>(std::lround(g_hle_options.fps_mult)));
+        if (words.empty() || steps_since + 1 >= m) return;   // (t = 1: the true values)
+        const float t = static_cast<float>(steps_since + 1) / static_cast<float>(m);   // 1/m at the first draw after a tick, 1 just before the next
+        for (const Word &w : words) {
+            const std::uint32_t cur = rt.memory().load32(w.addr);
+            if (cur != w.v1) continue;   // changed since by something else: leave it alone
+            const float a = std::bit_cast<float>(w.v0), b = std::bit_cast<float>(w.v1);
+            const std::uint32_t bl = std::bit_cast<std::uint32_t>(a + (b - a) * t);
+            saved.push_back({w.addr, cur, bl});
+            rt.memory().store32(w.addr, bl);
+        }
+        ++blends;
+    }
+}
+// Machine select: the car turntable angle ([[a0+12]+0x210]) gets += 1.0 every call of 0x088742CC, which runs once per
+// presented frame.  At the raised rate the step that call made is cut to 1/mult (seen at the next entry).
+constexpr std::uint32_t kTurntable = 0x088742ccu;
+void turntable(Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    static std::uint32_t at = 0, prev = 0;
+    auto ok = [](std::uint32_t a) { return a >= 0x08800000u && a < 0x09ffff00u && (a & 3u) == 0u; };
+    const std::uint32_t a0 = ctx.gpr[4];
+    if (!ok(a0 + 12u)) return;
+    const std::uint32_t obj = rt.memory().load32(a0 + 12u);
+    if (!ok(obj)) return;
+    const std::uint32_t a = obj + 0x210u;
+    const std::uint32_t cur = rt.memory().load32(a);
+    if (a == at && gates::fast_rate_active() && std::getenv("RR_TURNTABLE_OFF") == nullptr) {
+        const float p = std::bit_cast<float>(prev), c = std::bit_cast<float>(cur);
+        if (c == p + 1.0f) {
+            const float n = p + static_cast<float>(1.0 / g_hle_options.fps_mult);
+            rt.memory().store32(a, std::bit_cast<std::uint32_t>(n));
+            prev = std::bit_cast<std::uint32_t>(n);
+            return;
+        }
+    }
+    at = a; prev = cur;
+}
+// Values the menus step once per presented frame (not by the UI engine's dt): at the raised rate the step made since the
+// last look is cut to 1/mult.  Floats get the fraction directly, +1 int counters through an accumulator.
+struct Stepped { std::uint32_t addr = 0, left = 0; double acc = 0.0; bool valid = false; };
+void scale_step(Runtime &rt, Stepped &t, std::uint32_t addr, bool flt, float maxd) {
+    const std::uint32_t cur = rt.memory().load32(addr);
+    if (t.valid && t.addr == addr && gates::fast_rate_active()) {
+        const double m = g_hle_options.fps_mult;
+        if (flt) {
+            const float l = std::bit_cast<float>(t.left), c = std::bit_cast<float>(cur), d = c - l;
+            if (d != 0.0f && std::fabs(d) <= maxd && plausible(t.left) && plausible(cur)) {
+                const std::uint32_t n = std::bit_cast<std::uint32_t>(static_cast<float>(l + d / m));
+                rt.memory().store32(addr, n); t.left = n; return;
+            }
+        } else {
+            const std::int32_t d = static_cast<std::int32_t>(cur - t.left);
+            if (d == 1 || d == -1) {
+                t.acc += d / m;
+                const std::int32_t k = static_cast<std::int32_t>(t.acc);
+                t.acc -= k;
+                const std::uint32_t n = t.left + static_cast<std::uint32_t>(k);
+                rt.memory().store32(addr, n); t.left = n; return;
+            }
+        }
+    }
+    t.addr = addr; t.left = cur; t.acc = 0.0; t.valid = true;
+}
+// 0x088728C8 (menu manager, once per presented frame): the bottom ticker waits [obj+0x1C0] frames (to 121), then scrolls
+// [obj+0x1BC] by 1 (2 with a button held) a frame; [obj+0x1EC] is the machine-select car yaw (+0.5 degree a frame).
+constexpr std::uint32_t kMenuMgr = 0x088728c8u;
+void menu_mgr(Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    if (std::getenv("RR_MENU_STEPS_OFF") != nullptr) return;
+    static Stepped hold, scroll, yaw;
+    const std::uint32_t a0 = ctx.gpr[4];
+    if (a0 < 0x08800000u || a0 >= 0x09ffff00u || (a0 & 3u) != 0u) return;
+    const std::uint32_t obj = rt.memory().load32(a0 + 12u);
+    if (obj < 0x08800000u || obj >= 0x09ffe000u || (obj & 3u) != 0u) return;
+    scale_step(rt, hold, obj + 0x1c0u, false, 0.0f);
+    scale_step(rt, scroll, obj + 0x1bcu, true, 4.0f);
+    scale_step(rt, yaw, obj + 0x1ecu, true, 0.05f);
+}
+} // namespace ui
+
+// Netplay prediction.  The other player's car is a physics car that the game steers toward a target position kept in its
+// controller (a0 of 0x08888AD0 / 0x08888CF4: target x, y, z floats at +0x30/+0x34/+0x38).  That target trails the newest
+// received position by about 8 frames, which is most of the delay players see.  Before the steering runs (0x08888AD0) the
+// target is moved ahead by its own per-frame motion times RR_NET_LEAD frames (default 8); the true value is put back at the
+// start of the next frame's controller update (0x08888BD8), so the game's own bookkeeping never sees the moved target.
+namespace netpred {
+constexpr std::uint32_t kStart = 0x08888bd8u, kSteer = 0x08888ad0u;
+struct Ctl { float prev[3]{}; bool have_prev{false}; float saved[3]{}; bool moved{false}; float off[3]{}; bool have_off{false}; };
+std::unordered_map<std::uint32_t, Ctl> ctls;
+// The true target of one controller goes back at the start of that same car's next update (0x08888BD8 gets an object 0x540
+// below the steering controller).  Putting every car's back at the first start of the frame was wrong with two or more other
+// cars: the game writes each controller back after all cars have run, so the restore of every car but the last was
+// overwritten by the moved value and the lead piled up frame after frame (the other car flew off the track; 3-player races).
+constexpr std::uint32_t kStartToSteer = 0x540u;
+void restore_one(Runtime &rt, std::uint32_t a0, Ctl &c) {
+    if (!c.moved) return;
+    for (int i = 0; i < 3; ++i) rt.memory().store32(a0 + 0x30u + 4u * i, std::bit_cast<std::uint32_t>(c.saved[i]));
+    c.moved = false;
+}
+void restore(Runtime &rt, std::uint32_t start_a0) {
+    if (auto it = ctls.find(start_a0 + kStartToSteer); it != ctls.end()) { restore_one(rt, it->first, it->second); return; }
+    if (ctls.size() == 1u) restore_one(rt, ctls.begin()->first, ctls.begin()->second);   // (unknown layout, one car: as before)
+}
+void on_entry(Runtime &rt, std::uint32_t address, psprecomp::AllegrexContext &ctx) {
+    {   // RR_NETPRED_TRACE=frame: the calls (address, a0, a1, target) of 20 frames from that frame on (diagnostic)
+        static const std::uint64_t tf = [] { const char *e = std::getenv("RR_NETPRED_TRACE"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+        if (tf != 0u && g_frames_presented >= tf && g_frames_presented < tf + 20u) {
+            char b[200];
+            std::snprintf(b, sizeof b, "NETPREDTRACE f=%llu %s a0=%08X a1=%08X t=%.1f,%.1f,%.1f", static_cast<unsigned long long>(g_frames_presented), address == kStart ? "start" : "steer",
+                          ctx.gpr[4], ctx.gpr[5], static_cast<double>(std::bit_cast<float>(rt.memory().load32(ctx.gpr[4] + 0x30u))),
+                          static_cast<double>(std::bit_cast<float>(rt.memory().load32(ctx.gpr[4] + 0x34u))), static_cast<double>(std::bit_cast<float>(rt.memory().load32(ctx.gpr[4] + 0x38u))));
+            log_line(category::kHle, b);
+        }
+    }
+    if (address == kStart) { restore(rt, ctx.gpr[4]); return; }
+    const std::uint32_t a0 = ctx.gpr[4];
+    if (a0 < 0x08800000u || a0 >= 0x09ffff00u) return;
+    Ctl &c = ctls[a0];
+    float t[3];
+    for (int i = 0; i < 3; ++i) t[i] = std::bit_cast<float>(rt.memory().load32(a0 + 0x30u + 4u * i));
+    if (c.moved) {
+        // Not put back since the last move.  If the target still holds exactly the moved value, it is ours: start from the
+        // true one, so the lead can never pile up.  (If the game wrote a new target meanwhile, that one is used as it is.)
+        bool ours = true;
+        for (int i = 0; i < 3; ++i) if (std::bit_cast<std::uint32_t>(t[i]) != std::bit_cast<std::uint32_t>(c.saved[i] + c.off[i])) ours = false;
+        if (ours) for (int i = 0; i < 3; ++i) t[i] = c.saved[i];
+        c.moved = false;
+    }
+    float v[3] = {0, 0, 0};
+    bool ok = c.have_prev;
+    for (int i = 0; i < 3; ++i) { v[i] = t[i] - c.prev[i]; if (!std::isfinite(v[i]) || std::fabs(v[i]) > 2000.0f) ok = false; }
+    for (int i = 0; i < 3; ++i) c.prev[i] = t[i];
+    c.have_prev = true;
+    {   // RR_NETPRED_LOG=1: once a second, the measured per-frame motion of the target next to the reported velocity (+0x40)
+        static const bool lg = std::getenv("RR_NETPRED_LOG") != nullptr;
+        static std::uint64_t last = 0;
+        if (lg && g_frames_presented - last >= 60u) {
+            last = g_frames_presented;
+            char b[200];
+            std::snprintf(b, sizeof b, "NETPRED frame %llu dt=%.3f,%.3f,%.3f vel=%.3f,%.3f,%.3f", static_cast<unsigned long long>(g_frames_presented), v[0], v[1], v[2],
+                          static_cast<double>(std::bit_cast<float>(rt.memory().load32(a0 + 0x40u))), static_cast<double>(std::bit_cast<float>(rt.memory().load32(a0 + 0x44u))),
+                          static_cast<double>(std::bit_cast<float>(rt.memory().load32(a0 + 0x48u))));
+            log_line(category::kHle, b);
+        }
+    }
+    if (!ok) return;
+    static const double frames_at60 = [] { const char *e = std::getenv("RR_NET_LEAD"); return e ? std::atof(e) : 8.0; }();
+    // The trail is counted in frames of the game's own rate: ~8 at 60 fps, ~8 at 144 too (measured 55 ms there), so lead by
+    // the same number of (current) frames.
+    // velocity: the reported one (+0x40.., per 60 Hz frame) scaled to the current frame, unless RR_NET_LEAD_MEASURED=1
+    static const bool measured = std::getenv("RR_NET_LEAD_MEASURED") != nullptr;
+    if (!measured) {
+        const double m = std::max(0.25, g_hle_options.fps_mult);
+        for (int i = 0; i < 3; ++i) {
+            const float f = std::bit_cast<float>(rt.memory().load32(a0 + 0x40u + 4u * i));
+            if (std::isfinite(f) && std::fabs(f) < 5000.0f) v[i] = static_cast<float>(f / m);
+        }
+    }
+    // lead: the game's own trail (frames_at60 frames of the current rate) + the age of the data (network), in frames
+    static const bool no_age = std::getenv("RR_NET_LEAD_NOAGE") != nullptr;
+    double age_ms = 0.0;
+    if (!no_age) if (net::Node *node = net::shared_node()) age_ms = node->data_age_ms();
+    const double frame_ms = static_cast<double>(g_vblank_period_us) / 1000.0;
+    const float k = static_cast<float>(frames_at60 + std::min(age_ms, 300.0) / frame_ms);
+    // the forward offset is smoothed over time (RR_NET_LEAD_SMOOTH_MS, default 150): the lead multiplies every small change
+    // of the reported velocity, and unsmoothed that shows as jitter in the other car's motion
+    static const double tau = [] { const char *e = std::getenv("RR_NET_LEAD_SMOOTH_MS"); return e ? std::max(1.0, std::atof(e)) : 150.0; }();
+    const float a = static_cast<float>(1.0 - std::exp(-frame_ms / tau));
+    for (int i = 0; i < 3; ++i) {
+        const float want = v[i] * k;
+        c.off[i] = c.have_off ? c.off[i] + (want - c.off[i]) * a : want;
+    }
+    c.have_off = true;
+    for (int i = 0; i < 3; ++i) { c.saved[i] = t[i]; rt.memory().store32(a0 + 0x30u + 4u * i, std::bit_cast<std::uint32_t>(t[i] + c.off[i])); }
+    c.moved = true;
+    {
+        static const std::uint64_t tf = [] { const char *e = std::getenv("RR_NETPRED_TRACE"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+        if (tf != 0u && g_frames_presented >= tf && g_frames_presented < tf + 20u) {
+            char b[220];
+            std::snprintf(b, sizeof b, "NETPREDTRACE   a0=%08X v=%.1f,%.1f,%.1f k=%.1f off=%.1f,%.1f,%.1f", a0, v[0], v[1], v[2], static_cast<double>(k), c.off[0], c.off[1], c.off[2]);
+            log_line(category::kHle, b);
+        }
+    }
+}
+bool active() {
+    static const bool on = [] { const char *e = std::getenv("RR_NET_LEAD"); return !(e != nullptr && std::atof(e) <= 0.0); }();
+    return on && net::networking_enabled();
+}
+} // namespace netpred
+
 bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
+    if (ui::active() && (address == ui::kUpdateWrap || address == ui::kTickTraverse || address == ui::kTickPost || address == ui::kSceneDraw || address == ui::kAfterDraw)) ui::on_entry(*rt, address, ctx);
+    if (address == ui::kTurntable && ui::active()) ui::turntable(*rt, ctx);
+    if ((address == netpred::kStart || address == netpred::kSteer) && netpred::active()) netpred::on_entry(*rt, address, ctx);
+    if (address == ui::kMenuMgr && ui::active()) ui::menu_mgr(*rt, ctx);
     if (address == kPvsBuild) { pvs_hook(ctx); return false; }
     if ((address == 0x088d08c8u || address == 0x088d0940u || address == 0x088d09b8u) && cull_mode() != 0) {
         // RR_NOCULL=n (experiment): bit 1 = 0x088D08C8, 2 = 0x088D0940, 4 = 0x088D09B8 always report "visible"
@@ -2015,7 +2776,7 @@ bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
         if (counts[address]++ < 400u)
             log_line(category::kHle, "CALL " + hex32(address) + " step=" + std::to_string(game_step()) + " frame=" + std::to_string(g_frames_presented) +
                                          " ra=" + hex32(ctx.gpr[31]) + " a0=" + hex32(ctx.gpr[4]) + " a1=" + hex32(ctx.gpr[5]) +
-                                         " a2=" + hex32(ctx.gpr[6]) + " a3=" + hex32(ctx.gpr[7]) +
+                                         " a2=" + hex32(ctx.gpr[6]) + " a3=" + hex32(ctx.gpr[7]) + " t0=" + hex32(ctx.gpr[8]) + " t1=" + hex32(ctx.gpr[9]) +
                                          [&] {   // the player's car height at entry (car = [[0x08a448f0]+0xc4])
                                              auto &m = rt->memory();
                                              const std::uint32_t hud = m.load32(0x08a448f0u);
@@ -2323,6 +3084,48 @@ bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
                     std::string l = "CARDUMP k=" + std::to_string(k);
                     for (std::uint32_t o = 0x0u; o < 0x2800u; o += 4u) { char t[32]; std::snprintf(t, sizeof t, " %X:%.5g", o, f(o)); l += t; }
                     log_line(category::kHle, l);
+                }
+            }
+        }
+    }
+    if (address == kCarUpdate && std::getenv("RR_FRLOG") != nullptr) {
+        // RR_FRLOG=1 (rig): every 12th step from the start signal: game time in seconds (steps / (60 * mult)), the player's course distance,
+        // speed (+0xc0), engine rpm, nitro gauge, the race clocks (HUD +0x48, radar clock) and the course distance of computer cars 0..7,
+        // to compare a race at one frame rate with the same scenario at another (RR_AP_SCRIPT drives the car by 60 Hz race ticks).
+        static std::uint32_t last = ~0u;
+        const std::uint32_t st = game_step(), k = st - tick_origin;
+        auto &m = rt->memory();
+        const std::uint32_t mgr = ctx.gpr[4];
+        if (st != last && (k % 12u) == 0u && k < 400000u && mgr >= 0x08800000u && mgr < 0x0a000000u) {
+            last = st;
+            const std::uint32_t hud = m.load32(0x08a448f0u);
+            const std::uint32_t car = (hud >= 0x08800000u && hud < 0x0a000000u) ? m.load32(hud + 0xc4u) : 0u;
+            const std::uint32_t cb = m.load32(mgr + 0x18u);
+            if (car >= 0x08800000u && car < 0x0a000000u) {
+                const auto f = [&](std::uint32_t base, std::uint32_t o) { return static_cast<double>(std::bit_cast<float>(m.load32(base + o))); };
+                const std::uint32_t radar = m.load32(0x08A447FCu);
+                char b[420];
+                int n = std::snprintf(b, sizeof b, "FRL t=%.3f k=%u d=%.3f spd=%.3f rpm=%.0f gauge=%.2f hud48=%u radar30=%u opp=", static_cast<double>(k) / (60.0 * (fast_rate_active() ? g_hle_options.fps_mult : 1.0)), k, f(car, 0x860u),
+                                      f(car, 0xc0u), f(car, 0x1e98u + 0x1cu), f(car, 0x2740u), m.load32(hud + 0x48u), (radar >= 0x08800000u && radar < 0x0a000000u) ? m.load32(radar + 0x30u) : 0u);
+                for (std::uint32_t i = 0; i < 8u && n > 0 && n < 380; ++i) {
+                    const std::uint32_t c = cb + i * 0x27a0u;
+                    if (c < 0x08800000u || c >= 0x0a000000u) break;
+                    n += std::snprintf(b + n, sizeof b - static_cast<std::size_t>(n), "%s%.1f", i ? "," : "", f(c, 0x860u));
+                }
+                log_line(category::kHle, b);
+                // RR_FRL_DUMP=i:T1,T2,...  dump all words of computer car i (hex and float) when the game time first reaches T seconds.
+                static const char *dump_env = std::getenv("RR_FRL_DUMP");
+                if (dump_env) {
+                    static std::vector<double> times; static int ci = -1; static std::size_t next = 0;
+                    if (ci < 0) { ci = std::atoi(dump_env); const char *p = std::strchr(dump_env, ':'); while (p && *p) { times.push_back(std::atof(p + 1)); p = std::strchr(p + 1, ','); } }
+                    const double gt = static_cast<double>(k) / (60.0 * (fast_rate_active() ? g_hle_options.fps_mult : 1.0));
+                    if (next < times.size() && gt >= times[next]) {
+                        ++next;
+                        const std::uint32_t c = cb + static_cast<std::uint32_t>(ci) * 0x27a0u;
+                        std::string l = "CARW c=" + hex32(c) + " T=" + std::to_string(gt);
+                        for (std::uint32_t o = 0; o < 0x27a0u; o += 4u) { char t[24]; std::snprintf(t, sizeof t, " %X:%08X", o, m.load32(c + o)); l += t; }
+                        log_line(category::kHle, l);
+                    }
                 }
             }
         }
@@ -2646,6 +3449,8 @@ void refresh_table() {
         if (a >= psprecomp::kFunctionGateBase && a - psprecomp::kFunctionGateBase < psprecomp::kFunctionGateSpan)
             table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kSpriteSlotSetX - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    for (const std::uint32_t a : {0x08888bd8u, 0x08888ad0u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;   // (netplay prediction; cheap when off)
+    if (g_hle_options.menu_native) for (const std::uint32_t a : {0x0884f290u, 0x089622e0u, 0x08960200u, 0x0895fee8u, 0x08825750u, 0x088742ccu, 0x088728c8u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kAnimStep - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kPadUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kSePlay - psprecomp::kFunctionGateBase) >> 2u] = 1u;
@@ -2762,6 +3567,14 @@ void apply_live() {
     // it WITHOUT --fps-patch (car dt stays 1/60): the car physics then steps exactly like the 60 fps game, so the hill crest
     // behaves the same, while the rest of the game keeps the raised rate.  Experimental.
     if (sel == kCandidateCount + 1 && std::getenv("RR_CAR_GATE") != nullptr) { skip.push_back(0x0883e70cu); list += " car:0883e70c"; }
+    // Tire smoke: the scene setup 0x088ee8b4 (candidate 11) runs every step once the race is under way, and it also drives the
+    // smoke particles: 0x08904f78 (per car: the wheels add the car speed to a counter every call and spawn a puff past 3000 / 4000,
+    // plus the trail emitter), 0x08835c04 (particle frame begin) and 0x08835c40 (particle motion / ageing).  Every step they spawned
+    // 4x the puffs at 240 fps that also aged 4x faster: a thick short cloud around drifting cars.  Kept on the 60 Hz ticks; the
+    // drawing (0x08835cbc) still runs every step.  RR_SMOKE_GATE_OFF=1 restores the old behaviour.
+    if (sel == kCandidateCount + 1 && std::getenv("RR_SMOKE_GATE_OFF") == nullptr) {
+        for (const std::uint32_t f : {0x08904f78u, 0x08835c04u, 0x08835c40u}) { skip.push_back(f); list += " smoke:" + hex32(f); }
+    }
     // RR_GATE_EXTRA=addr,addr,...: more functions kept on the 60 Hz ticks (diagnostic: finds what moves the plane inside candidate 11).
     if (sel == kCandidateCount + 1) {
         if (const char *e = std::getenv("RR_GATE_EXTRA")) {
@@ -2974,7 +3787,8 @@ void start(Runtime &rt) {
     gates::profile_begin();
     psprecomp::set_watch_sink(&hle_watch_sink);
     psprecomp::set_write_watch_range(lo, hi - lo);
-    if (pad_buffer != 0u) rt.memory().set_read_watch_range(pad_buffer, 16u * std::max<std::uint32_t>(pad_count, 1u));
+    if (std::getenv("RR_TRACE_READS") != nullptr) rt.memory().set_read_watch_range(lo, hi - lo);   // also log who reads the range
+    else if (pad_buffer != 0u) rt.memory().set_read_watch_range(pad_buffer, 16u * std::max<std::uint32_t>(pad_count, 1u));
     frame_fields.clear(); last_value.clear(); out.clear(); lines = 0;
     summary = std::getenv("RR_TRACE_SUMMARY") != nullptr; stats.clear(); trace_frame = 0;
     out += "CARTRACE body=" + hex32(body) + " range=" + hex32(lo) + "-" + hex32(hi) + " (offsets below are from body)\n";
@@ -3153,6 +3967,7 @@ std::uint64_t g_race_probe_frame = 0;
 bool g_fast_rate = false;
 std::uint64_t g_go_frame = 0;   // first presented frame of the current race with the player car moving (0 = not yet)
 std::uint64_t g_base_vblank_us = 16683u, g_fast_vblank_us = 16683u;
+bool g_rate_for_race = true;   // the raised rate is for a race (false: --menu-native menus)
 
 void hle_watch_sink(bool is_write, std::uint32_t address, std::size_t length, std::uint64_t old_value, std::uint64_t new_value) {
     if (is_write && g_ctrl_hi != 0u && (address & 0x1FFFFFFFu) >= (g_ctrl_lo & 0x1FFFFFFFu) && (address & 0x1FFFFFFFu) < (g_ctrl_hi & 0x1FFFFFFFu)) {
@@ -3274,24 +4089,265 @@ void arm_race_probe(Runtime &rt) {
 void update_race_rate() {
     if (!race_only_rate() || cartrace::active) return;   // (the car trace borrows the read watch)
     // In a race while the steering code reads its constant, or while the race scene runs (load, track intro, race).
-    const bool race = (g_race_probe_frame != 0u && g_frames_presented - g_race_probe_frame < 20u) ||
-                      (gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 20u && scene_state_fast(gates::scene_state));
+    const bool in_race = (g_race_probe_frame != 0u && g_frames_presented - g_race_probe_frame < 20u) ||
+                         (gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 20u && scene_state_fast(gates::scene_state));
+    // --menu-native: the menus' UI engine ran in the last few frames (see gates::ui)
+    const bool menus = g_hle_options.menu_native && gates::ui::last_frame != 0u && g_frames_presented - gates::ui::last_frame < 8u;
+    const bool race = in_race || menus;
+    g_rate_for_race = in_race;
     if (race == g_fast_rate) return;
     g_fast_rate = race;
     set_vblank_period(race ? g_fast_vblank_us : g_base_vblank_us);
-    log_line(category::kHle, std::string("FPSMULT ") + (race ? "race started: raised rate" : "race over: back to 59.94 Hz") +
-                                 " at frame " + std::to_string(g_frames_presented));
+    log_line(category::kHle, std::string("FPSMULT ") + (race ? (in_race ? "race started: raised rate" : "menus: raised rate") : "race over: back to 59.94 Hz") +
+                                 " at frame " + std::to_string(g_frames_presented) + " (game time " + std::to_string(static_cast<long long>(g_ctrl_game60)) + " pad reads at 59.94 Hz)");
 }
 
+// Performance report (--perf-report FILE; on by default for players via the settings file).  Every presented frame adds its
+// timings to small histograms, separately for "race" frames and everything else (menus, loading); the report file is
+// rewritten about every half minute and at exit, so a crash or a killed window still leaves a report.
+namespace perfrep {
+std::filesystem::path path;   // empty = off
+struct Hist {
+    static constexpr int kBins = 800;   // 0.25 ms per bin, up to 200 ms
+    std::uint64_t bin[kBins + 1]{};
+    std::uint64_t n = 0;
+    double sum = 0.0, max = 0.0;
+    void add(double ms) {
+        if (ms < 0.0) ms = 0.0;
+        ++n; sum += ms;
+        if (ms > max) max = ms;
+        const int b = static_cast<int>(ms * 4.0);
+        ++bin[b >= kBins ? kBins : b];
+    }
+    double avg() const { return n != 0u ? sum / static_cast<double>(n) : 0.0; }
+    double pct(double q) const {
+        if (n == 0u) return 0.0;
+        const std::uint64_t want = static_cast<std::uint64_t>(std::ceil(q * static_cast<double>(n)));
+        std::uint64_t acc = 0;
+        for (int i = 0; i <= kBins; ++i) { acc += bin[i]; if (acc >= want) return i == kBins ? max : (i + 0.5) * 0.25; }
+        return max;
+    }
+};
+struct Group {
+    Hist interval, work, present, draw;
+    std::uint64_t slow = 0, over33 = 0;   // frames slower than 1.25 x the target, and slower than 33.5 ms
+    double target_ms = 16.683;
+    // Game speed: the game advances one target period of game time per presented frame, so over a second of real time the game ran at
+    // (sum of periods) / (real time) of full speed.  Seconds are counted in blocks of real time >= 1000 ms.
+    double win_wall = 0.0, win_game = 0.0, total_wall = 0.0, total_game = 0.0, speed_min = 1e9, speed_max = 0.0, speed_min_at = 0.0, speed_max_at = 0.0;
+    std::uint64_t secs = 0, secs_slow = 0, secs_fast = 0;
+};
+Group race, other;
+// A frame's cycle: [block point] -> present tail (blit, swap, pacing sleep / vsync wait) -> the game runs the next frame ->
+// next block point.  So the time between block points = the previous frame's tail + the next frame's real work.
+std::chrono::steady_clock::time_point block_t;
+bool have_block = false;
+double tail_prev = 0.0;
+void note_block(std::chrono::steady_clock::time_point t) { block_t = t; have_block = true; }
+void end_tail() { if (have_block) { tail_prev = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - block_t).count(); have_block = false; } }
+void record(bool in_race, double interval, double /*unused*/, double /*unused*/, double draw, double target) {
+    Group &g = in_race ? race : other;
+    g.target_ms = target;
+    const double tail = std::min(tail_prev, interval);
+    g.interval.add(interval); g.work.add(interval - tail); g.present.add(tail); g.draw.add(draw);
+    if (interval > target * 1.25) ++g.slow;
+    if (interval > 33.5) ++g.over33;
+    g.win_wall += interval; g.win_game += target; g.total_wall += interval; g.total_game += target;
+    if (g.win_wall >= 1000.0) {
+        const double sp = g.win_game / g.win_wall;
+        ++g.secs;
+        if (sp < 0.95) ++g.secs_slow;
+        if (sp > 1.03) ++g.secs_fast;
+        if (sp < g.speed_min) { g.speed_min = sp; g.speed_min_at = g.total_wall / 1000.0; }
+        if (sp > g.speed_max) { g.speed_max = sp; g.speed_max_at = g.total_wall / 1000.0; }
+        g.win_wall = 0.0; g.win_game = 0.0;
+    }
+}
+void describe(std::ostringstream &o, const char *title, const Group &g) {
+    char b[400];
+    if (g.interval.n == 0u) { o << title << ": no frames\n\n"; return; }
+    const double secs = g.interval.sum / 1000.0;
+    std::snprintf(b, sizeof b, "%s: %llu frames over %.0f s, target %.1f fps (%.1f ms per frame)\n", title, static_cast<unsigned long long>(g.interval.n), secs, 1000.0 / g.target_ms, g.target_ms);
+    o << b;
+    std::snprintf(b, sizeof b, "  achieved:   %.1f fps average;  frames slower than 1.25x target: %llu (%.1f%%);  slower than 33 ms: %llu (%.1f%%)\n",
+                  1000.0 / std::max(g.interval.avg(), 0.001), static_cast<unsigned long long>(g.slow), 100.0 * static_cast<double>(g.slow) / static_cast<double>(g.interval.n),
+                  static_cast<unsigned long long>(g.over33), 100.0 * static_cast<double>(g.over33) / static_cast<double>(g.interval.n));
+    o << b;
+    const auto row = [&](const char *name, const Hist &h) {
+        std::snprintf(b, sizeof b, "  %-11s avg %6.2f ms   median %6.2f   95%% %6.2f   99%% %6.2f   worst %7.2f\n", name, h.avg(), h.pct(0.5), h.pct(0.95), h.pct(0.99), h.max);
+        o << b;
+    };
+    row("frame time", g.interval);
+    row("CPU work", g.work);
+    row("present", g.present);
+    row("drawing", g.draw);
+    if (g_hle_options.throttle && g.secs >= 3u && g.total_wall > 0.0) {
+        // Is the game running at its proper speed?  (Below 100 % = slow motion because the PC cannot keep up; above 100 % would be a bug.)
+        std::snprintf(b, sizeof b, "  game speed: %.1f%% of full speed on average;  slowest second %.0f%% (at %.0f s);  fastest second %.0f%% (at %.0f s);  seconds below 95%%: %llu of %llu;  above 103%%: %llu\n",
+                      100.0 * g.total_game / g.total_wall, 100.0 * g.speed_min, g.speed_min_at, 100.0 * g.speed_max, g.speed_max_at,
+                      static_cast<unsigned long long>(g.secs_slow), static_cast<unsigned long long>(g.secs), static_cast<unsigned long long>(g.secs_fast));
+        o << b;
+    }
+    // Plain-language reading: only meaningful when the frame rate is short of the target.
+    if (!g_hle_options.throttle) {
+        // Uncapped run: nothing waits for the display, so the achieved rate is the most this PC can do with these settings.
+        const double fps = 1000.0 / std::max(g.interval.avg(), 0.001), need = 1000.0 / g.target_ms;
+        char u[400];
+        std::snprintf(u, sizeof u, "  -> Uncapped: %.0f fps at most = %.1fx the %.0f fps needed (%.0f fps at the 5%% slowest frames). ", fps, fps / need, need, 1000.0 / std::max(g.interval.pct(0.95), 0.001));
+        o << u;
+        if (g.work.avg() >= g.present.avg()) o << "The limit is the CPU (game code and draw preparation): lower settings will not help much, a faster CPU or a faster build would.\n";
+        else o << "The limit is the graphics chip (or memory bandwidth): lower render scale / anti-aliasing will raise the rate.\n";
+        if (fps < need) o << "  -> This PC cannot reach full speed with these settings.\n";
+        else if (fps < need * 1.3) o << "  -> Full speed, but with little headroom: expect stutter in heavier scenes.\n";
+    } else if (g.interval.avg() > g.target_ms * 1.08) {
+        if (g.work.avg() > g.target_ms * 0.8) o << "  -> Too slow, and the CPU is the limit: running the game and preparing the frame takes " << static_cast<int>(g.work.avg() + 0.5) << " ms of a " << static_cast<int>(g.target_ms + 0.5) << " ms budget.\n";
+        else if (g.present.avg() > g.interval.avg() * 0.45) o << "  -> Too slow, and the time goes into presenting the frame (waiting for the graphics chip or the display): lower the render scale / anti-aliasing.\n";
+        else o << "  -> Too slow, with the time spread between CPU work and presenting.\n";
+    } else if (g.slow * 20u > g.interval.n) {
+        o << "  -> Average is fine but more than 5% of frames are slow: this is stutter, not low speed.\n";
+    } else {
+        o << "  -> Holds the target.\n";
+    }
+    o << "\n";
+}
+void write_report() {
+    if (path.empty()) return;
+    std::ostringstream o;
+    o << "Ridge Racer PC port - performance report\n";
+    o << "port build: " << __DATE__ << " " << __TIME__ << "\n";
+    o << system_description() << "\n";
+    if (!g_hle_options.throttle) o << "Mode: UNCAPPED (frame pacing and vsync off; measures the most this PC can do)\n";
+    if (!g_gl) {
+        o << "Graphics: software renderer (CPU)";
+        if (!g_gpu_status.empty()) o << "  <-- OpenGL was requested but NOT used: " << g_gpu_status;
+        o << "\n";
+        if (!gl_description().empty()) o << "OpenGL reported: " << gl_description() << "\n";
+    } else {
+        o << "Graphics: " << gl_description() << "\n";
+    }
+    if (g_hle_options.frame_skip > 1) o << "Frame skip: 1 picture in " << g_hle_options.frame_skip << " is drawn during races\n";
+    if (g_hle_options.frame_skip == 0) o << "Frame skip: automatic; " << g_auto_skipped << " of " << g_auto_race_frames << " race pictures were skipped to keep the game at full speed\n";
+    char b[300];
+    std::snprintf(b, sizeof b, "Settings: %s, internal scale x%d, MSAA %d, aniso %d, frame rate x%.2f, low latency %s, %s\n", g_hle_options.gpu ? "OpenGL" : "software", g_hle_options.internal_scale,
+                  g_hle_options.msaa, g_hle_options.aniso, g_hle_options.fps_mult, g_hle_options.low_latency ? "on" : "off", g_hle_options.fullscreen ? "fullscreen" : "windowed");
+    o << b << "\n";
+    describe(o, "RACE (race scene incl. countdown)", race);
+    describe(o, "OTHER (menus, loading, movies)", other);
+    o << "frame time = time between two presented frames. CPU work = the game running one frame (game code + drawing prep), without the waiting.\n"
+         "present = handing the frame to the display, including the waits for the screen refresh and the GPU (a PC that is ahead of the target spends its spare time here). drawing = part of CPU work spent turning the game's drawing commands into pictures (or GPU work).\n";
+    std::ofstream f(path, std::ios::trunc);
+    if (f) f << o.str();
+}
+} // namespace perfrep
+
+std::uint64_t g_interp_pictures = 0;   // menu in-between pictures shown (window title fps)
 void present_display_frame(Runtime &rt) {
     if (g_display.frame_top == 0u) return;
     ++g_frames_presented;
+    if (!g_hle_options.window) {   // RR_REALTIME=1 (headless netplay tests): keep the game's clock in step with the real one
+        static const bool pace = std::getenv("RR_REALTIME") != nullptr;
+        // RR_NO_DRAW=N (N > 1, with --screenshots DIR N): draw only the frames around every Nth one, so screenshots still work
+        static const long long nd = [] { const char *e = std::getenv("RR_NO_DRAW"); return e ? std::atoll(e) : 0ll; }();
+        if (nd > 1) g_no_draw = static_cast<long long>(g_frames_presented % static_cast<std::uint64_t>(nd)) < nd - 2;
+        if (pace) {
+            static const auto t0 = std::chrono::steady_clock::now();
+            static const std::uint64_t v0 = g_virtual_time_us;
+            const auto due = t0 + std::chrono::microseconds(g_virtual_time_us - v0);
+            if (due > std::chrono::steady_clock::now()) std::this_thread::sleep_until(due);
+        }
+    }
+    gates::ui::restore(rt);   // (blended menu values only live while the frame is drawn)
+    { static const bool stretch_once = (audio_set_time_stretch(g_hle_options.frame_skip != 0), true); (void)stretch_once; }   // (auto frame skip: sound never slows)
+    {   // Game catch-up steps (more than one game step per presented frame): logged every 1200 frames when any happened.
+        static std::uint32_t last_step = 0; static std::uint64_t extra = 0, frames = 0;
+        const std::uint32_t st = gates::game_step();
+        if (last_step != 0u && st > last_step + 1u && st - last_step < 100u) extra += st - last_step - 1u;
+        last_step = st;
+        if (++frames >= 1200u) {
+            if (extra != 0u) log_line(category::kHle, "CATCHUP game steps without a picture: " + std::to_string(extra) + " in the last 1200 frames (frame " + std::to_string(g_frames_presented) + ")");
+            frames = 0; extra = 0;
+        }
+    }
     update_race_rate();
+    // Which button pictures to show (controller kind used last, or the keyboard): fonts, controller screen, our pages.
+    rr::pad::frame(present_pad_buttons(), present_gamepad_buttons(), present_pad_stick_active(), static_cast<rr::pad::Family>(present_pad_family()));
+    lobby_frame();   // (server browser / room setup page, when open; every frame, also without a window: tests)
+    {   // RR_TEST_STALL="frame,ms" (netplay tests): this copy freezes for ms at that frame, like a slow PC loading a course
+        static const std::pair<unsigned long long, int> stall = [] { unsigned long long f = 0; int ms = 0; if (const char *e = std::getenv("RR_TEST_STALL")) std::sscanf(e, "%llu,%d", &f, &ms); return std::pair<unsigned long long, int>{f, ms}; }();
+        if (stall.second > 0 && g_frames_presented == stall.first) { log_line(category::kHle, "TEST stall " + std::to_string(stall.second) + " ms"); std::this_thread::sleep_for(std::chrono::milliseconds(stall.second)); }
+    }
+    const bool skipped_frame = g_skip_draws;   // this frame's drawing was skipped: do not show it
+    {   // RR_LOAD_MS=n (rig): pretend drawing a picture costs n ms of CPU (a slow PC), to test the automatic frame skip
+        static const double load_ms = [] { const char *e = std::getenv("RR_LOAD_MS"); return e ? std::atof(e) : 0.0; }();
+        if (load_ms > 0.0 && !skipped_frame && gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 5u) {
+            const auto t_end = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(load_ms));
+            while (std::chrono::steady_clock::now() < t_end) {}
+        }
+    }
+    // A race with other players: every copy runs its own race clock (the game does not resynchronize them after the start), so
+    // a copy that falls behind real time (a stall, a busy or hidden browser window) would stay behind for the rest of the race
+    // and the others would see its car in the wrong place.  So in a networked race the catch-up below is always on, and it
+    // makes up as much as 10 s (single player keeps losing anything beyond 100 ms instead of fast-forwarding).
+    {
+        static bool was_net = false;
+        net::Node *nn = net::shared_node();
+        g_net_race_sync = nn != nullptr && nn->in_session() && gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 5u &&
+                          std::getenv("RR_NET_NO_CATCHUP") == nullptr;
+        if (g_net_race_sync != was_net) { was_net = g_net_race_sync; if (g_net_race_sync) log_line(category::kHle, "networked race: catch-up on (the race clock stays in step with real time)"); }
+    }
+    if (g_hle_options.frame_skip == 0 || g_net_race_sync) {
+        // Automatic frame skip: the game should run at full speed whatever the PC manages.  An ideal timeline (one virtual vblank period per
+        // frame) is kept for the race; when the real clock is more than 2.5 periods behind it, the next pictures are not drawn (the game
+        // logic and the drawing-command decoding still run, only pixels are skipped) and no pacing wait is done, so the game catches up.
+        // At most 5 pictures in a row are skipped; if still more than 0.6 s behind the timeline restarts (slow motion, as before).
+        static std::chrono::steady_clock::time_point ideal;
+        static bool have_ideal = false;
+        static int run = 0;
+        const bool race = gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 5u;
+        if (!race) { have_ideal = false; run = 0; g_skip_draws = false; }
+        else {
+            ++g_auto_race_frames;
+            const auto now = std::chrono::steady_clock::now();
+            const auto period = std::chrono::microseconds(static_cast<long long>(g_vblank_period_us));
+            if (!have_ideal) { ideal = now; have_ideal = true; }
+            else ideal += period;
+            const double p_ms = static_cast<double>(g_vblank_period_us) / 1000.0;
+            const double lag_ms = std::chrono::duration<double, std::milli>(now - ideal).count();
+            // Further behind than this: the lag is not made up (that would be a fast-forward the player sees and hears); the game just
+            // lost that moment.  RR_AUTOSKIP_MAX_LAG_MS overrides (the old value was 600).
+            static const double max_lag_solo = [] { const char *e = std::getenv("RR_AUTOSKIP_MAX_LAG_MS"); return e ? std::atof(e) : 100.0; }();
+            const double max_lag = g_net_race_sync ? 10000.0 : max_lag_solo;
+            if (lag_ms > max_lag) { ideal = now; run = 0; g_skip_draws = false; }
+            else {
+                if (lag_ms < -2.0 * p_ms) ideal = now - period;   // ahead of the timeline (the pacing waits): no credit to spend later
+                // Catching up plays the sound faster than real time too (it follows the game), so only a real lag is caught up, not a hiccup:
+                // the sound queue absorbs a lag of this size as a little extra latency without any audible speed-up.
+                static const double lag_limit = [] { const char *e = std::getenv("RR_AUTOSKIP_LAG_MS"); return e ? std::atof(e) : -1.0; }();
+                static const int run_limit = [] { const char *e = std::getenv("RR_AUTOSKIP_RUN"); return e ? std::max(1, std::atoi(e)) : 5; }();
+                if (lag_ms > (lag_limit >= 0.0 ? std::max(lag_limit, 1.5 * p_ms) : std::max(2.5 * p_ms, 60.0)) && run < (g_net_race_sync ? 15 : run_limit)) {
+                    g_skip_draws = true; ++run; ++g_auto_skipped;
+                    if (g_net_race_sync && lag_ms > 500.0) {   // (diagnostic: a real lag being made up)
+                        static std::uint64_t last_log = 0;
+                        if (g_frames_presented - last_log > 300u) { last_log = g_frames_presented; log_line(category::kHle, "networked race: catching up " + std::to_string(static_cast<int>(lag_ms)) + " ms"); }
+                    }
+                }
+                else { g_skip_draws = false; run = 0; }
+            }
+        }
+    } else if (g_hle_options.frame_skip > 1) {
+        static const bool always = std::getenv("RR_FRAMESKIP_ALWAYS") != nullptr;   // test: skip in menus too
+        const bool race = always || (gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 5u);
+        g_skip_draws = race && (g_frames_presented % static_cast<std::uint64_t>(g_hle_options.frame_skip)) != 0u;   // the frame that starts now
+    }
     if (g_gl) {
         g_gl->end_frame();
         for (const std::string &line : g_gl->take_events()) log_line(category::kGe, line);
     }
-    if (g_ge) g_ge->set_frame(g_frames_presented);
+    if (g_ge) {
+        g_ge->set_frame(g_frames_presented);
+        static const bool full_skip_off = std::getenv("RR_SKIP_TRANSFORM_OFF") != nullptr;
+        g_ge->set_skip_prims(g_skip_draws && !full_skip_off);
+    }
     if (g_hle_options.stop_after_frame != 0u && g_frames_presented >= g_hle_options.stop_after_frame)
         rt.stop("stop-after-frame reached");
     // Race-relative test triggers (test harness): GO = first frame the player's car moves (the race camera latch).
@@ -3313,7 +4369,7 @@ void present_display_frame(Runtime &rt) {
             if (!moving) move_run = 0u;
             else {
                 if (move_run++ == 0u) move_first = g_frames_presented;
-                if (move_run >= 30u && g_go_frame == 0u) { g_go_frame = move_first; log_line(category::kHle, "GO at frame " + std::to_string(g_go_frame) + " step " + std::to_string(gates::game_step())); }
+                if (move_run >= 30u && g_go_frame == 0u) { g_go_frame = move_first; log_line(category::kHle, "GO at frame " + std::to_string(g_go_frame) + " step " + std::to_string(gates::game_step()) + " (game time " + std::to_string(static_cast<long long>(g_ctrl_game60)) + " pad reads at 59.94 Hz)"); }
             }
         }
         static const long long go_stop = [] { const char *e = std::getenv("RR_GO_STOP"); return e ? std::atoll(e) : -1ll; }();
@@ -3325,6 +4381,10 @@ void present_display_frame(Runtime &rt) {
             if (go_diff >= 0 && since == go_diff && !difftrace::active) difftrace::start(rt);
             if (go_calls >= 0 && since == go_calls) callprof::start();
         }
+    }
+    {   // RR_CALLS_AT_FRAME=N (rig): start the call profile at presented frame N (absolute), independent of GO.
+        static const long long at_frame = [] { const char *e = std::getenv("RR_CALLS_AT_FRAME"); return e ? std::atoll(e) : -1ll; }();
+        if (at_frame >= 0 && static_cast<long long>(g_frames_presented) == at_frame) callprof::start();
     }
     g_import_snapshot = g_import_calls;
     // Purple detector: save a screenshot whenever a presented frame is noticeably purple.
@@ -3356,6 +4416,18 @@ void present_display_frame(Runtime &rt) {
             if (gates::opp_mode_obj != 0u && gates::opp_mode_obj != d_obj) { d_obj = gates::opp_mode_obj; d_frame = g_frames_presented + static_cast<std::uint64_t>(std::max(0, std::atoi(at))); d_armed = true; }
             if (d_armed && g_frames_presented >= d_frame && !difftrace::active) { d_armed = false; difftrace::start(rt); }
         }
+    }
+    // RR_TRACE_FRAME=N: start the write trace (needs --trace-tools; RR_TRACE_RANGE, RR_TRACE_FRAMES) at absolute presented frame N.
+    {
+        static const char *tf = std::getenv("RR_TRACE_FRAME");
+        static bool tf_done = false;
+        if (tf != nullptr && !tf_done && !cartrace::active && g_frames_presented >= std::strtoull(tf, nullptr, 10)) { tf_done = true; cartrace::start(rt); }
+    }
+    // RR_DIFF_FRAME=N: start the RAM diff trace (and call profile) at absolute presented frame N (headless rig).
+    {
+        static const char *df = std::getenv("RR_DIFF_FRAME");
+        static bool df_done = false;
+        if (df != nullptr && !df_done && !difftrace::active && g_frames_presented >= std::strtoull(df, nullptr, 10)) { df_done = true; difftrace::start(rt); }
     }
     // RR_TRACE_DIST=N: start the car trace when the player's course distance (float at car +0x860) passes N upward.
     {
@@ -3394,7 +4466,14 @@ void present_display_frame(Runtime &rt) {
     if (g_hle_options.window && present_callprofile_requested()) callprof::start();
     callprof::frame_end(g_frames_presented);
     // Insert: snapshot user RAM (plus a screenshot) for finding game variables by comparing snapshots.
-    const bool ramdump = g_hle_options.window && present_ramdump_requested();
+    // RR_RAMDUMP_FRAMES="f1,f2,..." (rig): the same snapshot at those frames.
+    static const std::vector<unsigned long long> dump_frames = [] {
+        std::vector<unsigned long long> v;
+        if (const char *e = std::getenv("RR_RAMDUMP_FRAMES")) for (const char *q = e; *q != '\0';) { char *end = nullptr; v.push_back(std::strtoull(q, &end, 10)); if (end == q) break; q = *end == ',' ? end + 1 : end; }
+        return v;
+    }();
+    const bool ramdump = (g_hle_options.window && present_ramdump_requested()) ||
+                         std::find(dump_frames.begin(), dump_frames.end(), static_cast<unsigned long long>(g_frames_presented)) != dump_frames.end();
     if (ramdump) {
         static int dump_n = 0;
         const std::uint32_t base = 0x08800000u, len = 0x01800000u;
@@ -3407,7 +4486,14 @@ void present_display_frame(Runtime &rt) {
             log_line(category::kHle, std::string("RAMDUMP ") + name + " (base 08800000, 24 MB)");
         }
     }
-    const bool f12 = g_hle_options.window && (present_screenshot_requested() || ramdump);
+    // Ctrl+F12: bug report (with a screenshot of this frame), made in the background while the game goes on.
+    {   // RR_TEST_CRASH=frame (test of the crash report): a bad memory write at that frame
+        static const std::uint64_t crash_at = [] { const char *e = std::getenv("RR_TEST_CRASH"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+        if (crash_at != 0u && g_frames_presented == crash_at) { volatile int *bad = nullptr; *bad = 1; }
+    }
+    const bool bug_report = g_hle_options.window && present_bug_report_requested();
+    if (bug_report) log_line(category::kHle, "bug report requested (Ctrl+F12)");
+    const bool f12 = g_hle_options.window && !bug_report && (present_screenshot_requested() || ramdump);
     if (f12 && g_gl && g_hle_options.shot_mode != 1 && g_hle_options.shot_mode != 3) g_gl->request_capture();   // grab the finished picture while it is presented
     if (f12 && g_ge && std::getenv("RR_F12_TRACE") != nullptr) g_ge->trace_commands(3000u);   // debugging aid only
     // RR_SHOT_RANGE="start,count;start,count": save every frame in those ranges (to the screenshots directory).
@@ -3428,6 +4514,16 @@ void present_display_frame(Runtime &rt) {
         return out;
     }();
     bool in_shot_range = false;
+    {   // RR_SHOT_GAMETIME=N (rig): a screenshot whenever another N frames of game time (59.94 Hz units, pad-read clock) have passed,
+        // named frame_<frame>.png; the log line GAMESHOT maps it to the game time (compares runs at different frame rates).
+        static const long long gt_every = [] { const char *e = std::getenv("RR_SHOT_GAMETIME"); return e ? std::atoll(e) : 0ll; }();
+        static long long gt_next = 0;
+        if (gt_every > 0 && static_cast<long long>(g_ctrl_game60) >= gt_next) {
+            log_line(category::kHle, "GAMESHOT game " + std::to_string(gt_next) + " frame " + std::to_string(g_frames_presented));
+            gt_next += gt_every;
+            in_shot_range = true;
+        }
+    }
     for (const auto &[start, count] : shot_ranges) if (g_frames_presented >= start && g_frames_presented < start + count) in_shot_range = true;
     {
         static long long gs_a = -1, gs_b = 0, gs_step = 1;   // RR_GO_SHOTS=start,count[,stride]
@@ -3444,7 +4540,7 @@ void present_display_frame(Runtime &rt) {
         if (f12 && burst_n != 0u) { burst_left = burst_n; log_line(category::kHle, "SHOTBURST " + std::to_string(burst_n) + " frames from frame " + std::to_string(g_frames_presented) + " step " + std::to_string(gates::game_step())); }
         if (burst_left != 0u) { --burst_left; in_shot_range = true; }
     }
-    const bool shot = f12 || (in_shot_range && !g_hle_options.screenshot_dir.empty()) || (!g_hle_options.screenshot_dir.empty() && g_hle_options.screenshot_every != 0u &&
+    const bool shot = f12 || bug_report || (in_shot_range && !g_hle_options.screenshot_dir.empty()) || (!g_hle_options.screenshot_dir.empty() && g_hle_options.screenshot_every != 0u &&
                       (g_frames_presented % g_hle_options.screenshot_every) == 0u &&
                       g_screenshots_taken < g_hle_options.screenshot_max);
     if (!g_hle_options.window) {   // RR_WORDLOG_H=addr,... (headless): those guest words once per presented frame from RR_WORDLOG_FROM (400 lines)
@@ -3458,6 +4554,46 @@ void present_display_frame(Runtime &rt) {
             log_line(category::kHle, t);
         }
     }
+    static const auto netsync_every = [] { const char *e = std::getenv("RR_NETSYNC_EVERY"); const long v = e ? std::atol(e) : 15; return static_cast<std::uint64_t>(v > 0 ? v : 15); };
+    // Diagnostic (RR_NETSYNC=1, netplay tests): every 15 frames of a race, the wall clock (ms, shared by copies on one PC),
+    // the player's distance (+0x860), and every car body's distance, to compare what each copy sees of the other.
+    if (std::getenv("RR_NETSYNC") != nullptr && g_frames_presented - gates::scene_frame < 5u && (g_frames_presented % netsync_every()) == 0u && gates::car_manager != 0u) {
+        auto &mem = rt.memory();
+        const std::uint32_t base = mem.load32(gates::car_manager + 0x14u), count = mem.load32(gates::car_manager + 0x10u);
+        const std::uint32_t hud = mem.load32(0x08a448f0u);
+        const std::uint32_t pc = (hud >= 0x08800000u && hud < 0x0a000000u) ? mem.load32(hud + 0xc4u) : 0u;
+        if (base >= 0x08800000u && base < 0x0a000000u && count <= 16u && pc >= 0x08800000u && pc < 0x0a000000u) {
+            const long long wall = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            char b[160];
+            std::snprintf(b, sizeof b, "NETSYNC wall=%lld frame=%llu me=%u dist=%.2f", wall, static_cast<unsigned long long>(g_frames_presented), (pc - base) / 0x27a0u,
+                          static_cast<double>(std::bit_cast<float>(mem.load32(pc + 0x860u))));
+            std::string l = b;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                std::snprintf(b, sizeof b, " c%u=%.2f", i, static_cast<double>(std::bit_cast<float>(mem.load32(base + i * 0x27a0u + 0x860u))));
+                l += b;
+            }
+            const std::uint32_t base2 = mem.load32(gates::car_manager + 0x18u);   // the other car array (CPU / remote cars)
+            { static std::uint32_t told = 0; if (base2 != told) { told = base2; log_line(category::kHle, "NETSYNC cars: own " + hex32(pc) + " remote k0 " + hex32(base2) + " mgr " + hex32(gates::car_manager)); } }
+            if (base2 >= 0x08800000u && base2 < 0x0a000000u) {   // positions (x, z) of the player and of the first remote car
+                const auto fl = [&](std::uint32_t a) { return static_cast<double>(std::bit_cast<float>(mem.load32(a))); };
+                std::snprintf(b, sizeof b, " mepos=%.3f,%.3f k0pos=%.3f,%.3f", fl(pc + 0x16a0u), fl(pc + 0x16a8u), fl(base2 + 0x16a0u), fl(base2 + 0x16a8u));
+                l += b;
+            }
+            if (base2 >= 0x08800000u && base2 < 0x0a000000u)
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    std::snprintf(b, sizeof b, " k%u=%.2f", i, static_cast<double>(std::bit_cast<float>(mem.load32(base2 + i * 0x27a0u + 0x860u))));
+                    l += b;
+                }
+            log_line(category::kHle, l);
+            if (std::getenv("RR_PATHLOG") != nullptr)   // every car body's distance and position (builds RR_AUTOPILOT path files)
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    const std::uint32_t c = mem.load32(gates::car_manager + 0x18u) + i * 0x27a0u;
+                    std::snprintf(b, sizeof b, "PATHPT %.2f %.2f %.2f", static_cast<double>(std::bit_cast<float>(mem.load32(c + 0x860u))),
+                                  static_cast<double>(std::bit_cast<float>(mem.load32(c + 0x16a0u))), static_cast<double>(std::bit_cast<float>(mem.load32(c + 0x16a8u))));
+                    log_line(category::kHle, b);
+                }
+        }
+    }
     if (!g_hle_options.window) gates::apply_live();   // headless runs (the window block below does it otherwise)
     if (!g_hle_options.window && !shot && !purple_shot) return;
     static std::vector<std::uint8_t> rgba(480u * 272u * 4u);
@@ -3467,6 +4603,20 @@ void present_display_frame(Runtime &rt) {
     // frame is needed on the CPU (screenshots, heartbeat) or was not drawn by the GPU (movies, CPU-drawn screens).
     const bool gpu_direct = g_gl && g_hle_options.window &&
                             g_display.frame_width == 512u && g_gl->has_target(g_display.frame_top);
+    // Menu frame interpolation (--menu-interp): outside races, with the rate raised for races, the 59.94 Hz menus get in-between
+    // pictures so they move at the raised rate too (the game itself still runs at 59.94 Hz, so nothing speeds up).
+    int interp_m = 0;
+    {
+        const bool mode = g_gl && g_hle_options.window && g_hle_options.menu_interp && race_only_rate() && !g_fast_rate;
+        const int m = mode ? std::clamp(static_cast<int>(std::lround(g_hle_options.fps_mult)), 1, 8) : 1;
+        if (g_gl) g_gl->interp_set_recording(mode && m > 1);
+        if (mode && m > 1 && gpu_direct && !skipped_frame && !osk_active()) interp_m = m;
+        static int paced_m = 0;
+        if (interp_m != paced_m) {
+            paced_m = interp_m;
+            present_set_frame_period_us(static_cast<int>(interp_m > 1 ? g_vblank_period_us / static_cast<std::uint64_t>(interp_m) : g_vblank_period_us));
+        }
+    }
     // Motion log (RR_MOTION_LOG=start,count): per presented frame, how much the picture changed since the previous one.
     static const std::uint64_t motion_start = [] { const char *e = std::getenv("RR_MOTION_LOG"); return e ? std::strtoull(e, nullptr, 0) : 0ull; }();
     static const std::uint64_t motion_count = [] { const char *e = std::getenv("RR_MOTION_LOG"); if (!e) return 0ull; const char *c = std::strchr(e, ','); return c ? std::strtoull(c + 1, nullptr, 0) : 120ull; }();
@@ -3499,7 +4649,7 @@ void present_display_frame(Runtime &rt) {
     // The heartbeat used to read the whole screen back from the GPU every 300 frames just to count lit pixels: a
     // synchronous readback that showed up as a hitch every 2.5 s at 120 fps.  RR_HEARTBEAT_LIT=1 brings it back.
     static const bool heartbeat_lit = std::getenv("RR_HEARTBEAT_LIT") != nullptr;
-    const bool need_rgba = !gpu_direct || shot || purple_shot || motion || (heartbeat_lit && g_frames_presented % 300u == 0u);
+    const bool need_rgba = (!gpu_direct && !skipped_frame) || shot || purple_shot || motion || (heartbeat_lit && g_frames_presented % 300u == 0u);
     if (need_rgba) {
         bool have = false;
         if (gpu_direct && g_gl->read_native_rgba(g_display.frame_top, rgba.data())) have = true;
@@ -3574,7 +4724,7 @@ void present_display_frame(Runtime &rt) {
             const double wall_ms = std::chrono::duration<double, std::milli>(now - last_beat).count();
             last_beat = now;
             const double draw_ms = g_ge ? g_ge->take_draw_ms() : 0.0;
-            char tbuf[256];
+            char tbuf[400];
             std::snprintf(tbuf, sizeof tbuf, "HEARTBEAT TIMING frames=300 wall=%.0fms (%.1f fps) ge_draw=%.0fms (%.0f%%) present_extra=%.0fms",
                           wall_ms, 300000.0 / std::max(wall_ms, 1.0), draw_ms, 100.0 * draw_ms / std::max(wall_ms, 1.0), g_present_ms);
             g_present_ms = 0.0;
@@ -3615,15 +4765,23 @@ void present_display_frame(Runtime &rt) {
             log_line(category::kHle, tbuf);
             {
                 const AudioStats a = audio_take_stats();
-                std::snprintf(tbuf, sizeof tbuf, "HEARTBEAT AUDIO pushed=%llu played=%llu underruns=%llu drops=%llu backlog=%llu..%llu frames device_starved=%llu max_mixer_gap=%llums",
+                std::snprintf(tbuf, sizeof tbuf, "HEARTBEAT AUDIO pushed=%llu played=%llu underruns=%llu drops=%llu backlog=%llu..%llu frames device_starved=%llu max_mixer_gap=%llums stretched=%llu (%llu starts)",
                               static_cast<unsigned long long>(a.pushed), static_cast<unsigned long long>(a.played), static_cast<unsigned long long>(a.underruns),
                               static_cast<unsigned long long>(a.drops), static_cast<unsigned long long>(a.queue_min), static_cast<unsigned long long>(a.queue_max),
-                              static_cast<unsigned long long>(a.device_starved), static_cast<unsigned long long>(a.device_gap_max_ms));
+                              static_cast<unsigned long long>(a.device_starved), static_cast<unsigned long long>(a.device_gap_max_ms),
+                              static_cast<unsigned long long>(a.stretched), static_cast<unsigned long long>(a.stretch_starts));
                 log_line(category::kHle, tbuf);
             }
         }
         // Trace one frame's worth of GE commands whenever the screen is black.
         if (lit == 0u && (g_frames_presented % 900u) == 0u && g_ge) g_ge->trace_commands(2500u);
+    }
+    if (bug_report) {   // (the frame as the PSP would show it; small and quick to write)
+        std::error_code ec;
+        std::filesystem::create_directories(rr::report::reports_dir(), ec);
+        const std::filesystem::path shot_path = rr::report::reports_dir() / "bug-report-screenshot.png";
+        const bool ok = write_png(shot_path.string().c_str(), rgba.data(), 480u, 272u);
+        rr::report::make_bug_report_async("Ctrl+F12 in game", ok ? shot_path : std::filesystem::path{});
     }
     if (f12) {
         // F12: one tidy file per press, named by date and time so nothing is ever overwritten.
@@ -3671,7 +4829,7 @@ void present_display_frame(Runtime &rt) {
             write_png_async(np, std::vector<std::uint8_t>(rgba.begin(), rgba.begin() + 480 * 272 * 4), 480u, 272u);
         }
     }
-    if (shot && !f12) {
+    if (shot && !f12 && !bug_report) {
         std::error_code ec;
         std::filesystem::create_directories(g_hle_options.screenshot_dir, ec);
         char name[64];
@@ -3776,6 +4934,13 @@ void present_display_frame(Runtime &rt) {
             if (ms > g_ft_max) g_ft_max = ms;
             if (ms > 20.0) ++g_ft_over20;
             if (ms > 33.5) ++g_ft_over33;
+            if (!perfrep::path.empty() && g_frames_presented > 30u) {
+                const bool in_race = gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 5u;
+                const double target = gates::fast_rate_active() ? 1000.0 / (59.94 * std::max(g_hle_options.fps_mult, 0.5)) : 1000.0 / 59.94;   // (menus run at the raised rate too with --menu-native)
+                perfrep::record(in_race, ms, 0.0, 0.0, (g_ge ? g_ge->peek_draw_ms() : 0.0) - spike_prev_draw, target);
+                perfrep::note_block(now_p);
+                if ((g_frames_presented % 1800u) == 0u) perfrep::write_report();
+            }
             {
                 // One line per slow frame (first 400): when it happens and what the GPU backend did during it.
                 std::uint64_t cur[4] = {0, 0, 0, 0};
@@ -3972,14 +5137,18 @@ void present_display_frame(Runtime &rt) {
             }
             // Live fps readout in the window title, refreshed twice a second.
             static auto fps_t0 = std::chrono::steady_clock::now();
-            static std::uint64_t fps_frames = 0;
+            static std::uint64_t fps_frames = 0, fps_extra0 = 0;
             ++fps_frames;
             const auto now = std::chrono::steady_clock::now();
             const double secs = std::chrono::duration<double>(now - fps_t0).count();
             if (secs >= 0.5) {
                 char title[360];
-                if (g_gl) std::snprintf(title, sizeof title, "Ridge Racer (native) - %.1f fps - GPU %dx%s", static_cast<double>(fps_frames) / secs, g_gl->scale(), (std::getenv("RR_GPU_VERIFY") != nullptr || std::getenv("RR_GPU_VERIFY_SMALL") != nullptr) ? " [SELF-CHECK ON - SLOW]" : "");
-                else std::snprintf(title, sizeof title, "Ridge Racer (native) - %.1f fps - software", static_cast<double>(fps_frames) / secs);
+                // Pictures shown per second: game frames plus the menu in-between pictures (the game itself stays at 59.94 Hz there).
+                const std::uint64_t extra = g_interp_pictures - fps_extra0;
+                fps_extra0 = g_interp_pictures;
+                if (g_gl) std::snprintf(title, sizeof title, RR_TITLE_PREFIX " - %.1f fps%s - GPU %dx%s", static_cast<double>(fps_frames + extra) / secs,
+                                        extra != 0u ? " (menu, smoothed)" : "", g_gl->scale(), (std::getenv("RR_GPU_VERIFY") != nullptr || std::getenv("RR_GPU_VERIFY_SMALL") != nullptr) ? " [SELF-CHECK ON - SLOW]" : "");
+                else std::snprintf(title, sizeof title, RR_TITLE_PREFIX " - %.1f fps - software", static_cast<double>(fps_frames) / secs);
                 {
                     char vol[128];
                     if (audio_muted()) std::snprintf(vol, sizeof vol, " - MUTED");
@@ -4020,7 +5189,9 @@ void present_display_frame(Runtime &rt) {
                 title_done:;
             }
         }
-        if (g_gl) {
+        if (skipped_frame && !shot && !purple_shot) {
+            if (g_hle_options.frame_skip == 0 || g_net_race_sync) present_skip_frame_fast(); else present_skip_frame();
+        } else if (g_gl) {
             int win_w = 0, win_h = 0;
             present_gl_size(win_w, win_h);
             bool shown = false;
@@ -4031,23 +5202,56 @@ void present_display_frame(Runtime &rt) {
                 static std::uint64_t big_key = 0u;
                 const int os = std::clamp((win_w + 479) / 480, 2, 5);
                 const int bw = 480 * os, bh = 272 * os;
-                const std::uint64_t key = osk_ui_state_key() ^ (static_cast<std::uint64_t>(os) << 56);
+                const std::uint64_t key = ui_page_state_key() ^ (static_cast<std::uint64_t>(os) << 56);
                 if (big.size() != static_cast<std::size_t>(bw) * bh * 4u || key != big_key) {
                     big.assign(static_cast<std::size_t>(bw) * bh * 4u, 255);
-                    osk_ui_render(big.data(), bw, bh);
+                    ui_page_render(big.data(), bw, bh);
                     big_key = key;
                 }
                 g_gl->present_rgba(big.data(), bw, bh, win_w, win_h);
                 shown = true;
             } else if (osk_active()) {
-                osk_ui_render(rgba.data(), 480, 272);
+                ui_page_render(rgba.data(), 480, 272);
+            }
+            if (!shown && interp_m > 1) {
+                // Menu frame interpolation: interp_m - 1 in-between pictures (previous game frame -> this one), each paced at
+                // 1 / interp_m of a vblank, then the frame itself.  A frame that cannot be rebuilt is shown again instead.
+                g_gl->interp_frame_done(g_display.frame_top);
+                static const char *ishots = std::getenv("RR_INTERP_SHOTS");   // test: save the in-between pictures of RR_SHOT_RANGE frames
+                for (int k = 1; k < interp_m; ++k) {
+                    const bool ok = g_gl->interp_render(static_cast<float>(k) / static_cast<float>(interp_m)) && g_gl->present_interp(win_w, win_h);
+                    if (!ok) g_gl->present_target(g_display.frame_top, win_w, win_h);
+                    if (ishots != nullptr && in_shot_range) {
+                        std::vector<std::uint8_t> px(480u * 272u * 4u);
+                        if (ok && g_gl->read_interp_native(px.data())) {
+                            std::error_code ec; std::filesystem::create_directories(ishots, ec);
+                            char nm[64]; std::snprintf(nm, sizeof nm, "frame_%07llu_%d.png", static_cast<unsigned long long>(g_frames_presented), k);
+                            write_png((std::filesystem::path(ishots) / nm).string().c_str(), px.data(), 480u, 272u);
+                        }
+                    }
+                    present_gl_swap();
+                    ++g_interp_pictures;
+                }
+                {   // a summary every ~10 s of menus
+                    static std::uint64_t last_log = 0;
+                    const auto &is = g_gl->interp_stats();
+                    if (is.frames - last_log >= 600u) {
+                        last_log = is.frames;
+                        char b[300];
+                        std::snprintf(b, sizeof b, "MENUINTERP x%d frames=%llu usable=%llu (cleared %llu) draws=%llu matched=%llu (same source %llu) moved=%llu 3d_snapped=%llu bad: sw=%llu self=%llu cpu=%llu base=%llu big=%llu", interp_m,
+                                      (unsigned long long)is.frames, (unsigned long long)is.usable, (unsigned long long)is.cleared, (unsigned long long)is.draws, (unsigned long long)is.matched, (unsigned long long)is.exact, (unsigned long long)is.lerped,
+                                      (unsigned long long)is.snapped_3d, (unsigned long long)is.bad_sw, (unsigned long long)is.bad_self, (unsigned long long)is.bad_cpu, (unsigned long long)is.bad_base, (unsigned long long)is.bad_big);
+                        log_line(category::kGe, b);
+                    }
+                }
             }
             if (!shown && !(gpu_direct && g_gl->present_target(g_display.frame_top, win_w, win_h))) g_gl->present_rgba(rgba.data(), 480, 272, win_w, win_h);
             present_gl_swap();
         } else {
-            if (osk_active()) osk_ui_render(rgba.data(), 480, 272);
+            if (osk_active()) ui_page_render(rgba.data(), 480, 272);
             present_frame(rgba.data(), 480, 272);
         }
+        perfrep::end_tail();
         if (present_quit_requested()) rt.stop("window closed by user");
     }
 }
@@ -4184,7 +5388,18 @@ void umd_set_state(Runtime &runtime, AllegrexContext &ctx, std::uint32_t new_sta
 std::uint64_t g_tick_microseconds = 64u;
 
 void starvation_tick(Runtime &runtime, AllegrexContext &ctx) {
-    g_virtual_time_us += g_tick_microseconds;
+    // Execution-driven time: so many guest dispatches = so much PSP time.  At a raised frame rate each game step must fit into a
+    // shorter vblank, but it does the same work as at 59.94 Hz; with the unscaled clock a busy step looked late, and the game ran
+    // its own catch-up steps (logic only, up to 3 per frame): bursts of fast game time = rubber banding, and the extra sound was
+    // cut by the audio queue (heard as speed-ups).  The clock runs slower by the same factor as the vblank (a PSP that is that
+    // much faster), so a step costs the same fraction of its frame as on the real console.  RR_TICK_SCALE_OFF=1: old clock.
+    static const bool scale_off = std::getenv("RR_TICK_SCALE_OFF") != nullptr;
+    if (!scale_off && g_vblank_period_us < g_base_vblank_us) {
+        static std::uint64_t acc = 0;   // in units of 1/g_base_vblank_us microseconds
+        acc += g_tick_microseconds * g_vblank_period_us;
+        g_virtual_time_us += acc / g_base_vblank_us;
+        acc %= g_base_vblank_us;
+    } else g_virtual_time_us += g_tick_microseconds;
     promote_expired_delays();
 
     ThreadRecord *thread = current_thread();
@@ -4544,13 +5759,14 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     g_screenshots_taken = 0;
     g_backend = std::make_unique<SoftwareBackend>(runtime.memory());
     g_gl.reset();
+    // (Was inside the window branch: without a window the raised rate never took effect, so headless "240 fps" runs ran at 59.94 Hz.)
+    g_fast_vblank_us = static_cast<std::uint64_t>(std::max(2000.0, std::min(33366.0, 16683.0 / std::max(0.25, std::min(8.0, g_hle_options.fps_mult)))));
+    g_vblank_period_us = race_only_rate() ? g_base_vblank_us : g_fast_vblank_us;
     if (g_hle_options.window) {
         PresentOptions present{};
         present.window = true;
         present.scale = g_hle_options.window_scale;
         present.throttle = g_hle_options.throttle;
-    g_fast_vblank_us = static_cast<std::uint64_t>(std::max(2000.0, std::min(33366.0, 16683.0 / std::max(0.25, std::min(8.0, g_hle_options.fps_mult)))));
-    g_vblank_period_us = race_only_rate() ? g_base_vblank_us : g_fast_vblank_us;
         present.frame_period_us = static_cast<int>(g_vblank_period_us); present.low_latency = g_hle_options.low_latency; present.latency_log = g_hle_options.latency_log;
         present.fullscreen = g_hle_options.fullscreen;
         if (!present_open(present)) {
@@ -4562,8 +5778,19 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     if (g_hle_options.gpu) {
         if (!g_hle_options.window) {
             log_line(category::kBoot, "GPU renderer needs a window; using the software renderer");
+            g_gpu_status = "no window";
         } else if (const GlProc proc = present_gl_open()) {
-            auto gl = std::make_unique<GlBackend>(runtime.memory(), proc, false, g_hle_options.internal_scale);
+            #ifdef __EMSCRIPTEN__
+            constexpr bool kGles = true;   // WebGL2 = OpenGL ES 3.0 dialect
+#else
+            constexpr bool kGles = false;
+#endif
+            auto gl = std::make_unique<GlBackend>(runtime.memory(), proc, kGles, g_hle_options.internal_scale);
+            const std::string &gdesc = gl_description();
+            const bool sw_gl = gdesc.find("GDI Generic") != std::string::npos || gdesc.find("Microsoft") != std::string::npos ||
+                               gdesc.find("llvmpipe") != std::string::npos || gdesc.find("softpipe") != std::string::npos || gdesc.find("SwiftShader") != std::string::npos;
+            if (!gdesc.empty()) log_line(category::kBoot, "OpenGL: " + gdesc + (sw_gl ? "  (SOFTWARE OpenGL - slow)" : ""));
+            if (sw_gl && gl->ok()) g_gpu_status = "OpenGL is running in software (" + gdesc + "); installing or updating the graphics driver should fix it";
             if (gl->ok()) {
                 log_line(category::kBoot, "GPU renderer active, internal scale " + std::to_string(gl->scale()) + "x");
                 GlBackend::Enhance enhance;
@@ -4576,13 +5803,36 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 gpu_backend = g_gl.get();
             } else {
                 log_line(category::kBoot, "GPU renderer failed (" + gl->error() + "); using the software renderer");
+                g_gpu_status = "the graphics driver could not start OpenGL 3.3 (" + gl->error() + (gdesc.empty() ? std::string() : "; driver says " + gdesc) + ")";
             }
         } else {
             log_line(category::kBoot, "no OpenGL context available; using the software renderer");
+            g_gpu_status = "the graphics driver did not provide an OpenGL 3.3 context";
         }
     }
+    if (g_hle_options.gpu && !g_gpu_status.empty() && g_hle_options.window && !g_rr_dev)
+        show_error_box("The game could not use your graphics card through OpenGL, so it is running on the slow software renderer.\n\nReason: " + g_gpu_status +
+                       "\n\nUpdating the graphics driver (from AMD, Intel or NVIDIA, not only Windows Update) usually fixes this. The game still starts.");
+    static const bool no_draw = [] { const char *e = std::getenv("RR_NO_DRAW"); return e != nullptr && std::string(e) != "0"; }();   // test rig: decode the GE lists but draw nothing (fast logic tests)
+    if (no_draw) g_no_draw = true;
+    if (g_hle_options.frame_skip != 1 || no_draw) {
+        g_skip_backend = std::make_unique<SkipBackend>(*gpu_backend);
+        gpu_backend = g_skip_backend.get();
+        if (g_hle_options.frame_skip > 1) present_set_cpu_pacing(true);
+    }
     g_ge = std::make_unique<GeProcessor>(runtime.memory(), *gpu_backend);
+#ifndef __EMSCRIPTEN__   // the browser build creates no extra threads (the page watches for stalls instead)
     if (!g_watchdog.joinable()) start_watchdog();
+    // For crash and bug reports: what the game was doing (plain reads of a few numbers, safe from any thread).
+    rr::report::set_state_text_provider([]() -> std::string {
+        std::string t = "Frames shown: " + std::to_string(g_frames_presented);
+        t += gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 5u ? " (in a race)" : " (menus / loading)";
+        t += "\nFrame rate setting: " + std::to_string(g_hle_options.fps_mult * 59.94) + " fps, frame skip " + std::to_string(g_hle_options.frame_skip);
+        t += ", renderer " + std::string(g_gl ? "OpenGL" : "software");
+        t += "\nOnline race: " + std::string(g_net_race_sync ? "yes" : "no") + "\n";
+        return t;
+    });
+#endif
 
     g_options = options;
     g_installed = true;
@@ -5288,9 +6538,22 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     register_import(runtime, "ThreadManForUser", 0x349D6D6Cu, "sceKernelCheckCallback",
         [](Runtime &rt, AllegrexContext &ctx) {
             maybe_pump_window();
+            if (std::getenv("RR_NETSTUB") != nullptr) {   // study aid: show the game's network-module state now and then
+                static std::uint32_t last0 = 0xffffffffu, last8 = 0xffffffffu, lastc = 0xffffffffu, ticks = 0u;
+                auto &mm = rt.memory();
+                const std::uint32_t o = 0x08A45E98u, st = mm.load32(o), fl = mm.load32(o + 8u), er = mm.load32(o + 0xcu);
+                if ((st != last0 || fl != last8 || er != lastc) && (++ticks, true)) {
+                    last0 = st; last8 = fl; lastc = er;
+                    char text[160];
+                    std::snprintf(text, sizeof text, "net module object: state=%u flags=0x%X error=0x%08X (channel %u, busy %u)", st, fl, er,
+                                  mm.load32(o + 0x14u), static_cast<unsigned>(mm.load8(o + 0x19u)));
+                    log_line("NET", text);
+                }
+            }
             if (service_owned_callback(rt,ctx,0,true)) return;
             ctx.set_gpr(2, 0u);
             if (ge_deliver(rt, ctx, 0u)) return;
+            if (net_deliver(rt, ctx)) return;
             // Watch self-test (PSPRECOMP_RIDGERACER_PROBE=1): write a canary to
             // the scene-object pointer so a write watch on it can be shown to
             // work before trusting a "no writes" result.
@@ -6650,6 +7913,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         });
     const auto ctrl_read = [](Runtime &rt, AllegrexContext &ctx) {
         ++g_ctrl_reads;
+        g_ctrl_game60 += static_cast<double>(g_vblank_period_us) / static_cast<double>(g_base_vblank_us);
         const std::uint32_t buffer = ctx.gpr[4];
         const std::uint32_t count = std::min<std::uint32_t>(std::max<std::uint32_t>(ctx.gpr[5], 1u), 64u);
         present_pump();
@@ -6785,7 +8049,8 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         const auto audio_play = [](Runtime &rt, std::uint32_t channel, std::uint32_t buffer, std::uint32_t vol_l, std::uint32_t vol_r) {
             static const bool enabled = g_hle_options.window && std::getenv("RR_NO_AUDIO") == nullptr;
             if (!enabled || channel >= 8u || buffer == 0u) return;
-            static const bool started = (audio_set_master_volume(g_hle_options.volume), audio_set_menu_gain(g_hle_options.menu_volume), audio_start());
+            static const bool started = (audio_set_master_volume(g_hle_options.volume), audio_set_menu_gain(g_hle_options.menu_volume),
+                                         audio_set_time_stretch(g_hle_options.frame_skip != 0), audio_start());
             if (!started) return;
             const bool stereo = (channels[channel].format & 0x10u) == 0u;
             const std::uint32_t frames = std::min<std::uint32_t>(channels[channel].samples, 65536u);
@@ -6923,41 +8188,134 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     // disables its multiplayer features.
     // -----------------------------------------------------------------------
     {
-        struct NetImport { const char *library; std::uint32_t nid; };
+        struct NetImport { const char *library; std::uint32_t nid; const char *name; };
         static const NetImport kNet[] = {
-            {"sceNet", 0x39AF39A6u},
-            {"sceNet", 0x281928A9u},
-            {"sceNet", 0x0BF0A3AEu},
-            {"sceNetAdhoc", 0xE1D621D7u},
-            {"sceNetAdhoc", 0xA62C6F57u},
-            {"sceNetAdhoc", 0x6F92741Bu},
-            {"sceNetAdhoc", 0xABED3790u},
-            {"sceNetAdhoc", 0xDFE53E03u},
-            {"sceNetAdhoc", 0x7F27BB5Eu},
-            {"sceNetAdhocctl", 0xE26F226Eu},
-            {"sceNetAdhocctl", 0x9D689E13u},
-            {"sceNetAdhocctl", 0x0AD043EDu},
-            {"sceNetAdhocctl", 0x08FFF7A0u},
-            {"sceNetAdhocctl", 0x34401D65u},
-            {"sceNetAdhocctl", 0x20B317A0u},
-            {"sceNetAdhocctl", 0x6402490Bu},
-            {"sceNetAdhocctl", 0x75ECD386u},
-            {"sceNetAdhocctl", 0x81AEE1BEu},
-            {"sceNetAdhocMatching", 0x2A2A1E07u},
-            {"sceNetAdhocMatching", 0x7945ECDAu},
-            {"sceNetAdhocMatching", 0xCA5EDA6Fu},
-            {"sceNetAdhocMatching", 0x93EF3843u},
-            {"sceNetAdhocMatching", 0x32B156B3u},
-            {"sceNetAdhocMatching", 0xF16EAF4Fu},
-            {"sceNetAdhocMatching", 0x5E3D4B79u},
-            {"sceNetAdhocMatching", 0xEA3C6108u},
-            {"sceNetAdhocMatching", 0xB58E61B7u},
-            {"sceNetAdhocMatching", 0xC58BCD9Eu},
-            {"sceNetAdhocMatching", 0x40F8F435u},
+            {"sceNet", 0x39AF39A6u, "sceNetInit"},
+            {"sceNet", 0x281928A9u, "sceNetTerm"},
+            {"sceNet", 0x0BF0A3AEu, "sceNetGetLocalEtherAddr"},
+            {"sceNetAdhoc", 0xE1D621D7u, "sceNetAdhocInit"},
+            {"sceNetAdhoc", 0xA62C6F57u, "sceNetAdhocTerm"},
+            {"sceNetAdhoc", 0x6F92741Bu, "sceNetAdhocPdpCreate"},
+            {"sceNetAdhoc", 0xABED3790u, "sceNetAdhocPdpSend"},
+            {"sceNetAdhoc", 0xDFE53E03u, "sceNetAdhocPdpRecv"},
+            {"sceNetAdhoc", 0x7F27BB5Eu, "sceNetAdhocPdpDelete"},
+            {"sceNetAdhocctl", 0xE26F226Eu, "sceNetAdhocctlInit"},
+            {"sceNetAdhocctl", 0x9D689E13u, "sceNetAdhocctlTerm"},
+            {"sceNetAdhocctl", 0x0AD043EDu, "sceNetAdhocctlConnect"},
+            {"sceNetAdhocctl", 0x08FFF7A0u, "sceNetAdhocctlScan"},
+            {"sceNetAdhocctl", 0x34401D65u, "sceNetAdhocctlDisconnect"},
+            {"sceNetAdhocctl", 0x20B317A0u, "sceNetAdhocctlAddHandler"},
+            {"sceNetAdhocctl", 0x6402490Bu, "sceNetAdhocctlDelHandler"},
+            {"sceNetAdhocctl", 0x75ECD386u, "sceNetAdhocctlGetState"},
+            {"sceNetAdhocctl", 0x81AEE1BEu, "sceNetAdhocctlGetScanInfo"},
+            {"sceNetAdhocMatching", 0x2A2A1E07u, "sceNetAdhocMatchingInit"},
+            {"sceNetAdhocMatching", 0x7945ECDAu, "sceNetAdhocMatchingTerm"},
+            {"sceNetAdhocMatching", 0xCA5EDA6Fu, "sceNetAdhocMatchingCreate"},
+            {"sceNetAdhocMatching", 0x93EF3843u, "sceNetAdhocMatchingStart"},
+            {"sceNetAdhocMatching", 0x32B156B3u, "sceNetAdhocMatchingStop"},
+            {"sceNetAdhocMatching", 0xF16EAF4Fu, "sceNetAdhocMatchingDelete"},
+            {"sceNetAdhocMatching", 0x5E3D4B79u, "sceNetAdhocMatchingSelectTarget"},
+            {"sceNetAdhocMatching", 0xEA3C6108u, "sceNetAdhocMatchingCancelTarget"},
+            {"sceNetAdhocMatching", 0xB58E61B7u, "sceNetAdhocMatchingSetHelloOpt"},
+            {"sceNetAdhocMatching", 0xC58BCD9Eu, "sceNetAdhocMatchingGetMembers"},
+            {"sceNetAdhocMatching", 0x40F8F435u, "sceNetAdhocMatchingGetPoolMaxAlloc"},
         };
         for (const NetImport &entry : kNet) {
-            register_import(runtime, entry.library, entry.nid, "sceNet*(unavailable)",
-                [](Runtime &, AllegrexContext &ctx) { ctx.set_gpr(2, 0x80410001u); });
+            // Still reports "unavailable", but logs every call (first 40 per function) so the game's multiplayer use can be
+            // studied: the log shows which functions the menus call and with which arguments.
+            const char *name = entry.name;
+            register_import(runtime, entry.library, entry.nid, name,
+                [name](Runtime &rt, AllegrexContext &ctx) {
+                    static std::atomic<int> total{0};
+                    static std::map<std::string, int> per;
+                    static std::mutex mu;
+                    int n;
+                    { std::lock_guard<std::mutex> lk(mu); n = ++per[name]; }
+                    if (n <= 40 && total.fetch_add(1) < 600)
+                    {
+                        char text[256];
+                        std::snprintf(text, sizeof text, "%s(0x%08X, 0x%08X, 0x%08X, 0x%08X, 0x%08X, 0x%08X) -> %s", name,
+                                      static_cast<unsigned>(ctx.gpr[4]), static_cast<unsigned>(ctx.gpr[5]), static_cast<unsigned>(ctx.gpr[6]),
+                                      static_cast<unsigned>(ctx.gpr[7]), static_cast<unsigned>(ctx.gpr[8]), static_cast<unsigned>(ctx.gpr[9]),
+                                      std::getenv("RR_NETSTUB") != nullptr ? "pretend-ok (RR_NETSTUB)" : "unavailable");
+                        log_line("NET", text);
+                    }
+                    if (net::Node *node = net::shared_node()) {   // RR_NET=1: the real thing
+                        ctx.set_gpr(2, net_call(rt, ctx, name, *node));
+                        return;
+                    }
+                    // RR_NETSTUB=1 (study aid): pretend the network works but is empty, so the game gets past its first
+                    // initialisation and the log shows what it does next.  No packets are sent anywhere.
+                    static const bool pretend = std::getenv("RR_NETSTUB") != nullptr;
+                    if (!pretend) { ctx.set_gpr(2, 0x80410001u); return; }
+                    const std::string fn = name;
+                    auto &mem = rt.memory();
+                    std::uint32_t ret = 0u;
+                    // State of the pretend network: the adhoc-control handler the game registered and whether it is "connected".
+                    static std::uint32_t ctl_entry = 0u, ctl_arg = 0u, ctl_state = 0u, match_cb = 0u;
+                    auto fire_ctl = [&](std::uint32_t event) {
+                        {
+                            char text[128];
+                            std::snprintf(text, sizeof text, "firing adhocctl event %u at handler 0x%08X (arg 0x%08X)", event, ctl_entry, ctl_arg);
+                            log_line("NET", text);
+                        }
+                        if (ctl_entry == 0u) return;
+                        notify_guest_function(rt, ctx, ctl_entry, event, 0u, "adhocctl_handler", "netstub");
+                        ctx.gpr[6] = ctl_arg;   // handler(event, error, arg)
+                    };
+                    if (fn == "sceNetAdhocctlAddHandler") {
+                        ctl_entry = static_cast<std::uint32_t>(ctx.gpr[4]);
+                        ctl_arg = static_cast<std::uint32_t>(ctx.gpr[5]);
+                        ctx.set_gpr(2, 1u);
+                        return;
+                    }
+                    if (fn == "sceNetAdhocctlDisconnect") {
+                        ctl_state = 0u;
+                        ctx.set_gpr(2, 0u);
+                        fire_ctl(2u);   // ADHOCCTL_EVENT_DISCONNECTED
+                        return;
+                    }
+                    if (fn == "sceNetAdhocctlConnect") {
+                        char group[9] = {};
+                        for (int i = 0; i < 8; ++i) group[i] = static_cast<char>(mem.load8(static_cast<std::uint32_t>(ctx.gpr[4]) + static_cast<std::uint32_t>(i)));
+                        char text[96];
+                        std::snprintf(text, sizeof text, "adhocctl group name \"%s\"", group);
+                        log_line("NET", text);
+                        ctl_state = 1u;
+                        ctx.set_gpr(2, 0u);
+                        fire_ctl(1u);   // ADHOCCTL_EVENT_CONNECTED
+                        return;
+                    }
+                    if (fn == "sceNetAdhocctlScan") {
+                        ctx.set_gpr(2, 0u);
+                        fire_ctl(3u);   // ADHOCCTL_EVENT_SCAN
+                        return;
+                    }
+                    if (fn == "sceNetAdhocMatchingCreate") {
+                        match_cb = mem.load32(static_cast<std::uint32_t>(ctx.gpr[29]));
+                        char text[96];
+                        std::snprintf(text, sizeof text, "matching callback is 0x%08X", match_cb);
+                        log_line("NET", text);
+                    }
+                    if (fn == "sceNetAdhocPdpRecv") {
+                        ctx.set_gpr(2, 0x80410709u);   // SCE_NET_ADHOC_NO_DATA_AVAILABLE: nothing has arrived
+                        return;
+                    }
+                    if (fn == "sceNetAdhocctlGetState") {
+                        if (ctx.gpr[4] != 0u) mem.store32(static_cast<std::uint32_t>(ctx.gpr[4]), ctl_state);
+                        ctx.set_gpr(2, 0u);
+                        return;
+                    }
+                    if (fn == "sceNetGetLocalEtherAddr") {
+                        const std::uint8_t mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+                        for (int i = 0; i < 6; ++i) mem.store8(static_cast<std::uint32_t>(ctx.gpr[4]) + static_cast<std::uint32_t>(i), mac[i]);
+                    } else if (fn == "sceNetAdhocctlGetScanInfo") {
+                        if (ctx.gpr[4] != 0u) mem.store32(static_cast<std::uint32_t>(ctx.gpr[4]), 0u);   // nothing found
+                    } else if (fn == "sceNetAdhocMatchingCreate" || fn == "sceNetAdhocPdpCreate" || fn == "sceNetAdhocctlAddHandler") {
+                        ret = 1u;   // an id / handle
+                    }
+                    ctx.set_gpr(2, ret);
+                });
         }
     }
 
@@ -7845,7 +9203,10 @@ void dump_scheduler(const char *why) {
     }
 }
 
+void set_perf_report(const std::filesystem::path &file) { perfrep::path = file; }
+
 void report_summary() {
+    perfrep::write_report();
     g_watchdog_stop = true;
     if (g_watchdog.joinable()) g_watchdog.join();
     audio_stop();

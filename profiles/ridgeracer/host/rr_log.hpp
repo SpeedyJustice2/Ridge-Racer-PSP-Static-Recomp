@@ -1,6 +1,8 @@
 #pragma once
 
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace rr {
 
@@ -24,5 +26,7 @@ inline constexpr std::string_view kThread = "THREAD";
 void log_line(std::string_view category, std::string_view message);
 bool open_log_file(const char *path);
 void close_log_file();
+std::string log_file_path();                              // the file opened with open_log_file ("" if none)
+std::vector<std::string> recent_log_lines(bool crashing);  // the newest ~400 lines (for crash and bug reports)
 
 } // namespace rr

@@ -1,3 +1,5 @@
+#include <cctype>
+#include <mutex>
 #include "psprecomp/runtime.hpp"
 #include "psprecomp/common.hpp"
 
@@ -188,6 +190,7 @@ std::uint8_t *g_function_gate_table = nullptr;
 FunctionGateHook g_function_gate_hook = nullptr;
 
 std::uint32_t runtime_dispatch_pc() noexcept { return g_runtime_dispatch_pc; }
+const std::uint32_t *runtime_dispatch_pc_address() noexcept { return &g_runtime_dispatch_pc; }
 RuntimeExecutionContextToken capture_runtime_execution_context() noexcept {
     return RuntimeExecutionContextToken{g_runtime_thread_uid, g_runtime_thread_switch_generation_fast};
 }
@@ -576,7 +579,41 @@ std::filesystem::path Runtime::translate_path(const std::string &psp_path) const
         if (part == "..") throw Error("Rejected PSP path traversal: " + psp_path);
         if (part != ".") clean /= part;
     }
-    return game_root_ / clean;
+    const std::filesystem::path exact = game_root_ / clean;
+    std::error_code ec;
+    if (std::filesystem::exists(exact, ec)) return exact;
+    // The PSP's file system ignores case (the game asks for "Data/RRP.DAT", a disc image may store "DATA/RRP.DAT"), while
+    // Linux, macOS and the browser's file system do not: resolve each missing part by a case-insensitive directory search.
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, std::filesystem::path> cache;
+    const std::string key = exact.generic_string();
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (const auto hit = cache.find(key); hit != cache.end()) return hit->second;
+    }
+    const auto lower = [](std::string t) { for (char &c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return t; };
+    std::filesystem::path at = game_root_;
+    bool found_all = true;
+    for (const auto &part : clean) {
+        if (found_all) {
+            std::filesystem::path next = at / part;
+            if (!std::filesystem::exists(next, ec)) {
+                found_all = false;
+                const std::string want = lower(part.string());
+                for (const auto &entry : std::filesystem::directory_iterator(at, ec)) {
+                    if (lower(entry.path().filename().string()) == want) { next = entry.path(); found_all = true; break; }
+                }
+            }
+            at = next;
+        } else {
+            at /= part;   // (a file that does not exist yet: keep the rest as asked)
+        }
+    }
+    if (found_all) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.emplace(key, at);
+    }
+    return at;
 }
 
 void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {

@@ -57,6 +57,8 @@ void set_runtime_thread_identity(std::int32_t uid, const std::string &name) noex
 [[nodiscard]] std::int32_t runtime_thread_uid() noexcept;
 [[nodiscard]] const char *runtime_thread_name() noexcept;
 [[nodiscard]] std::uint32_t runtime_dispatch_pc() noexcept;
+// Where the dispatch address lives (lets a debugger or the browser page peek at it from outside the engine thread).
+[[nodiscard]] const std::uint32_t *runtime_dispatch_pc_address() noexcept;
 [[nodiscard]] RuntimeExecutionContextToken capture_runtime_execution_context() noexcept;
 [[nodiscard]] bool runtime_execution_context_matches(RuntimeExecutionContextToken token) noexcept;
 // Hot direct-chain guard.  The generation increments on every PSP thread

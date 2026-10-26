@@ -1,6 +1,8 @@
 #include <optional>
 #include <cstdio>
 #include "rr_ge.hpp"
+#include "rr_crumb.hpp"
+#include "rr_glyph_patch.hpp"
 
 #include "psprecomp/guest_memory.hpp"
 #include "rr_log.hpp"
@@ -175,6 +177,7 @@ void GeProcessor::run_list(List &list) {
             return;
         }
         const std::uint32_t word = memory_.load32(list.pc);
+        RR_CRUMB(0, list.pc); RR_CRUMB(1, word);
         list.pc += 4u;
         const std::uint32_t command = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
@@ -534,6 +537,11 @@ void GeProcessor::execute_prim(std::uint32_t data) {
     ++stats_.prims;
     stats_.vertices += count;
     if (count == 0u || prim > 6u) return;
+    if (skip_prims_) {
+        const std::uint32_t unit = vt.idx == 1u ? 1u : (vt.idx == 2u ? 2u : (vt.idx == 3u ? 4u : 0u));
+        if (unit == 0u) vertex_addr_ += count * vt.size; else index_addr_ += count * unit;
+        return;
+    }
     if (vt.through) ++stats_.through;
 
     const bool lighting = (reg_[0x17] & 1u) != 0u && !vt.through;
@@ -545,6 +553,7 @@ void GeProcessor::execute_prim(std::uint32_t data) {
     sub_scope.emplace(prof::kPrimSetup);
     GpuDraw draw = build_draw();
     draw.through = vt.through;
+    if (draw.tex_enable && (draw.tex_format == 4u || draw.tex_format == 5u)) glyph_patch_draw(memory_, draw);   // controller button pictures
     // The two diagnostics below only matter the first time a state shows up.  Formatting their text for every draw
     // cost several microseconds each (thousands of draws per frame), so a cheap hash of the inputs decides first.
     const auto fnv = [](std::uint64_t h, std::uint32_t v) { return (h ^ v) * 1099511628211ull; };
@@ -653,6 +662,7 @@ void GeProcessor::execute_prim(std::uint32_t data) {
 
     const std::uint32_t vbase = vertex_addr_;
     const std::uint32_t index_unit = vt.idx == 1u ? 1u : (vt.idx == 2u ? 2u : (vt.idx == 3u ? 4u : 0u));
+    draw.src_addr = index_unit != 0u ? index_addr_ : vbase;
 
     sub_scope.emplace(prof::kPrimVerts);
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -926,6 +936,8 @@ void GeProcessor::execute_prim(std::uint32_t data) {
     };
     const std::uint32_t cull_enable = reg_[0x1D] & 1u;
     const std::uint32_t cull_mode = reg_[0x9B] & 1u;
+    const bool want_full = !vt.through && backend_.wants_full_triangles();
+    full_.clear();
     const auto emit_triangle = [&](const Clip &a, const Clip &b, const Clip &c) {
         if (vt.through) {
             scratch_.push_back(a.v); scratch_.push_back(b.v); scratch_.push_back(c.v);
@@ -935,6 +947,7 @@ void GeProcessor::execute_prim(std::uint32_t data) {
         if (a.z + a.w >= 0.0f && a.w - a.z >= 0.0f && b.z + b.w >= 0.0f && b.w - b.z >= 0.0f && c.z + c.w >= 0.0f && c.w - c.z >= 0.0f) {
             if (!(a.w > 1e-7f) || !(b.w > 1e-7f) || !(c.w > 1e-7f)) return;
             const GpuVertex s0 = to_screen(a), s1 = to_screen(b), s2 = to_screen(c);
+            if (want_full) { full_.push_back(s0); full_.push_back(s1); full_.push_back(s2); }
             if (cull_enable && !cull_disabled()) {
                 const float area = (s1.x - s0.x) * (s2.y - s0.y) - (s2.x - s0.x) * (s1.y - s0.y);
                 if ((cull_mode == 1u && area < 0.0f) || (cull_mode == 0u && area > 0.0f)) { ++stats_.culled; return; }
@@ -975,6 +988,7 @@ void GeProcessor::execute_prim(std::uint32_t data) {
             sv[i] = to_screen(poly[i]);
         }
         for (int i = 1; i + 1 < n; ++i) {
+            if (want_full) { full_.push_back(sv[0]); full_.push_back(sv[i]); full_.push_back(sv[i + 1]); }
             if (cull_enable && !cull_disabled()) {
                 const float area = (sv[i].x - sv[0].x) * (sv[i + 1].y - sv[0].y) -
                                    (sv[i + 1].x - sv[0].x) * (sv[i].y - sv[0].y);
@@ -1248,6 +1262,8 @@ void GeProcessor::execute_prim(std::uint32_t data) {
                 log_line(category::kGe, b); ++ul;
             }
         }
+        if (want_full && kind == GpuPrim::Triangles && !full_.empty())
+            backend_.record_full(draw, full_.data(), full_.size(), (cull_enable && !cull_disabled()) ? static_cast<int>(cull_mode) : -1);
         backend_.draw(draw, kind, scratch_.data(), scratch_.size());
         if (timed) {
             // RR_DRAW_TIME=ms: log every draw call whose CPU time (including any batch flush it triggers) exceeds ms.

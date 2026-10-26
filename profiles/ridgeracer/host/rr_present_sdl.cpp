@@ -1,6 +1,7 @@
 // Window, keyboard / gamepad input, OpenGL context and frame pacing on SDL2 (Linux; the same file should also serve macOS
 // and other SDL platforms later).  Same behaviour as rr_present_win32.cpp: key bindings, 59.94 Hz pacing, adaptive vsync.
 #include "rr_present.hpp"
+#include "rr_pad.hpp"
 #include "rr_audio.hpp"
 #include "rr_env.hpp"
 #include "rr_log.hpp"
@@ -43,10 +44,11 @@ int g_lat_frames = 0, g_lat_probes = 0, g_lat_counter = 0;
 double g_swap_ms = 0.0, g_pace_ms = 0.0;
 void (*g_gl_finish)() = nullptr;
 int g_swap_interval = 0;
+bool g_cpu_pacing = false;   // frame skip: pace on the CPU clock, no vsync wait
 int g_vsync_check = 0;
 std::vector<char16_t> g_typed;
-SDL_GameController *g_pad = nullptr;
-std::chrono::steady_clock::time_point g_pad_scan{};
+int g_mouse_px = 0, g_mouse_py = 0, g_mouse_clicks = 0, g_mouse_wheel = 0;
+bool g_mouse_seen = false;
 
 void set_fullscreen(bool on) {
     if (g_window == nullptr) return;
@@ -148,52 +150,9 @@ bool edge(SDL_Scancode sc, bool &was_down) {
     return fire;
 }
 
-void pad_scan() {
-    const auto now = std::chrono::steady_clock::now();
-    if (g_pad != nullptr) {
-        if (!SDL_GameControllerGetAttached(g_pad)) { SDL_GameControllerClose(g_pad); g_pad = nullptr; }
-        return;
-    }
-    if (now - g_pad_scan < std::chrono::seconds(1)) return;
-    g_pad_scan = now;
-    for (int i = 0; i < SDL_NumJoysticks(); ++i) {
-        if (SDL_IsGameController(i)) { g_pad = SDL_GameControllerOpen(i); if (g_pad != nullptr) break; }
-    }
-}
-
-std::uint32_t pad_buttons() {
-    pad_scan();
-    if (g_pad == nullptr) return 0u;
-    const auto b = [](SDL_GameControllerButton x) { return SDL_GameControllerGetButton(g_pad, x) != 0; };
-    std::uint32_t o = 0;
-    if (b(SDL_CONTROLLER_BUTTON_START)) o |= 0x0008u;
-    if (b(SDL_CONTROLLER_BUTTON_BACK)) o |= 0x0001u;
-    if (b(SDL_CONTROLLER_BUTTON_DPAD_UP)) o |= 0x0010u;
-    if (b(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) o |= 0x0020u;
-    if (b(SDL_CONTROLLER_BUTTON_DPAD_DOWN)) o |= 0x0040u;
-    if (b(SDL_CONTROLLER_BUTTON_DPAD_LEFT)) o |= 0x0080u;
-    if (b(SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) o |= 0x0100u;    // L
-    if (b(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) o |= 0x0200u;   // R
-    if (b(SDL_CONTROLLER_BUTTON_Y)) o |= 0x1000u;               // TRIANGLE
-    if (b(SDL_CONTROLLER_BUTTON_B)) o |= 0x2000u;               // CIRCLE
-    if (b(SDL_CONTROLLER_BUTTON_A)) o |= 0x4000u;               // CROSS
-    if (b(SDL_CONTROLLER_BUTTON_X)) o |= 0x8000u;               // SQUARE
-    return o;
-}
-
-bool pad_stick(std::uint8_t &lx, std::uint8_t &ly) {
-    pad_scan();
-    if (g_pad == nullptr) return false;
-    const float x = static_cast<float>(SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX)) / 32767.0f;
-    const float y = static_cast<float>(SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY)) / 32767.0f;   // SDL: down is positive
-    const float mag = std::sqrt(x * x + y * y);
-    if (mag < 0.2f) return false;
-    const float k = std::min(1.0f, (mag - 0.2f) / 0.8f) / mag;
-    const auto conv = [](float v) { return static_cast<std::uint8_t>(std::clamp(128.0f + v * 127.5f, 0.0f, 255.0f)); };
-    lx = conv(x * k);
-    ly = conv(y * k);
-    return true;
-}
+// Controllers: rr_pad.cpp reads every connected one through SDL (all makers, hot-plug, triggers).
+std::uint32_t pad_buttons() { return rr::pad::sdl_buttons(); }
+bool pad_stick(std::uint8_t &lx, std::uint8_t &ly) { return rr::pad::sdl_stick(lx, ly); }
 
 void update_vsync(bool force) {
     if (g_gl == nullptr) return;
@@ -209,6 +168,7 @@ void update_vsync(bool force) {
     if (env != nullptr && env[0] == '0') why = "RR_VSYNC=0";
     else if (env != nullptr && env[0] != '\0') { interval = std::max(1, std::atoi(env)); why = "RR_VSYNC"; }
     else if (!g_throttle) why = "unthrottled";
+    else if (g_cpu_pacing) why = "frame skip (CPU pacing)";
     else if (hz > 0) {
         const double n = static_cast<double>(hz) / fps, rn = std::round(n);
         if (rn >= 1.0 && std::fabs(n - rn) <= 0.03 * rn) interval = -static_cast<int>(rn);   // adaptive when the driver has it
@@ -250,6 +210,8 @@ bool present_open(const PresentOptions &options) {
     g_frame_period_us = std::max(1000, options.frame_period_us);
     g_low_latency = options.low_latency; g_latency_log = options.latency_log;
     g_scale = options.scale < 1 ? 1 : options.scale;
+    // Face buttons by position on every controller (Nintendo "B" = south = CROSS), as rr_pad.cpp expects.
+    SDL_SetHint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         log_line("PRESENT", std::string("SDL_Init failed: ") + SDL_GetError());
         return false;
@@ -278,6 +240,9 @@ void present_pump() {
         case SDL_WINDOWEVENT: if (e.window.event == SDL_WINDOWEVENT_CLOSE) g_quit = true; break;
         case SDL_KEYDOWN: handle_key_down(e.key); break;
         case SDL_TEXTINPUT: push_utf8(e.text.text); break;
+        case SDL_MOUSEMOTION: g_mouse_px = e.motion.x; g_mouse_py = e.motion.y; g_mouse_seen = true; break;
+        case SDL_MOUSEBUTTONDOWN: if (e.button.button == SDL_BUTTON_LEFT) { g_mouse_px = e.button.x; g_mouse_py = e.button.y; g_mouse_seen = true; ++g_mouse_clicks; } break;
+        case SDL_MOUSEWHEEL: g_mouse_wheel += e.wheel.y; break;
         default: break;
         }
     }
@@ -348,6 +313,10 @@ void present_gl_swap() {
     pace_frame();
 }
 
+void present_skip_frame() { present_pump(); pace_frame(); }
+void present_skip_frame_fast() { present_pump(); }
+void present_set_cpu_pacing(bool on) { if (on != g_cpu_pacing) { g_cpu_pacing = on; update_vsync(true); } }
+
 void present_set_frame_period_us(int period_us) {
     const int p = std::max(1000, period_us);
     if (p != g_frame_period_us) { g_frame_period_us = p; update_vsync(true); }
@@ -357,7 +326,14 @@ bool present_difftrace_requested() { static bool w = false; return edge(SDL_SCAN
 bool present_callprofile_requested() { static bool w = false; return edge(SDL_SCANCODE_SCROLLLOCK, w); }
 bool present_cartrace_requested() { static bool w = false; return edge(SDL_SCANCODE_DELETE, w); }
 bool present_ramdump_requested() { static bool w = false; return edge(SDL_SCANCODE_INSERT, w); }
-bool present_screenshot_requested() { static bool w = false; return edge(SDL_SCANCODE_F12, w); }
+bool present_screenshot_requested() { static bool w = false; const bool ctrl = key(SDL_SCANCODE_LCTRL) || key(SDL_SCANCODE_RCTRL); const bool e = edge(SDL_SCANCODE_F12, w); return e && !ctrl; }
+bool present_bug_report_requested() {
+    static bool w = false;
+    const bool down = key(SDL_SCANCODE_F12) && (key(SDL_SCANCODE_LCTRL) || key(SDL_SCANCODE_RCTRL));
+    const bool fire = down && !w;
+    w = down;
+    return fire;
+}
 
 void present_set_title(const char *title) { if (g_window != nullptr) SDL_SetWindowTitle(g_window, title); }
 
@@ -416,14 +392,28 @@ void present_pad_analog(std::uint8_t &lx, std::uint8_t &ly) {
 }
 
 void present_take_typed(std::vector<char16_t> &out) { out.clear(); out.swap(g_typed); }
+void present_take_mouse(PresentMouse &out) {
+    out = PresentMouse{};
+    if (g_window == nullptr) return;
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(g_window, &ww, &wh);
+    if (g_mouse_seen) out.inside = present_map_pointer(g_mouse_px, g_mouse_py, ww, wh, out.x, out.y);
+    out.clicks = g_mouse_clicks; out.wheel = g_mouse_wheel;
+    g_mouse_clicks = 0; g_mouse_wheel = 0;
+    // (the cursor is hidden in full screen: show it while a menu page of the port is open)
+    static bool shown = false;
+    const bool want = osk_active();
+    if (want != shown) { shown = want; if (g_fullscreen) SDL_ShowCursor(want ? SDL_ENABLE : SDL_DISABLE); }
+}
 
 std::uint32_t present_gamepad_buttons() { return pad_buttons(); }
+int present_pad_family() { return static_cast<int>(rr::pad::sdl_family()); }
+bool present_pad_stick_active() { std::uint8_t x = 128, y = 128; return pad_stick(x, y); }
 
 void present_close() {
     if (g_frame_tex != nullptr) { SDL_DestroyTexture(g_frame_tex); g_frame_tex = nullptr; }
     if (g_renderer != nullptr) { SDL_DestroyRenderer(g_renderer); g_renderer = nullptr; }
     if (g_gl != nullptr) { SDL_GL_DeleteContext(g_gl); g_gl = nullptr; }
-    if (g_pad != nullptr) { SDL_GameControllerClose(g_pad); g_pad = nullptr; }
     if (g_window != nullptr) { SDL_DestroyWindow(g_window); g_window = nullptr; }
     SDL_Quit();
 }

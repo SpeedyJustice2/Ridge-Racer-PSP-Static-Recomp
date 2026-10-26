@@ -23,13 +23,16 @@ void audio_stop();
 void audio_channel_push(int channel, const std::int16_t *pcm, std::uint32_t frames, bool stereo, int vol_left, int vol_right);
 // Channels keep their backlog bounded by default (excess is skipped with a short blend); the movie channel turns this off.
 void audio_channel_set_trim(int channel, bool on);
+// Time stretch (playing slower, same pitch, when the game produces sound slower than real time): on by default.  Off with the
+// automatic frame skip, which keeps the game itself at full speed, so the sound always plays at full speed.
+void audio_set_time_stretch(bool on);
 void audio_channel_volume(int channel, int vol_left, int vol_right);
 [[nodiscard]] std::uint32_t audio_channel_queued(int channel);
 void audio_channel_clear(int channel);
 // Counters since the last call (diagnostics): underruns = a primed channel ran dry, drops = frames discarded because a
 // ring was full, pushed/played = sample frames in/out, device_starved = times the sound card had run out of queued buffers (the mixer thread was too late), device_gap_max_ms = longest wait
 // between two mixer wake-ups, queue_min/max = largest single-channel backlog seen by the mixer.
-struct AudioStats { std::uint64_t underruns{}, drops{}, pushed{}, played{}, queue_min{}, queue_max{}, device_starved{}, device_gap_max_ms{}; };
+struct AudioStats { std::uint64_t underruns{}, drops{}, pushed{}, played{}, queue_min{}, queue_max{}, device_starved{}, device_gap_max_ms{}, stretched{}, stretch_starts{}; };   // stretched = output frames made by the time stretch
 AudioStats audio_take_stats();
 // Mixes `frames` stereo frames of all channels into `out` (interleaved int16).  Called by the device thread; exposed
 // for tests.

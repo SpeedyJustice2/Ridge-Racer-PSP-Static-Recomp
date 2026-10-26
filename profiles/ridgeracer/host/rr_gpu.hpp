@@ -62,6 +62,7 @@ struct GpuDraw {
     std::uint32_t depth_func{};
     std::uint32_t mask_rgb{}, mask_alpha{};
     std::int32_t scissor_x0{}, scissor_y0{}, scissor_x1{479}, scissor_y1{271};
+    std::uint32_t src_addr{};   // guest address the GE read this draw's vertices from (its index list when indexed): identifies a model piece
 };
 
 // Diagnostics a backend fills in while drawing (used to find rendering bugs).
@@ -92,6 +93,10 @@ public:
     virtual void vram_write(std::uint32_t /*address*/, std::uint32_t /*length*/) {}
     // Called when the GE stops executing (list finished, stalled or paused): submit any batched work.
     virtual void sync() {}
+    // Menu frame interpolation: when true, the GE also hands over each 3D triangle draw before back-face culling
+    // (record_full, right before draw()); `cull` is the cull mode in force (0 / 1) or -1 when culling is off.
+    [[nodiscard]] virtual bool wants_full_triangles() const { return false; }
+    virtual void record_full(const GpuDraw & /*state*/, const GpuVertex * /*vertices*/, std::size_t /*count*/, int /*cull*/) {}
 };
 
 } // namespace rr

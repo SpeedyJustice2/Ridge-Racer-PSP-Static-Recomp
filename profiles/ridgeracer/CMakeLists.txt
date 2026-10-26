@@ -101,6 +101,14 @@ add_executable(RidgeRacerNative
     host/rr_utility.cpp
     host/rr_settings.cpp
     host/rr_iso.cpp
+    host/rr_net.cpp
+    host/rr_http.cpp
+    host/rr_relay.cpp
+    host/rr_lobby_ui.cpp
+    host/rr_pad.cpp
+    host/rr_glyph_patch.cpp
+    host/rr_report.cpp
+    host/rr_sysinfo.cpp
     ${RR_LAUNCHER_SOURCE}
     ${RR_PRESENT_SOURCE}
     ${RIDGERACER_GENERATED}
@@ -136,7 +144,7 @@ if(NOT WIN32 AND RR_HAVE_SDL2)
     target_link_libraries(RidgeRacerNative PRIVATE ${CMAKE_DL_LIBS})
 endif()
 if(WIN32)
-    target_link_libraries(RidgeRacerNative PRIVATE user32 gdi32 d3d11 dxgi d3dcompiler opengl32 mfplat mfuuid ole32 winmm comctl32 shell32 uuid)
+    target_link_libraries(RidgeRacerNative PRIVATE user32 gdi32 d3d11 dxgi d3dcompiler opengl32 mfplat mfuuid ole32 winmm comctl32 shell32 uuid ws2_32 winhttp)
 endif()
 
 # Optional, developer use only: FFmpeg (shared build) for plain ATRAC3 files and for the RR_ATRAC_COMPARE check.
