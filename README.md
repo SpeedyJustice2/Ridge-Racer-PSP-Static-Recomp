@@ -2,6 +2,8 @@
 
 A native PC port of Ridge Racer (PSP), made by statically recompiling the game's own code. You build it on your own computer from **your own, legally obtained copy** of the game.
 
+COMMUNITY DISCORDL https://discord.gg/3SHKduJmH5
+
 > **Beta.** Windows only for now. Not affiliated with or endorsed by the game's publisher.
 
 **This repository contains no game files, no keys, no decryption code and no generated game code.** You need your own copy of the game; the setup tool turns it into a PC program on your machine.
