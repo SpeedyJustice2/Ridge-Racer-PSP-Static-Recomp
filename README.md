@@ -1,8 +1,6 @@
-# Ridge Racer (PSP) – Static Recomp
+# Ridge Racer (PSP) – PC port
 
 A native PC port of Ridge Racer (PSP), made by statically recompiling the game's own code. You build it on your own computer from **your own, legally obtained copy** of the game.
-
-COMMUNITY DISCORD https://discord.gg/3SHKduJmH5
 
 > **Beta.** Windows only for now. Not affiliated with or endorsed by the game's publisher.
 

@@ -1893,6 +1893,11 @@ constexpr std::uint32_t kUpdateWrap = 0x0884f290u, kSceneUpdate = 0x0895fd20u, k
                         kSceneDraw = 0x0895fee8u, kDtConst = 0x089a6b34u, kAfterDraw = 0x08825750u;   // (0x0887061C draws, calls 0x08825750, then updates)
 constexpr std::uint32_t kHeapLo = 0x09200000u, kHeapHi = 0x09400000u;   // where the UI nodes live (write traces at several menus)
 std::uint64_t last_frame = 0;            // last presented frame the UI update ran (raises the rate while the menus run)
+// The Rally-X mini game (first start without save data, "Press SELECT to continue onto Ridge Racer") runs its own logic once
+// per frame from 0x088EB858 while the UI engine also runs, so at the raised rate it played mult times too fast.  While it runs
+// the rate stays at 59.94 Hz, as before the menus got the raised rate.  RR_RALLYX_FAST=1 restores the old behaviour.
+constexpr std::uint32_t kRallyX = 0x088eb858u;
+std::uint64_t rallyx_frame = 0;          // last presented frame the Rally-X update ran
 bool active() { return g_hle_options.menu_native && g_hle_options.fps_mult > 1.0; }
 std::vector<std::uint32_t> before;       // heap before the first tick of the current update
 bool have_before = false, ticked = false;
@@ -2185,6 +2190,7 @@ bool active() {
 bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
     if (ui::active() && (address == ui::kUpdateWrap || address == ui::kTickTraverse || address == ui::kTickPost || address == ui::kSceneDraw || address == ui::kAfterDraw)) ui::on_entry(*rt, address, ctx);
     if (address == ui::kTurntable && ui::active()) ui::turntable(*rt, ctx);
+    if (address == ui::kRallyX && ui::active()) ui::rallyx_frame = g_frames_presented;
     if ((address == netpred::kStart || address == netpred::kSteer) && netpred::active()) netpred::on_entry(*rt, address, ctx);
     if (address == ui::kMenuMgr && ui::active()) ui::menu_mgr(*rt, ctx);
     if (address == kPvsBuild) { pvs_hook(ctx); return false; }
@@ -3450,7 +3456,7 @@ void refresh_table() {
             table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kSpriteSlotSetX - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     for (const std::uint32_t a : {0x08888bd8u, 0x08888ad0u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;   // (netplay prediction; cheap when off)
-    if (g_hle_options.menu_native) for (const std::uint32_t a : {0x0884f290u, 0x089622e0u, 0x08960200u, 0x0895fee8u, 0x08825750u, 0x088742ccu, 0x088728c8u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    if (g_hle_options.menu_native) for (const std::uint32_t a : {0x0884f290u, 0x089622e0u, 0x08960200u, 0x0895fee8u, 0x08825750u, 0x088742ccu, 0x088728c8u, 0x088eb858u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kAnimStep - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kPadUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kSePlay - psprecomp::kFunctionGateBase) >> 2u] = 1u;
@@ -4092,7 +4098,10 @@ void update_race_rate() {
     const bool in_race = (g_race_probe_frame != 0u && g_frames_presented - g_race_probe_frame < 20u) ||
                          (gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 20u && scene_state_fast(gates::scene_state));
     // --menu-native: the menus' UI engine ran in the last few frames (see gates::ui)
-    const bool menus = g_hle_options.menu_native && gates::ui::last_frame != 0u && g_frames_presented - gates::ui::last_frame < 8u;
+    // (not while the Rally-X mini game runs: it counts frames, see gates::ui::kRallyX)
+    static const bool rallyx_fast = std::getenv("RR_RALLYX_FAST") != nullptr;
+    const bool rallyx = !rallyx_fast && gates::ui::rallyx_frame != 0u && g_frames_presented - gates::ui::rallyx_frame < 8u;
+    const bool menus = g_hle_options.menu_native && !rallyx && gates::ui::last_frame != 0u && g_frames_presented - gates::ui::last_frame < 8u;
     const bool race = in_race || menus;
     g_rate_for_race = in_race;
     if (race == g_fast_rate) return;
