@@ -15,11 +15,13 @@
 
 #include "rr_hle.hpp"
 #include "rr_env.hpp"
+#include "rr_gen_loader.hpp"
 #include "rr_log.hpp"
 #include "rr_net.hpp"
 #include "rr_pad.hpp"
 #include "rr_report.hpp"
 #include "rr_settings.hpp"
+#include "rr_update.hpp"
 #include "rr_sysinfo.hpp"
 #include <cstdio>
 
@@ -61,6 +63,7 @@ bool apply_launcher(int &argc, char **&argv, std::vector<std::string> &store, st
     if (!double_click && !launcher_flag) return true;
     g_from_launcher = true;
     if (double_click) rr::hide_own_console();
+    rr::update::cleanup_old_files();   // (files an update replaced while the game was running)
     const std::filesystem::path ini = rr::settings_file_path();
     std::error_code ec;
     const bool ini_exists = std::filesystem::is_regular_file(ini, ec);
@@ -409,7 +412,10 @@ int main(int argc, char **argv) {
             " invalid=" + std::to_string(relocations.invalid) +
             " unsupported=" + std::to_string(relocations.unsupported));
 
-        psprecomp::register_generated_functions(runtime);
+        {
+            const std::string err = rr::load_game_code(runtime, rr::executable_directory());
+            if (!err.empty()) { log("ERROR: " + err); rr::show_error_box(err); return 3; }
+        }
         log("linked recompiled functions/entry points: " + std::to_string(runtime.function_count()));
         if (runtime.function_count() == 0u) {
             log("ERROR: the generated corpus is empty. Check PSPRECOMP_RIDGERACER_GENERATED_DIR.");

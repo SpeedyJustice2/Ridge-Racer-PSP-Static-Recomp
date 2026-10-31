@@ -18,6 +18,7 @@
 
 #include "psprecomp/runtime.hpp"
 #include "rr_crumb.hpp"
+#include "rr_links.hpp"
 #include "rr_log.hpp"
 #include "rr_pad.hpp"
 #include "rr_png.hpp"
@@ -34,6 +35,8 @@
 #include <dbghelp.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
+#include <commctrl.h>
 #elif !defined(__EMSCRIPTEN__)
 #include <csignal>
 #include <execinfo.h>
@@ -199,6 +202,48 @@ fs::path desktop_dir() {
     }
 #endif
     return executable_dir();
+}
+
+// ---- where to save the bug report ----
+std::atomic<bool> g_cancelled{false};
+
+// Windows: the standard "Save as" window (starts in the folder used last time, the Desktop the first time).  Returns false if the
+// player cancelled; `out` stays empty when the window could not be shown at all (the caller then uses the Desktop).
+bool ask_save_location(const std::string &file_name, fs::path &out) {
+    out.clear();
+#if defined(_WIN32)
+    if (const char *forced = std::getenv("RR_REPORT_DIR"); forced != nullptr && *forced != '\0') { out = fs::path(forced) / file_name; return true; }
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool cancelled = false;
+    IFileSaveDialog *d = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d))) && d != nullptr) {
+        static const GUID kGuid = {0x7a1e5c52, 0x3b0f, 0x4c61, {0x9d, 0x24, 0x52, 0x52, 0x62, 0x75, 0x67, 0x72}};   // (remembers the folder between uses)
+        d->SetClientGuid(kGuid);
+        d->SetTitle(L"Save the bug report");
+        d->SetOkButtonLabel(L"Save");
+        const COMDLG_FILTERSPEC types[] = {{L"Zip file (*.zip)", L"*.zip"}};
+        d->SetFileTypes(1, types);
+        d->SetDefaultExtension(L"zip");
+        d->SetFileName(fs::path(file_name).wstring().c_str());
+        IShellItem *folder = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(desktop_dir().c_str(), nullptr, IID_PPV_ARGS(&folder))) && folder != nullptr) { d->SetDefaultFolder(folder); folder->Release(); }
+        const HRESULT shown = d->Show(GetForegroundWindow());
+        if (SUCCEEDED(shown)) {
+            IShellItem *item = nullptr;
+            if (SUCCEEDED(d->GetResult(&item)) && item != nullptr) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path != nullptr) { out = fs::path(path); CoTaskMemFree(path); }
+                item->Release();
+            }
+        } else if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) cancelled = true;
+        d->Release();
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return !cancelled;
+#else
+    (void)file_name;
+    return true;
+#endif
 }
 
 // ---- crash handling ----
@@ -429,31 +474,76 @@ fs::path make_bug_report(const std::string &reason, const fs::path &screenshot) 
         t += "\nPlease also tell the developer what you were doing and what went wrong.\n";
         entries.insert(entries.begin(), {"system.txt", std::vector<std::uint8_t>(t.begin(), t.end())});
     }
-    const fs::path zip = desktop_dir() / ("RidgeRacer-bug-report-" + stamp_now("%Y-%m-%d_%H-%M-%S") + ".zip");
-    if (!write_zip(zip, entries)) return {};
+    const std::string file_name = "RidgeRacer-bug-report-" + stamp_now("%Y-%m-%d_%H-%M-%S") + ".zip";
+    fs::path zip;
+    g_cancelled = false;
+    if (!ask_save_location(file_name, zip)) { g_cancelled = true; log_line(category::kHle, "bug report: save window cancelled"); return {}; }
+    if (zip.empty()) zip = desktop_dir() / file_name;
+    if (!write_zip(zip, entries)) {   // (a folder we cannot write to: try the Desktop)
+        zip = desktop_dir() / file_name;
+        if (!write_zip(zip, entries)) return {};
+    }
     log_line(category::kHle, "bug report written: " + zip.string());
     return zip;
 }
 
 void announce(const fs::path &zip, bool crashed) {
 #if defined(_WIN32)
-    std::wstring msg;
-    if (zip.empty()) msg = L"The bug report could not be written.  Please send the files in the game's folder instead (ridgeracer.log and the reports folder).";
-    else {
-        msg = crashed ? L"Sorry - Ridge Racer crashed.\n\n" : L"";
-        msg += L"A bug report was saved on your Desktop:\n\n" + zip.filename().wstring() +
-               L"\n\nPlease send this file to the developer, with a few words about what you were doing.  It holds the game's logs, your settings "
-               L"(without your room password), a summary of your PC and, if the game crashed, a crash report.\n\nOpen the folder now?";
+    if (zip.empty() && g_cancelled) return;   // the player chose not to save a report
+    if (zip.empty()) {
+        MessageBoxW(nullptr, L"The bug report could not be written.  Please send the files in the game's folder instead (ridgeracer.log and the reports folder).",
+                    crashed ? L"Ridge Racer crashed" : L"Ridge Racer bug report", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+        return;
     }
-    const int r = MessageBoxW(nullptr, msg.c_str(), crashed ? L"Ridge Racer crashed" : L"Ridge Racer bug report",
-                              (zip.empty() ? MB_OK | MB_ICONWARNING : MB_YESNO | (crashed ? MB_ICONERROR : MB_ICONINFORMATION)) | MB_TOPMOST | MB_SETFOREGROUND);
-    if (r == IDYES) {
-        const std::wstring args = L"/select,\"" + zip.wstring() + L"\"";
-        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+    const std::wstring title = crashed ? L"Ridge Racer crashed" : L"Ridge Racer bug report";
+    std::wstring content = L"File: " + zip.filename().wstring() + L"\n\nIt holds the game's logs, your settings (without your room password), a summary of your PC and, "
+                           L"if the game crashed, a crash report.  Please tell us what you were doing and what went wrong.";
+    enum : int { kBtnGithub = 1001, kBtnFolder = 1002 };
+    const TASKDIALOG_BUTTON buttons[] = {
+        {kBtnGithub, L"Report it on GitHub\nOpens the bug report page in your browser. Drag the saved file into the report."},
+        {kBtnFolder, L"Show the file in its folder"},
+    };
+    const wchar_t *footer = L"Questions, or want someone to race? <a href=\"" RR_URL_DISCORD_W L"\">Join the community Discord</a>";
+    using TaskDialogFn = HRESULT(WINAPI *)(const TASKDIALOGCONFIG *, int *, int *, BOOL *);
+    const auto task_dialog = reinterpret_cast<TaskDialogFn>(GetProcAddress(GetModuleHandleW(L"comctl32.dll"), "TaskDialogIndirect"));
+    for (;;) {
+        int pressed = 0;
+        HRESULT hr = E_FAIL;
+        if (task_dialog != nullptr) {
+            TASKDIALOGCONFIG cfg{};
+            cfg.cbSize = sizeof cfg;
+            cfg.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ENABLE_HYPERLINKS | TDF_ALLOW_DIALOG_CANCELLATION;
+            cfg.dwCommonButtons = TDCBF_CLOSE_BUTTON;
+            cfg.pszWindowTitle = title.c_str();
+            cfg.pszMainIcon = crashed ? TD_ERROR_ICON : TD_INFORMATION_ICON;
+            cfg.pszMainInstruction = crashed ? L"Sorry - Ridge Racer crashed.  A bug report was saved." : L"Your bug report was saved.";
+            cfg.pszContent = content.c_str();
+            cfg.cButtons = 2;
+            cfg.pButtons = buttons;
+            cfg.pszFooter = footer;
+            cfg.pszFooterIcon = TD_INFORMATION_ICON;
+            cfg.pfCallback = [](HWND, UINT msg, WPARAM, LPARAM lp, LONG_PTR) -> HRESULT {
+                if (msg == TDN_HYPERLINK_CLICKED) ShellExecuteW(nullptr, L"open", reinterpret_cast<const wchar_t *>(lp), nullptr, nullptr, SW_SHOWNORMAL);
+                return S_OK;
+            };
+            hr = task_dialog(&cfg, &pressed, nullptr, nullptr);
+        }
+        if (FAILED(hr)) {   // (no task dialog available: a plain question)
+            const std::wstring msg = L"A bug report was saved:\n\n" + zip.filename().wstring() + L"\n\nOpen the GitHub bug report page now? (No = show the file)";
+            const int r = MessageBoxW(nullptr, msg.c_str(), title.c_str(), MB_YESNOCANCEL | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+            pressed = r == IDYES ? kBtnGithub : r == IDNO ? kBtnFolder : IDCLOSE;
+        }
+        if (pressed == kBtnGithub) { ShellExecuteW(nullptr, L"open", RR_URL_ISSUES_W, nullptr, nullptr, SW_SHOWNORMAL); continue; }
+        if (pressed == kBtnFolder) {
+            const std::wstring args = L"/select,\"" + zip.wstring() + L"\"";
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+            continue;
+        }
+        break;
     }
 #else
-    if (zip.empty()) std::fprintf(stderr, "The bug report could not be written.\n");
-    else std::fprintf(stderr, "%sA bug report was saved: %s\nPlease send it to the developer.\n", crashed ? "Ridge Racer crashed. " : "", zip.string().c_str());
+    if (zip.empty()) { if (!g_cancelled) std::fprintf(stderr, "The bug report could not be written.\n"); }
+    else std::fprintf(stderr, "%sA bug report was saved: %s\nPlease send it to the developer (%s).\n", crashed ? "Ridge Racer crashed. " : "", zip.string().c_str(), RR_URL_ISSUES);
 #endif
 }
 

@@ -52,6 +52,20 @@ echo    This is the slow step of making a release (about as long as the old inst
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%\build.ps1" -PrepareRelease "%STAGE%" -WorkDir "%DIST%\_prep"
 if errorlevel 1 (echo PREPARING THE PREBUILT PARTS FAILED & pause & exit /b 1)
 if not exist "%STAGE%\prebuilt\psp_recomp.exe" (echo PREBUILT PARTS MISSING & pause & exit /b 1)
+if not exist "%STAGE%\prebuilt\RidgeRacerNative.exe" (echo PROGRAM MISSING FROM THE PREBUILT PARTS & pause & exit /b 1)
+echo == Update package ^(the program only, for the in-game updater^)
+mkdir "%DIST%\_upd"
+move /Y "%STAGE%\prebuilt\RidgeRacerNative.exe" "%DIST%\_upd\RidgeRacerNative.exe" >nul
+if exist "%SRC%\profiles\ridgeracer\third_party\sdl2\SDL2.dll" copy /Y "%SRC%\profiles\ridgeracer\third_party\sdl2\SDL2.dll" "%DIST%\_upd\" >nul
+if exist "%SRC%\README-BETA.md" copy /Y "%SRC%\README-BETA.md" "%DIST%\_upd\README.txt" >nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = Get-Content -Raw -LiteralPath '%SRC%\profiles\ridgeracer\gen\rr_gen_abi_version.hpp'; if ($t -match 'kAbiVersion\s*=\s*(\d+)') { Set-Content -LiteralPath '%DIST%\_upd\abi.txt' -Value $Matches[1] -Encoding ASCII } else { exit 1 }"
+if errorlevel 1 (echo COULD NOT READ kAbiVersion & pause & exit /b 1)
+echo == Safety check ^(the update package must hold only our own program, no game data or converted game code^)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$d = '%DIST%\_upd'; $ok = @('RidgeRacerNative.exe','SDL2.dll','README.txt','abi.txt'); $files = Get-ChildItem -LiteralPath $d -File; $bad = $files | Where-Object { $ok -notcontains $_.Name }; if ($bad -or (Get-ChildItem -LiteralPath $d -Directory)) { Write-Host 'STOPPED - unexpected files in the update package:' -ForegroundColor Red; $bad | ForEach-Object { Write-Host ('  ' + $_.Name) }; exit 1 }; $exe = Get-Item (Join-Path $d 'RidgeRacerNative.exe'); if ($exe.Length -gt 30MB) { Write-Host ('STOPPED - the program is ' + [math]::Round($exe.Length / 1MB) + ' MB; it should not contain game code.') -ForegroundColor Red; exit 1 }; $txt = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe.FullName)); if ($txt.Contains('recomp_unit_0') -or $txt.Contains('generated_unit')) { Write-Host 'STOPPED - converted game code is inside the program.' -ForegroundColor Red; exit 1 }; Write-Host 'OK'"
+if errorlevel 1 (pause & exit /b 1)
+tar -a -cf "%DIST%\RidgeRacer-Update.zip" -C "%DIST%\_upd" .
+if errorlevel 1 (echo UPDATE PACKAGE FAILED & pause & exit /b 1)
+rmdir /s /q "%DIST%\_upd"
 echo == Compressing (this takes a minute)
 tar -a -cf "%DIST%\payload.zip" -C "%STAGE%" .
 if errorlevel 1 (echo ZIP FAILED & pause & exit /b 1)
@@ -71,5 +85,7 @@ if exist "%DIST%\_prep" rmdir /s /q "%DIST%\_prep"
 del "%DIST%\stub.exe" "%DIST%\payload.zip"
 if exist "%DIST%\stub.pdb" del "%DIST%\stub.pdb"
 for %%A in ("%DIST%\Setup.exe") do echo == Done: %%~fA  (%%~zA bytes)
+for %%A in ("%DIST%\RidgeRacer-Update.zip") do echo ==       %%~fA  (%%~zA bytes)  - upload this too: it is what the in-game updater downloads
+
 echo    Started %T0%, finished %TIME%.
 pause

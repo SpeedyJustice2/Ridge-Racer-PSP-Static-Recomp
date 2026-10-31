@@ -25,9 +25,9 @@ Start the game from the shortcut. A settings window opens on the first start (ho
 Wireless Battle works over the internet: choose it in the game, then host a race or pick one from the server browser (or type a friend's room code with *Direct connect*). Up to 8 players.
 
 ## Reporting bugs
-The game makes a bug report for you: a zip file on your Desktop named `RidgeRacer-bug-report-<date>.zip`. Send that file, together with a few words about what you were doing (track, mode, online or not, what went wrong).
+The game makes a bug report for you and asks where to save it: a zip file named `RidgeRacer-bug-report-<date>.zip`. Send that file, together with a few words about what you were doing (track, mode, online or not, what went wrong).
 
-- **The game crashed or stopped with an error:** a message tells you a report was saved on your Desktop.
+- **The game crashed or stopped with an error:** the game asks where to save a report, then offers to open the GitHub bug report page.
 - **Something looks or sounds wrong while playing:** press **Ctrl+F12** at that moment. The report includes a picture of the screen.
 - **The game froze, or will not start:** open the settings window (hold Shift while starting the game) and click **Bug report...**. It includes the log of the last session.
 
@@ -36,3 +36,6 @@ A report holds the game's logs (this session and the one before), your settings 
 ## Known limits
 - The browser version cannot be offered as a download or website (it would contain the game's code).
 - Unlocked frame rate, car LOD pop-in, intro camera shots other than the default, and Time Attack on some tracks are not fully checked.
+
+## Community
+Join the Discord for news, updates and to find opponents to race against: https://discord.gg/XENZw6VXdd

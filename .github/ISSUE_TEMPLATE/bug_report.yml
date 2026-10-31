@@ -6,7 +6,7 @@ body:
       value: |
         Thanks for reporting. This is a hobby project that is not actively maintained, so there may be no reply or fix.
         **Anything you attach here is public.** The bug report zip holds logs, settings, crash files and a short PC summary, and these can include folder paths with your Windows user name. Look inside before attaching if that matters to you.
-        The game makes the report for you: Ctrl+F12 in game, the **Bug report...** button in the settings window (hold Shift while starting the game), or automatically after a crash. The zip is on your Desktop (`RidgeRacer-bug-report-<date>.zip`).
+        The game makes the report for you: Ctrl+F12 in game, the **Bug report...** button in the settings window (hold Shift while starting the game), or automatically after a crash. The game asks where to save the zip (`RidgeRacer-bug-report-<date>.zip`), then offers to open this page.
   - type: input
     id: version
     attributes:

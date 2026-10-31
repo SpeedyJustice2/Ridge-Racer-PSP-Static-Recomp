@@ -124,9 +124,9 @@ $prof = Join-Path $root "profiles\ridgeracer"
 $hostDir = Join-Path $prof "host"
 $a3p = Join-Path $prof "third_party\atrac3plus"
 $cFlags = @("cc", "-target", "x86_64-windows-gnu", "-std=c11", "-O2", "-g0", "-DNDEBUG", "-mavx", "-fno-strict-aliasing", "-fwrapv", "-ffp-contract=off", "-Wno-everything")
-$libNames = "user32","gdi32","d3d11","dxgi","d3dcompiler_47","opengl32","mfplat","mfuuid","mf","mfreadwrite","ole32","winmm","comctl32","shell32","uuid","comdlg32","advapi32","shlwapi","ws2_32","winhttp"
+$libNames = "user32","gdi32","d3d11","dxgi","d3dcompiler_47","opengl32","mfplat","mfuuid","mf","mfreadwrite","ole32","winmm","comctl32","shell32","uuid","comdlg32","advapi32","shlwapi","ws2_32","winhttp","bcrypt"
 $hostNames = "main","rr_hle","rr_log","rr_ge","rr_raster","rr_gl","rr_png","rr_atrac","rr_mpeg","rr_pmf","rr_audio","rr_atrac_decoder",
-             "rr_video_win32","rr_osk_ui","rr_lobby_ui","rr_pad","rr_glyph_patch","rr_report","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_launcher_win32","rr_present_win32"
+             "rr_video_win32","rr_osk_ui","rr_lobby_ui","rr_pad","rr_glyph_patch","rr_report","rr_update","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_launcher_win32","rr_present_win32","rr_gen_loader"
 $atracNames = "atrac","atrac3plus","atrac3plusdsp","atrac3plusdec","rr_compat"
 
 # ---- the parts that do not depend on the game: compiler runtime library, code generator, the game's host code
@@ -142,7 +142,9 @@ $toolObj = @(New-ItemList @(Get-Item (Join-Path $root "tools\codegen_main.cpp"))
 $gen = Join-Path $build "generated"
 $gameArgs = $cxx + $inc + @("-I", $hostDir, "-I", $a3p, "-I", $gen)
 $hostFiles = $hostNames | ForEach-Object { Get-Item (Join-Path $hostDir ($_ + ".cpp")) }
-$hostObj = @(New-ItemList $hostFiles $hostObjDir $gameArgs)
+# The program is built apart from the converted game code (RidgeRacerGame.dll): see profiles\ridgeracer\gen\rr_gen_abi.hpp.
+$hostArgs = $gameArgs + @("-DRR_GAME_LIBRARY=1")
+$hostObj = @(New-ItemList $hostFiles $hostObjDir $hostArgs)
 $cfiles = $atracNames | ForEach-Object { Get-Item (Join-Path $a3p ($_ + ".c")) }
 $cArgs = $cFlags + @("-I", (Join-Path $a3p "compat"), "-I", $a3p)
 $atracObj = @(New-ItemList $cfiles $atracObjDir $cArgs)
@@ -151,7 +153,7 @@ $atracObj = @(New-ItemList $cfiles $atracObjDir $cArgs)
 # used when they match exactly.
 function Get-TreeHash {
   $rels = New-Object System.Collections.Generic.List[string]
-  foreach ($d in @("include", "src", "tools", "profiles\ridgeracer\host", "profiles\ridgeracer\third_party\atrac3plus")) {
+  foreach ($d in @("include", "src", "tools", "profiles\ridgeracer\host", "profiles\ridgeracer\gen", "profiles\ridgeracer\third_party\atrac3plus")) {
     $p = Join-Path $root $d
     if (-not (Test-Path $p)) { continue }
     foreach ($f in (Get-ChildItem $p -Recurse -File)) {
@@ -191,6 +193,19 @@ if ($PrepareRelease) {
     Copy-Item -LiteralPath $pair[0] -Destination (Join-Path $pre $pair[1]) -Recurse -Force
   }
   Copy-Item -LiteralPath $genExe -Destination (Join-Path $pre "psp_recomp.exe") -Force
+  # The program itself (everything except the converted game code, which becomes RidgeRacerGame.dll on the player's PC).  It is
+  # shipped inside Setup.exe and, with SDL2.dll, as the small update package.
+  $resP = Join-Path $build "rr.res"
+  Push-Location $hostDir; & $zig rc "rr.rc" $resP; $rcP = $LASTEXITCODE; Pop-Location
+  if ($rcP) { Fail "Building resources failed." }
+  $relP = { param($p) $p.Substring($build.Length + 1) }
+  $objsP = @(($hostObj + $atracObj + $coreObj) | ForEach-Object { & $relP $_.obj })
+  $libsP = $libNames | ForEach-Object { "-l$_" }
+  Push-Location $build
+  & $zig @(@("c++", "-target", "x86_64-windows-gnu", "-O2") + $objsP + @("rr.res") + $libsP + @("-Wl,--stack,67108864", "-o", (Join-Path $pre "RidgeRacerNative.exe")))
+  $lcP = $LASTEXITCODE
+  Pop-Location
+  if ($lcP) { Fail "Linking the program failed." }
   Set-Content -LiteralPath (Join-Path $pre "manifest.txt") (Get-TreeHash) -Encoding ASCII
   # Warm cache: use the compiler the way the installer will (same target and CPU flags, same libraries), on tiny programs.
   Step "Preparing the compiler cache" "compile"
@@ -341,6 +356,7 @@ $unityObjDir = Join-Path $build "obj-unity"
 $genItems = @()
 if ($NoUnity) {
   $genItems = @(New-ItemList $genFiles $objGen $gameArgs)
+  $genItems += @(New-ItemList @(Get-Item (Join-Path $prof "gen\rr_gen_shim.cpp")) $objGen $gameArgs)
   $objs += $genItems
   Invoke-Compiles ($hostObj + $atracObj + $genItems) "game"
 } else {
@@ -372,6 +388,7 @@ if ($NoUnity) {
     $batchMembers[$wrapper] = $b
   }
   $otherItems = @(New-ItemList $others $objGen $gameArgs)
+  $otherItems += @(New-ItemList @(Get-Item (Join-Path $prof "gen\rr_gen_shim.cpp")) $objGen $gameArgs)
   # big files first so the long ones do not end up last
   $all = @($hostObj + $atracObj + $otherItems + $batchItems)
   $failedSrc = Invoke-Compiles $all "game" -Soft
@@ -405,13 +422,25 @@ $exe = Join-Path $out "RidgeRacerNative.exe"
 $libs = $libNames | ForEach-Object { "-l$_" }
 # Object paths are made relative to the build folder: with 430+ objects the full paths would exceed the command-line length limit.
 $rel = { param($p) $p.Substring($build.Length + 1) }
-$relObjs = @(($objs | ForEach-Object { & $rel $_.obj }) + ($coreObj | ForEach-Object { & $rel $_.obj }))
-$linkGame = @("c++", "-target", "x86_64-windows-gnu", "-O2") + $relObjs + @("rr.res") + $libs + @("-Wl,--stack,67108864", "-o", $exe)
+# 1) the program: this project's own code only (no converted game code)
+$progObjs = @(($hostObj + $atracObj) | ForEach-Object { & $rel $_.obj }) + @($coreObj | ForEach-Object { & $rel $_.obj })
+$linkGame = @("c++", "-target", "x86_64-windows-gnu", "-O2") + $progObjs + @("rr.res") + $libs + @("-Wl,--stack,67108864", "-o", $exe)
 Push-Location $build
 & $zig @linkGame
 $lc = $LASTEXITCODE
 Pop-Location
 if ($lc) { Fail "Linking the game failed." }
+# 2) the game library: the code converted from your game, built here and kept here
+Step "Linking the game library" "link"
+$dll = Join-Path $out "RidgeRacerGame.dll"
+$libObjs = @($objs | Where-Object { $hostObj.obj -notcontains $_.obj -and $atracObj.obj -notcontains $_.obj } | ForEach-Object { & $rel $_.obj })
+$linkLib = @("c++", "-target", "x86_64-windows-gnu", "-O2", "-shared") + $libObjs + @("-o", $dll)
+Push-Location $build
+& $zig @linkLib
+$lc2 = $LASTEXITCODE
+Pop-Location
+if ($lc2) { Fail "Linking the game library failed." }
+Remove-Item (Join-Path $out "RidgeRacerGame.lib") -Force -ErrorAction SilentlyContinue
 # Controller support for PlayStation / Switch / other pads (loaded at run time; without it only XInput pads work).
 $sdlDll = Join-Path $root "profiles\ridgeracer\third_party\sdl2\SDL2.dll"
 if (Test-Path $sdlDll) {

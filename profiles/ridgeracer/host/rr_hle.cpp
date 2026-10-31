@@ -3508,6 +3508,7 @@ void install(Runtime &runtime) {
     refresh_table();
     psprecomp::g_function_gate_table = table.data();
     psprecomp::g_function_gate_hook = &hook;
+    if (psprecomp::g_runtime_globals_changed != nullptr) psprecomp::g_runtime_globals_changed();   // (split build: the game library has its own copies)
     std::string list;
     for (const std::uint32_t a : skip) list += " " + hex32(a);
     log_line(category::kHle, std::string("ANIMFIX build=a53 mirror_old=") + (std::getenv("RR_MIRROR_OLD") ? "1" : "0") + " anim_scale_off=" + (std::getenv("RR_ANIM_SCALE_OFF") ? "1" : "0") +

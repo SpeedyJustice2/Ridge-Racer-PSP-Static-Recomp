@@ -21,6 +21,9 @@ namespace psprecomp {
 // fully instrumented runtime lookup. Keeping this as a plain process-global bool
 // makes the common branch one predictable load instead of a hook/table walk.
 extern bool g_runtime_chain_observers_active;
+// Called after the two fast-path globals below (or the function-gate pair) change; the split build uses it to copy them into
+// the game library, which has its own copies.  Null otherwise.
+extern void (*g_runtime_globals_changed)() noexcept;
 // Fast-path copy of the scheduler cadence. It is configured before guest
 // execution and lets compile-time direct AOT chains charge ordinary work
 // without calling an out-of-line helper on every cross-unit edge.
@@ -68,8 +71,11 @@ void set_runtime_thread_identity(std::int32_t uid, const std::string &name) noex
 [[nodiscard]] std::uint64_t runtime_thread_switch_generation() noexcept;
 [[nodiscard]] bool runtime_thread_switch_generation_matches(std::uint64_t generation) noexcept;
 
+struct GenBridge;
+
 class Runtime {
 public:
+    friend struct GenBridge;
     using RecompiledFunction = void (*)(Runtime &, AllegrexContext &);
     using RecompiledEntryFunction = void (*)(Runtime &, AllegrexContext &, std::uint16_t,
                                              GuestMemory::AotFastView &);

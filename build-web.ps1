@@ -127,7 +127,7 @@ $objs = @()
 $core = Get-ChildItem (Join-Path $root "src") -Filter *.cpp
 $objs += New-ItemList $core (Join-Path $build "obj-core") $cxx
 $hostNames = "main","rr_hle","rr_log","rr_ge","rr_raster","rr_gl","rr_png","rr_atrac","rr_mpeg","rr_pmf","rr_audio","rr_atrac_decoder",
-             "rr_osk_ui","rr_lobby_ui","rr_pad","rr_glyph_patch","rr_report","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_launcher_null","rr_present_web"
+             "rr_osk_ui","rr_lobby_ui","rr_pad","rr_glyph_patch","rr_report","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_update","rr_gen_loader","rr_launcher_null","rr_present_web"
 $hostFiles = $hostNames | ForEach-Object { Get-Item (Join-Path $hostDir ($_ + ".cpp")) }
 $gameArgs = $cxx + @("-I", $hostDir, "-I", $a3p, "-I", $gen)
 $objs += New-ItemList $hostFiles (Join-Path $build "obj-host") $gameArgs

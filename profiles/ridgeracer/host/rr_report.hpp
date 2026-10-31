@@ -5,7 +5,7 @@
 //  - A crash (an unhandled exception in the game itself) writes reports\crash-<time>.txt (what failed and where, the call
 //    stack, what the game was doing, the last log lines) and, on Windows, reports\crash-<time>.dmp (a minidump for a
 //    debugger), then starts the game once more in report mode, which packs everything into a bug report and says where it is.
-//  - A bug report is one zip on the Desktop (Windows; next to the game elsewhere): logs (this and the previous session),
+//  - A bug report is one zip saved where the player chooses (Windows: a Save window starting at the Desktop; next to the game elsewhere): logs (this and the previous session),
 //    settings (password removed), performance report, online log, the newest crash reports, a system summary and, from the
 //    in-game hot key, a screenshot.  Made from the settings window ("Bug report..."), with Ctrl+F12 in game, after a crash
 //    and after the game stops on an error.

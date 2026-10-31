@@ -4,6 +4,7 @@
 # from your own game with psp_recomp (see README.md) and point this profile at
 # it with PSPRECOMP_RIDGERACER_GENERATED_DIR.
 
+option(RR_SPLIT_GAME "Build the converted game code as a separate library (RidgeRacerGame)" OFF)
 set(RIDGERACER_PROFILE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
 set(PSPRECOMP_RIDGERACER_GENERATED_DIR "${CMAKE_SOURCE_DIR}/../RidgeRacerPSPFiles/generated" CACHE PATH
@@ -108,11 +109,30 @@ add_executable(RidgeRacerNative
     host/rr_pad.cpp
     host/rr_glyph_patch.cpp
     host/rr_report.cpp
+    host/rr_update.cpp
+    host/rr_gen_loader.cpp
     host/rr_sysinfo.cpp
     ${RR_LAUNCHER_SOURCE}
     ${RR_PRESENT_SOURCE}
-    ${RIDGERACER_GENERATED}
+    $<$<NOT:$<BOOL:${RR_SPLIT_GAME}>>:${RIDGERACER_GENERATED}>
 )
+if(RR_SPLIT_GAME)
+    # Split build: the converted game code becomes a separate library that is built on the player's PC (see gen/rr_gen_abi.hpp).
+    target_compile_definitions(RidgeRacerNative PRIVATE RR_GAME_LIBRARY=1)
+    add_library(RidgeRacerGame SHARED gen/rr_gen_shim.cpp ${RIDGERACER_GENERATED})
+    target_include_directories(RidgeRacerGame PRIVATE "${RIDGERACER_GENERATED_DIR}" "${RIDGERACER_PROFILE_DIR}/gen" "${CMAKE_SOURCE_DIR}/include")
+    set_target_properties(RidgeRacerGame PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON
+                          RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:RidgeRacerNative>" LIBRARY_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:RidgeRacerNative>")
+    if(NOT MSVC)
+        target_compile_options(RidgeRacerGame PRIVATE -fno-strict-aliasing -fwrapv -ffp-contract=off)
+        target_link_options(RidgeRacerGame PRIVATE -Wl,--no-undefined)
+        target_link_libraries(RidgeRacerGame PRIVATE m)
+    endif()
+    add_dependencies(RidgeRacerNative RidgeRacerGame)
+    if(NOT WIN32)
+        target_link_libraries(RidgeRacerNative PRIVATE dl)
+    endif()
+endif()
 if(NOT MSVC)
     target_compile_options(RidgeRacerNative PRIVATE -fno-strict-aliasing -fwrapv -ffp-contract=off)
 endif()
@@ -144,7 +164,7 @@ if(NOT WIN32 AND RR_HAVE_SDL2)
     target_link_libraries(RidgeRacerNative PRIVATE ${CMAKE_DL_LIBS})
 endif()
 if(WIN32)
-    target_link_libraries(RidgeRacerNative PRIVATE user32 gdi32 d3d11 dxgi d3dcompiler opengl32 mfplat mfuuid ole32 winmm comctl32 shell32 uuid ws2_32 winhttp)
+    target_link_libraries(RidgeRacerNative PRIVATE user32 gdi32 d3d11 dxgi d3dcompiler opengl32 mfplat mfuuid ole32 winmm comctl32 shell32 uuid ws2_32 winhttp bcrypt)
 endif()
 
 # Optional, developer use only: FFmpeg (shared build) for plain ATRAC3 files and for the RR_ATRAC_COMPARE check.

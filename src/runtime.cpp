@@ -18,6 +18,8 @@ namespace psprecomp {
 // sticky: once instrumentation has been requested, correctness matters more
 // than returning to the production fast path later in the process.
 bool g_runtime_chain_observers_active = false;
+void (*g_runtime_globals_changed)() noexcept = nullptr;
+namespace { inline void globals_changed() noexcept { if (g_runtime_globals_changed != nullptr) g_runtime_globals_changed(); } }
 std::uint64_t g_runtime_starvation_interval_fast = 0u;
 std::uint64_t g_runtime_thread_switch_generation_fast = 0u;
 
@@ -78,6 +80,7 @@ void load_counted_pcs() {
         begin = comma + 1u;
     }
     if (g_counted_pc_size != 0u) g_runtime_chain_observers_active = true;
+    globals_changed();
 }
 
 inline void count_pc(std::uint32_t pc) noexcept {
@@ -114,6 +117,7 @@ void load_jalr_targets() {
         begin = comma + 1u;
     }
     if (g_jalr_target_size != 0u) g_runtime_chain_observers_active = true;
+    globals_changed();
 }
 
 void trace_jalr(const AllegrexContext &ctx, std::uint32_t address) {
@@ -159,6 +163,7 @@ void set_runtime_starvation_hook(RuntimeStarvationHook hook, std::uint64_t inter
     g_starvation_hook = interval != 0u ? hook : nullptr;
     g_starvation_interval = interval;
     g_runtime_starvation_interval_fast = g_starvation_hook != nullptr ? interval : 0u;
+    globals_changed();
 }
 
 void set_runtime_pre_dispatch_hook(RuntimePreDispatchHook hook) noexcept {
@@ -170,10 +175,12 @@ void set_runtime_post_dispatch_hook(RuntimePostDispatchHook hook) noexcept {
 void set_runtime_pre_chained_call_hook(RuntimePreChainedCallHook hook) noexcept {
     g_pre_chained_call_hook = hook;
     if (hook != nullptr) g_runtime_chain_observers_active = true;
+    globals_changed();
 }
 void set_runtime_post_chained_call_hook(RuntimePostChainedCallHook hook) noexcept {
     g_post_chained_call_hook = hook;
     if (hook != nullptr) g_runtime_chain_observers_active = true;
+    globals_changed();
 }
 
 void set_runtime_post_import_hook(RuntimePostImportHook hook) noexcept { g_post_import_hook = hook; }

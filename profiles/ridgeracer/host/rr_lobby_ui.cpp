@@ -234,13 +234,19 @@ void start_probe(const LobbyRoom &r, const std::string &pw) {
     g.out = LobbyRequest{LobbyRequestKind::Probe, r.id, pw, 0};
 }
 
+std::string queue_race_text(const LobbyRoom &r) {
+    std::string t = r.host.empty() ? std::string("the host") : r.host;
+    if (r.course > 0) t += " - " + std::string(lobby_course_name(r.course));
+    return t;
+}
+
 void start_queue(const LobbyRoom &r, const std::string &pw) {
     g.pending = r;
     g.pending_pw = pw;
     ++g.pending_seq;
     g.modal = Modal::Busy;
     g.busy_for = BusyFor::Queue;
-    g.busy_text = "Waiting for " + (r.host.empty() ? std::string("the") : r.host + "'s") + " race to finish...";
+    g.busy_text = "Waiting: " + queue_race_text(r);
     g.queue_note = "You will join as soon as it takes entries again.";
     g.queue_since = g.frames;
     g.queue_next = g.frames + 180u;
@@ -454,7 +460,23 @@ void lobby_ui_set_rooms(const std::vector<LobbyRoom> &rooms, int status, bool fr
 namespace { std::string g_update_to; }   // (kept across pages: the room service refuses this game version)
 void lobby_ui_set_update(const std::string &newest) { g_update_to = newest; }
 
+
 void lobby_ui_lookup_result(bool found, const LobbyRoom &room, int status, const std::string &other_version) {
+    if (g.modal == Modal::Busy && g.busy_for == BusyFor::Queue) {   // waiting in line: follow the room as the host changes it
+        if (status != 200) { lobby_ui_probe_result("error"); return; }
+        if (!other_version.empty()) { g.modal = Modal::None; toast("That race is on another version of the game (" + other_version + ")."); g.events |= kOskCancel; return; }
+        if (!found) { lobby_ui_probe_result("gone"); return; }
+        g.queue_gone_since = 0u;
+        const bool changed = room.course != g.pending.course || room.cls != g.pending.cls || room.handicap != g.pending.handicap || room.host != g.pending.host;
+        g.pending = room;
+        g.busy_text = "Waiting: " + queue_race_text(room);
+        if (changed) g.events |= kOskMove;
+        if (room.racing) { g.queue_note = "Race in progress. You join when the host returns to the lobby."; return; }
+        if (room.players >= room.max) { g.queue_note = "The race is full: waiting for a free place."; return; }
+        g.queue_note = "Joining: " + queue_race_text(room);
+        g.out = LobbyRequest{LobbyRequestKind::Probe, room.id, g.pending_pw, 0};
+        return;
+    }
     if (g.modal != Modal::Busy || g.busy_for != BusyFor::Lookup) return;
     g.modal = Modal::None;
     if (status != 200) { toast("Could not reach the room service."); g.events |= kOskCancel; return; }
@@ -476,7 +498,7 @@ void lobby_ui_probe_result(const std::string &result) {
         if (result != "gone") g.queue_gone_since = 0u;
         if (result == "racing" || result == "full" || result == "busy" || result == "error") {
             if (g.busy_for != BusyFor::Queue) { start_queue(g.pending, g.pending_pw); g.events |= kOskMove; return; }
-            g.queue_note = result == "racing" ? "You will join as soon as it takes entries again."
+            g.queue_note = result == "racing" ? "Race in progress. You join when the host returns to the lobby."
                          : result == "full" ? "The race is full: waiting for a free place."
                          : "Can't reach the room service right now: still trying.";
             return;
@@ -594,7 +616,7 @@ void update_impl(const LobbyInput &in) {
     // waiting for a race to end: ask again every 3 s
     if (g.modal == Modal::Busy && g.busy_for == BusyFor::Queue && g.out.kind == LobbyRequestKind::None && g.frames >= g.queue_next) {
         g.queue_next = g.frames + 180u;
-        g.out = LobbyRequest{LobbyRequestKind::Probe, g.pending.id, g.pending_pw, 0};
+        g.out = LobbyRequest{LobbyRequestKind::Lookup, g.pending.id, lobby_room_code(g.pending.id), 0};   // (live room info first, then the join check)
     }
     // automatic refresh while the list is on screen
     if (g.page == Page::Browser && g.modal == Modal::None && g.out.kind == LobbyRequestKind::None && g.frames >= g.refresh_at) refresh();

@@ -27,8 +27,11 @@ void set_write_watch_range(std::uint32_t address, std::uint32_t size) noexcept; 
 #define PSPRECOMP_MEMORY_FAST_PATH inline __attribute__((always_inline))
 #endif
 
+struct GenBridge;   // (the split build forwards the converted game code's calls here; see profiles/ridgeracer/gen)
+
 class GuestMemory {
 public:
+    friend struct GenBridge;
     static constexpr std::uint32_t kScratchpadPhysicalBase = 0x00010000u;
     static constexpr std::uint32_t kScratchpadSize = 16u * 1024u;
     static constexpr std::uint32_t kVramPhysicalBase = 0x04000000u;

@@ -225,7 +225,7 @@ $btnNext.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9.5)
 $form.AcceptButton = $btnNext
 
 $titles = @(
-  @("Welcome", "Ridge Racer PSP - PC port (beta)"),
+  @("Welcome", $(if ($env:RR_UPDATE_DIR) { "Updating your install - just click Next, your folder and game are filled in" } else { "Ridge Racer PSP - PC port (beta)" })),
   @("Your game", "Step 1 of 2"),
   @("Install location", "Step 2 of 2"),
   @("Installing", "Please wait - this window can stay in the background"),
@@ -502,6 +502,12 @@ $form.Add_FormClosing({
 
 # a game path given on the command line pre-fills the window (handy for testing)
 $txtDir.Text = Join-Path ([Environment]::GetFolderPath("UserProfile")) "Games\Ridge Racer PSP PC"
+# started by the game's built-in updater: the current game folder and game path are filled in
+if ($env:RR_UPDATE_DIR) {
+  $txtDir.Text = $env:RR_UPDATE_DIR
+  if ($env:RR_UPDATE_GAME) { $txtGame.Text = $env:RR_UPDATE_GAME }
+  $lblSub.Tag = "update"
+}
 $script:closing = $false
 Show-Page 0
 [void]$form.ShowDialog()

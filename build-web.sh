@@ -29,7 +29,7 @@ add() {  # add SRC OBJDIR FLAGS COMPILER
 : > "$build/objects.lst"
 for f in "$root"/src/*.cpp; do add "$f" "$build/obj-core" "$cxx" "$EMXX"; done
 for n in main rr_hle rr_log rr_ge rr_raster rr_gl rr_png rr_atrac rr_mpeg rr_pmf rr_audio rr_atrac_decoder rr_osk_ui \
-         rr_lobby_ui rr_pad rr_glyph_patch rr_report rr_menusound rr_utility rr_settings rr_iso rr_net rr_http rr_relay rr_sysinfo rr_launcher_null rr_present_web; do
+         rr_lobby_ui rr_pad rr_glyph_patch rr_report rr_menusound rr_utility rr_settings rr_iso rr_net rr_http rr_relay rr_sysinfo rr_update rr_gen_loader rr_launcher_null rr_present_web; do
     add "$hostdir/$n.cpp" "$build/obj-host" "$game" "$EMXX"; done
 # Movies: FFmpeg's H.264 decoder (third_party/ffmpeg-h264, LGPL) behind host/rr_video_ffmpeg.cpp
 ff=$prof/third_party/ffmpeg-h264
