@@ -21,7 +21,8 @@
 #include "rr_pad.hpp"
 #include "rr_report.hpp"
 #include "rr_settings.hpp"
-#include "rr_update.hpp"
+#include "rr_updater_client.hpp"
+#include "rr_overlay.hpp"
 #include "rr_sysinfo.hpp"
 #include <cstdio>
 
@@ -63,7 +64,7 @@ bool apply_launcher(int &argc, char **&argv, std::vector<std::string> &store, st
     if (!double_click && !launcher_flag) return true;
     g_from_launcher = true;
     if (double_click) rr::hide_own_console();
-    rr::update::cleanup_old_files();   // (files an update replaced while the game was running)
+    rr::cleanup_update_leftovers();   // (files an update replaced while the game was running)
     const std::filesystem::path ini = rr::settings_file_path();
     std::error_code ec;
     const bool ini_exists = std::filesystem::is_regular_file(ini, ec);
@@ -76,10 +77,15 @@ bool apply_launcher(int &argc, char **&argv, std::vector<std::string> &store, st
         s.render_scale = 2; s.aa = 0; s.aniso = 1; s.ui_crisp = 1; s.smooth_cutouts = false; s.frame_skip = 0;
     }
     const bool game_ok = rr::check_game_file(rr::resolve_game_path(s.game_path)).empty();
-    if (launcher_flag || !ini_exists || s.show_launcher || !game_ok || rr::launcher_shift_held()) {
+    // The settings live in game now (Options > RECOMP OPTIONS); the window opens only when the game files are missing, when
+    // asked for (--launcher, Shift held) or when the player turned "Settings window at start" on.
+    if (launcher_flag || s.show_launcher || !game_ok || rr::launcher_shift_held()) {
         if (!rr::run_launcher(s)) return false;
         rr::save_settings(ini, s);
+    } else if (!ini_exists) {
+        rr::save_settings(ini, s);   // (first start: remember the game files that were found)
     }
+    rr::set_running_settings(s, true);
     store = rr::to_args(s, rr::monitor_refresh_hz());
     if (double_click && !log_given) { store.push_back("--log"); store.push_back((ini.parent_path() / "ridgeracer.log").string()); }
     store.insert(store.end(), rest.begin(), rest.end());
@@ -311,6 +317,9 @@ int main(int argc, char **argv) {
                 { const std::string v = argv[++i]; frame_skip = (v == "auto") ? 0 : std::clamp(std::atoi(v.c_str()), 0, 4); }
             } else if (arg == "--smooth-cutouts") {
                 smooth_cutouts = true;
+            } else if (arg == "--perf-overlay") {
+                if (i + 1 >= argc) throw psprecomp::Error("--perf-overlay needs 0 (off), 1 (frame rate) or 2 (details)");
+                rr::overlay::set_mode(std::atoi(argv[++i]));
             } else if (arg == "--perf-report") {
                 if (i + 1 >= argc) throw psprecomp::Error("--perf-report needs a file name");
                 rr::set_perf_report(argv[++i]);

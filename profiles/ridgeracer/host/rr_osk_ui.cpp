@@ -1,5 +1,6 @@
 #include "rr_osk_ui.hpp"
 #include "rr_ui_canvas.hpp"
+#include "rr_ui_repeat.hpp"
 #include "rr_pad_ui.hpp"
 
 #include <algorithm>
@@ -69,7 +70,9 @@ struct Ui {
     std::u16string desc, text;
     std::uint32_t limit{15u};
     int row{0}, col{0};
-    std::uint32_t prev_pad{0u}, held_frames{0u}, frames{0u};
+    std::uint32_t prev_pad{0u}, frames{0u};
+    ui::NavRepeat repeat;
+    ui::Ticks60 ticks;
     std::uint32_t events{0u};   // OskEvent bits since the last osk_ui_take_events()
     bool armed{false};   // buttons must be released once so the press that opened the dialog is not taken as input
     bool arrows{false};  // the highlight was last moved with the arrow keys / D-pad: Enter presses the highlighted key
@@ -116,7 +119,7 @@ void osk_ui_end() { g.active = false; }
 
 OskState osk_ui_update(const std::vector<char16_t> &typed, std::uint32_t pad) {
     if (!g.active) return OskState::Cancelled;
-    ++g.frames;
+    g.frames = g.ticks.next();
     // Typed characters.  Ignore the very first frames: the Enter that opened the dialog may still be in the queue.
     if (g.frames > 2u) {
         for (char16_t c : typed) {
@@ -141,12 +144,7 @@ OskState osk_ui_update(const std::vector<char16_t> &typed, std::uint32_t pad) {
     const std::uint32_t pressed = pad & ~g.prev_pad;
     std::uint32_t nav = pressed;
     const std::uint32_t dirs = kUp | kRight | kDown | kLeft;
-    if (pad & dirs) {
-        ++g.held_frames;
-        if (g.held_frames > 20u && (g.held_frames % 5u) == 0u) nav |= pad & dirs;   // auto-repeat
-    } else {
-        g.held_frames = 0u;
-    }
+    nav |= g.repeat.step(pad, dirs);   // auto-repeat (timed, see rr_ui_repeat.hpp)
     g.prev_pad = pad;
     if (nav & dirs) { g.events |= kOskMove; g.arrows = true; }
     if (g.row == kCharRows) {

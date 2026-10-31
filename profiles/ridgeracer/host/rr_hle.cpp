@@ -7,6 +7,11 @@
 #include "rr_menusound.hpp"
 #include "rr_osk_ui.hpp"
 #include "rr_lobby_ui.hpp"
+#include "rr_options_ui.hpp"
+#include "rr_overlay.hpp"
+#include "rr_updater_client.hpp"
+#include "rr_links.hpp"
+#include "rr_version.hpp"
 #include "rr_utility.hpp"
 #include "rr_ge.hpp"
 #include "rr_png.hpp"
@@ -869,6 +874,34 @@ namespace gates { bool autopilot_buttons(std::uint32_t &out); extern std::uint64
 std::uint32_t g_opp_state = 0xffffffffu;   // race state machine state (OPPSTATE), for the test autopilot
 using gates::autopilot_buttons;
 std::uint32_t effective_pad_buttons() {
+    // RR_LIVEPAD=<file> (test rig only): an append-only command file polled while the game runs, so a headless run can be steered
+    // screen by screen.  Each new line "HEX READS" holds those buttons for READS controller reads, then releases for 6 reads.
+    // A line "wait READS" just waits.  Lines are consumed in order; the file is re-read from where it was left.
+    if (static const char *live = std::getenv("RR_LIVEPAD"); live != nullptr) {
+        static std::streamoff off = 0;
+        static std::deque<std::pair<std::uint32_t, std::uint64_t>> q;
+        static std::uint32_t cur = 0u; static std::uint64_t left = 0u;
+        if (left == 0u && q.empty()) {
+            std::ifstream in(live);
+            if (in) {
+                in.seekg(off);
+                std::string line;
+                while (std::getline(in, line)) {
+                    unsigned b = 0; unsigned long long n = 0;
+                    if (std::sscanf(line.c_str(), "wait %llu", &n) == 1) q.push_back({0u, n});
+                    else if (std::sscanf(line.c_str(), "%x %llu", &b, &n) == 2) { q.push_back({b, n}); q.push_back({0u, 6u}); }
+                    off = in.tellg() < 0 ? off + static_cast<std::streamoff>(line.size() + 1) : static_cast<std::streamoff>(in.tellg());
+                }
+            }
+        }
+        if (left == 0u && !q.empty()) {
+            cur = q.front().first; left = q.front().second; q.pop_front();
+            log_line(category::kHle, "LIVEPAD " + hex32(cur) + " x" + std::to_string(left) + " at read " + std::to_string(g_ctrl_reads) +
+                                         " frame " + std::to_string(g_frames_presented));
+        }
+        if (left > 0u) { --left; return cur; }
+        return 0u;
+    }
     if (g_rig_active) {
         static std::uint32_t current = 0u;
         while (g_rig_pos < g_rig.size() && rig_due(g_rig[g_rig_pos])) { current = g_rig[g_rig_pos].buttons; ++g_rig_pos; }
@@ -1019,6 +1052,7 @@ LobbyRoom lobby_room_of(const net::RoomInfo &ri, const net::BrowseState &b) {
     return r;
 }
 
+namespace recomp { void start_background_check(); void note_online(); }
 // At the game's group scan: opens the browser (Search Race) or the room setup page (Host Race) and holds the scan open.
 bool lobby_try_open(Runtime &rt, AllegrexContext &ctx, net::Node &node) {
     if (!node.online() || !lobby_enabled()) return false;
@@ -1027,6 +1061,7 @@ bool lobby_try_open(Runtime &rt, AllegrexContext &ctx, net::Node &node) {
     const std::uint32_t path = mem.load32(kNetPathAddr);
     if (path > 1u) return false;
     lobby_load_prefs();
+    recomp::note_online();   // (the player wants to race online: look for a newer version now)
     node.ctl_scan_hold();
     { std::vector<char16_t> stale; present_take_typed(stale); PresentMouse m; present_take_mouse(m); }
     g_lobby.active = true;
@@ -1181,6 +1216,353 @@ void lobby_frame() {
         }
     }
 }
+
+// ---- RECOMP OPTIONS (the port's settings page, see rr_options_ui.hpp) ----
+// The game's Options screen lists CONTROLLER, AUDIO, NAME CHANGE, AV PLAYER, MINI GAME and BACK.  Its texts come from the
+// game's string table (object a0 of the lookup 0x08881EEC: count [a0], (id, offset) pairs [a0+0x190], text base [a0+0x194],
+// text at base + offset*2: a u16 prefix, then glyph codes, 0-terminated).  The row texts are looked up when the screen is
+// built, the help line under the list every frame.  The BACK row (string 4001011) becomes RECOMP OPTIONS and its help
+// lines (104001019 / 104001020) describe the page; Triangle / Square (and the game's other back buttons) still go back.
+// When the cursor is on that row (its help line was looked up in the last frames) and the Options job is running
+// (COptionModeJob at 0x089F1BE0, vtable 0x089A4E00, +8 non-zero while active), Cross / Circle / Start open the page
+// instead of reaching the game.  Another version of the game fails these checks and keeps its plain BACK row.
+// RR_NO_RECOMP_OPTIONS=1 turns all of this off.
+namespace recomp {
+constexpr std::uint32_t kStrLookup = 0x08881EECu, kOptionJob = 0x089F1BE0u, kOptionJobVtable = 0x089A4E00u;
+constexpr std::uint32_t kIdRow = 4001011u, kIdHelpA = 104001019u, kIdHelpB = 104001020u, kIdMainHelp = 101001014u;
+std::uint32_t table = 0u;                  // the string table object, once seen
+std::map<std::uint32_t, std::uint32_t> patched;   // id -> offset we wrote
+std::map<std::uint32_t, std::string> wanted;      // id -> text
+std::uint64_t row_frame = 0u;              // last presented frame the row's help line was looked up
+bool page_open = false;
+std::uint32_t mask_buttons = 0u;           // buttons kept from the game until released (the press that opened / closed the page)
+PlayerSettings running;
+OptionsUpdateView upd;
+std::string upd_status;                    // status file of the running RidgeRacerUpdater.exe (empty = none)
+int upd_job = 0;                           // 0 idle, 1 checking, 2 installing
+std::uint64_t upd_started = 0;             // presented frame the helper was started
+bool online_notice = false;   // tell the player in the server browser / room setup page once a newer version is known
+
+bool enabled() {
+    static const bool off = std::getenv("RR_NO_RECOMP_OPTIONS") != nullptr;
+    return !off;
+}
+
+// ASCII to the game's glyph codes (letters, digits and the punctuation found in its own texts).
+std::vector<std::uint16_t> encode(const std::string &t) {
+    std::vector<std::uint16_t> out;
+    for (const unsigned char c : t) {
+        if (c == ' ') out.push_back(1u);
+        else if (c >= 'A' && c <= 'Z') out.push_back(static_cast<std::uint16_t>(2u + (c - 'A')));
+        else if (c >= 'a' && c <= 'z') out.push_back(static_cast<std::uint16_t>(28u + (c - 'a')));
+        else if (c >= '0' && c <= '9') out.push_back(static_cast<std::uint16_t>(0x36u + (c - '0')));
+        else if (c == '.') out.push_back(0x4Du);
+        else if (c == ',') out.push_back(0x4Bu);
+        else if (c == '/') out.push_back(0x4Eu);
+        else if (c == '\'') out.push_back(0x46u);
+        else if (c == '(') out.push_back(0x47u);
+        else if (c == ')') out.push_back(0x48u);
+        else if (c == '?') out.push_back(0x54u);
+        else if (c == '\x01') out.push_back(0xFFFCu);   // (marker the game puts in front of long help lines)
+    }
+    return out;
+}
+
+int find_entry(Runtime &r, std::uint32_t id) {
+    auto &m = r.memory();
+    const std::uint32_t count = m.load32(table), pairs = m.load32(table + 0x190u);
+    if (count == 0u || count > 20000u || pairs < 0x08800000u || pairs >= 0x0A000000u) return -1;
+    for (std::uint32_t k = 0; k < count; ++k) if (m.load32(pairs + 8u * k) == id) return static_cast<int>(k);
+    return -1;
+}
+
+// Points string `id` at `text` (a copy in guest memory).  The original prefix word is kept.
+void patch(Runtime &r, std::uint32_t id, const std::string &text) {
+    auto &m = r.memory();
+    const int k = find_entry(r, id);
+    if (k < 0) return;
+    const std::uint32_t pairs = m.load32(table + 0x190u), base = m.load32(table + 0x194u);
+    const std::uint32_t old_off = m.load32(pairs + 8u * static_cast<std::uint32_t>(k) + 4u);
+    const std::uint16_t prefix = m.load16(base + old_off * 2u);
+    const std::vector<std::uint16_t> glyphs = encode(text);
+    const std::uint32_t bytes = static_cast<std::uint32_t>((glyphs.size() + 2u) * 2u);
+    const std::uint32_t at = arena_allocate(bytes + 4u, 4u);
+    if (at == 0u || ((at - base) & 1u) != 0u) return;
+    m.store16(at, prefix);
+    for (std::size_t i = 0; i < glyphs.size(); ++i) m.store16(at + 2u + static_cast<std::uint32_t>(i) * 2u, glyphs[i]);
+    m.store16(at + 2u + static_cast<std::uint32_t>(glyphs.size()) * 2u, 0u);
+    const std::uint32_t off = (at - base) >> 1u;
+    m.store32(pairs + 8u * static_cast<std::uint32_t>(k) + 4u, off);
+    patched[id] = off;
+}
+
+void set_text(std::uint32_t id, const std::string &text) { wanted[id] = text; if (patched.count(id) != 0u) patched[id] = 0xFFFFFFFFu; }
+
+// Entry of the game's string lookup: notes the table, keeps our texts in it, and sees which help line is on screen.
+void on_lookup(Runtime &r, psprecomp::AllegrexContext &ctx) {
+    if (!enabled()) return;
+    const std::uint32_t t = static_cast<std::uint32_t>(ctx.gpr[4]), id = static_cast<std::uint32_t>(ctx.gpr[5]);
+    if (id == kIdHelpA || id == kIdHelpB) row_frame = g_frames_presented;
+    if (wanted.count(id) == 0u) return;
+    auto &m = r.memory();
+    if (t != table) { table = t; patched.clear(); }
+    const int k = find_entry(r, id);
+    if (k < 0) return;
+    const std::uint32_t cur = m.load32(m.load32(table + 0x190u) + 8u * static_cast<std::uint32_t>(k) + 4u);
+    const auto it = patched.find(id);
+    if (it == patched.end() || it->second != cur) {
+        patch(r, id, wanted[id]);
+        log_line(category::kHle, "RECOMP OPTIONS: text " + std::to_string(id) + " -> \"" + wanted[id] + "\"");
+    }
+}
+
+bool job_active(Runtime &r) {
+    auto &m = r.memory();
+    return m.load32(kOptionJob) == kOptionJobVtable && m.load32(kOptionJob + 8u) != 0u;
+}
+
+void init_texts() {
+    static bool done = false;
+    if (done || !enabled()) return;
+    done = true;
+    set_text(kIdRow, "RECOMP OPTIONS");
+    set_text(kIdHelpA, "Change the PC version's graphics, sound, controls and more.");
+    set_text(kIdHelpB, "Change the PC version's graphics, sound, controls and more.");
+    set_text(kIdMainHelp, "Access game options, the AV Player and the Recomp Options.");
+}
+
+OptionsContext context() {
+    OptionsContext c;
+    c.monitor_hz = monitor_refresh_hz();
+    c.can_restart = started_from_shortcut();
+    c.can_update = std::getenv("RR_NO_UPDATE_CHECK") == nullptr && updater_available();
+    c.version = RR_GAME_VERSION_NAME;
+    return c;
+}
+
+PlayerSettings load_current() {
+    std::error_code ec;
+    const auto ini = settings_file_path();
+    PlayerSettings s = std::filesystem::is_regular_file(ini, ec) ? load_settings(ini) : PlayerSettings{};
+    s.fullscreen = present_fullscreen() || (s.fullscreen && !g_hle_options.window);
+    // what the game is using now (F9 / F10 change the volume while playing)
+    s.volume = std::clamp(static_cast<int>(std::lround(audio_master_volume() * 100.0f)), 0, 150);
+    s.menu_volume = std::clamp(static_cast<int>(std::lround(audio_menu_gain() * 100.0f)), 0, 200);
+    s.perf_overlay = overlay::mode();
+    return s;
+}
+
+void start_background_check();
+void open_page() {
+    PlayerSettings now = load_current();
+    if (!running_settings(running)) running = now;
+    { std::vector<char16_t> stale; present_take_typed(stale); PresentMouse m; present_take_mouse(m); }
+    options_ui_set_update(upd);
+    options_ui_begin(now, running, context());
+    page_open = true;
+    start_background_check();   // (only now, never at game start: an unsigned program that goes online at start trips antivirus heuristics)
+    menu_sound_play(MenuSound::Confirm);
+    log_line(category::kHle, "RECOMP OPTIONS: page opened (frame " + std::to_string(g_frames_presented) + ")");
+}
+
+// Settings that take effect at once.
+void apply_live(const PlayerSettings &s) {
+    g_hle_options.volume = std::clamp(s.volume, 0, 150) / 100.0f;
+    g_hle_options.menu_volume = std::clamp(s.menu_volume, 0, 200) / 100.0f;
+    audio_set_master_volume(g_hle_options.volume);
+    audio_set_menu_gain(g_hle_options.menu_volume);
+    static const char *const prompt_names[] = {"auto", "xbox", "playstation", "nintendo", "keyboard"};
+    pad::set_prompts(pad::parse_prompts(prompt_names[std::clamp(s.button_prompts, 0, 4)], pad::Prompts::Auto));
+    pad::set_triggers(s.trigger_buttons);
+    overlay::set_mode(s.perf_overlay);
+    if (g_hle_options.window && present_fullscreen() != s.fullscreen) present_set_fullscreen(s.fullscreen);
+    if (g_gl) {
+        GlBackend::Enhance e = g_gl->enhance();
+        static const float sharpen_levels[] = {0.0f, 0.35f, 0.6f, 1.0f}, crisp_levels[] = {0.0f, 0.8f, 1.0f};
+        e.aniso = std::clamp(s.aniso, 1, 16);
+        e.sharpen = sharpen_levels[std::clamp(s.sharpen, 0, 3)];
+        e.ui_crisp = crisp_levels[std::clamp(s.ui_crisp, 0, 2)];
+        e.smooth_cutouts = s.smooth_cutouts;
+        g_gl->set_enhance(e);
+        for (const std::string &line : g_gl->take_events()) log_line(category::kGe, line);
+        g_hle_options.aniso = e.aniso; g_hle_options.sharpen = e.sharpen; g_hle_options.ui_crisp = e.ui_crisp; g_hle_options.smooth_cutouts = e.smooth_cutouts;
+    }
+}
+
+void save(const PlayerSettings &s) {
+    const auto ini = settings_file_path();
+    PlayerSettings out = s;
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(ini, ec)) {   // keep what the page does not show (game path, room options)
+        const PlayerSettings old = load_settings(ini);
+        out.game_path = old.game_path; out.room_visibility = old.room_visibility; out.room_password = old.room_password;
+    } else if (out.game_path.empty()) {
+        return;   // (test runs without a settings file: nothing to keep the settings for)
+    }
+    if (!save_settings(ini, out)) log_line(category::kHle, "RECOMP OPTIONS: could not write " + ini.string());
+}
+
+// Update work: done by RidgeRacerUpdater.exe (rr_updater_main.cpp), never by the game program itself (an unsigned game that went
+// to GitHub was stopped by antivirus heuristics).  The game starts it and polls its status file.
+void start_check() {
+    if (upd_job != 0) return;
+    if (!updater_start_check(upd_status)) { upd.state = OptionsUpdateView::Unreachable; log_line(category::kHle, "UPDATE check: could not start RidgeRacerUpdater.exe"); return; }
+    upd_job = 1; upd_started = g_frames_presented;
+    upd.state = OptionsUpdateView::Checking;
+}
+
+void start_update() {
+    if (upd_job != 0) return;
+    const PlayerSettings s = load_current();
+    if (!updater_start_install(upd_status, s.game_path)) { upd.state = OptionsUpdateView::Failed; upd.message = "RidgeRacerUpdater.exe could not be started."; return; }
+    upd_job = 2; upd_started = g_frames_presented;
+    upd.state = OptionsUpdateView::Downloading; upd.percent = 0;
+    log_line(category::kHle, "UPDATE install: started RidgeRacerUpdater.exe for " + upd.tag);
+}
+
+void restart_game(Runtime &r) {
+    if (!updater_start_restart()) { log_line(category::kHle, "RECOMP OPTIONS: restart failed (RidgeRacerUpdater.exe missing)"); options_ui_toast("Please restart the game yourself"); return; }
+    log_line(category::kHle, "RECOMP OPTIONS: restarting the game");
+    r.stop("restart for new settings");
+}
+
+// Reads the helper's status file (every 10 frames).
+void poll_updater(Runtime &r) {
+    if (upd_job == 0 || (g_frames_presented % 10u) != 0u) return;
+    std::map<std::string, std::string> st;
+    if (!updater_read(upd_status, st)) {
+        if (g_frames_presented - upd_started > 60u * 60u) {   // (no answer for a minute: the helper did not run)
+            upd.state = upd_job == 1 ? OptionsUpdateView::Unreachable : OptionsUpdateView::Failed;
+            upd.message = "The updater did not answer.";
+            upd_job = 0;
+        }
+        return;
+    }
+    const std::string state = st["state"];
+    if (!st["tag"].empty()) upd.tag = st["tag"];
+    static std::string last;
+    if (state != last) { last = state; log_line(category::kHle, "UPDATE " + state + (st["tag"].empty() ? std::string() : " " + st["tag"]) + (st["message"].empty() ? std::string() : ": " + st["message"]) + (st["source"].empty() ? std::string() : " (asked " + st["source"] + ")")); }
+    if (upd_job == 1) {
+        if (state == "available") { upd.state = OptionsUpdateView::Available; upd_job = 0; }
+        else if (state == "uptodate") { upd.state = OptionsUpdateView::UpToDate; upd_job = 0; }
+        else if (state == "unreachable") { upd.state = OptionsUpdateView::Unreachable; upd_job = 0; }
+        return;
+    }
+    if (state == "downloading" || state == "checking") { upd.state = OptionsUpdateView::Downloading; upd.percent = std::atoi(st["percent"].c_str()); }
+    else if (state == "uptodate") { upd.state = OptionsUpdateView::UpToDate; upd_job = 0; }
+    else if (state == "failed") { upd.state = OptionsUpdateView::Failed; upd.message = st["message"]; upd_job = 0; }
+    else if (state == "restarting" || state == "setup") {   // the helper installs / starts Setup once this game has closed
+        if (page_open) { save(options_ui_settings()); options_ui_end(); page_open = false; }
+        upd_job = 0;
+        r.stop(state == "restarting" ? "updated: restarting" : "update installer starts");
+    }
+}
+
+// Once a frame (from the present path).
+void frame(Runtime &r) {
+    if (!enabled()) return;
+    poll_updater(r);
+    {   // what the updater found
+        static int last_state = -1;
+        if (static_cast<int>(upd.state) != last_state) {
+            last_state = static_cast<int>(upd.state);
+            if (upd.state == OptionsUpdateView::Available)   // the main menu's Options help line tells the player
+                set_text(kIdMainHelp, "Options and AV Player. Update " + upd.tag + " is ready in Recomp Options.");
+        }
+        if (online_notice && upd.state == OptionsUpdateView::Available && lobby_ui_active()) {
+            online_notice = false;
+            lobby_ui_toast("Version " + upd.tag + " is out: install it in Options > Recomp Options > Updates & Help.");
+        }
+        if (page_open) options_ui_set_update(upd);
+    }
+    if (!page_open) return;
+    LobbyInput in;
+    present_take_typed(in.typed);
+    in.pad = effective_pad_buttons() | (g_replay_active ? present_pad_buttons() : 0u);
+    in.gamepad = g_replay_active ? effective_pad_buttons() | present_gamepad_buttons() : present_gamepad_buttons();
+    {
+        PresentMouse m;
+        present_take_mouse(m);
+        in.mouse_inside = m.inside; in.mouse_x = m.x; in.mouse_y = m.y; in.clicks = m.clicks; in.wheel = m.wheel;
+    }
+    const OptionsRequest rq = options_ui_update(in);
+    if (const std::uint32_t ev = options_ui_take_events(); ev != 0u) {
+        if (ev & kOskAccept) menu_sound_play(MenuSound::Confirm);
+        else if (ev & kOskCancel) menu_sound_play(MenuSound::Back);
+        else menu_sound_play(MenuSound::Move);
+    }
+    if (options_ui_take_live_change()) apply_live(options_ui_settings());
+    const auto close = [&]() {
+        save(options_ui_settings());
+        apply_live(options_ui_settings());
+        options_ui_end();
+        page_open = false;
+        mask_buttons = 0x4000u | 0x2000u | 0x1000u | 0x8000u | 0x0008u | 0x0001u;   // (until released: the closing press is not the game's)
+        log_line(category::kHle, "RECOMP OPTIONS: page closed (frame " + std::to_string(g_frames_presented) + ")");
+    };
+    switch (rq) {
+    case OptionsRequest::None: break;
+    case OptionsRequest::Close: close(); break;
+    case OptionsRequest::Restart: close(); restart_game(r); break;
+    case OptionsRequest::CheckUpdate: start_check(); break;
+    case OptionsRequest::Update: start_update(); break;
+    case OptionsRequest::BugReport: rr::report::make_bug_report_async("recomp options"); options_ui_toast("Making the bug report..."); break;
+    case OptionsRequest::OpenIssues: rr::report::open_url(RR_URL_ISSUES); options_ui_toast("Opened the bug report page in your browser"); break;
+    case OptionsRequest::OpenDiscord: rr::report::open_url(RR_URL_DISCORD); options_ui_toast("Opened the Discord invite in your browser"); break;
+    case OptionsRequest::OpenScreenshots: {
+        std::error_code ec;
+        const std::filesystem::path dir = std::filesystem::absolute(g_hle_options.shot_dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        const std::u8string u = dir.u8string();
+        rr::report::open_url(std::string(u.begin(), u.end()).c_str());
+        options_ui_toast("Opened the screenshots folder");
+        break;
+    }
+    }
+    // RR_OPTIONS_SHOTS=<folder> (tests): a picture of the page whenever it changes (at most one per 20 frames)
+    static const char *shots = std::getenv("RR_OPTIONS_SHOTS");
+    if (shots != nullptr && page_open) {
+        static std::uint64_t shot_key = 0, last_shot = 0;
+        static int shot_n = 0;
+        const std::uint64_t key = options_ui_state_key();
+        if (key != shot_key && g_frames_presented - last_shot >= 20u) {
+            last_shot = g_frames_presented; shot_key = key;
+            std::vector<std::uint8_t> px(960u * 544u * 4u, 255);
+            options_ui_render(px.data(), 960, 544);
+            std::error_code ec; std::filesystem::create_directories(shots, ec);
+            char nm[96]; std::snprintf(nm, sizeof nm, "options_%03d_frame%07llu.png", ++shot_n, static_cast<unsigned long long>(g_frames_presented));
+            write_png((std::filesystem::path(shots) / nm).string().c_str(), px.data(), 960u, 544u);
+        }
+    }
+}
+
+// The buttons the game sees on the Options screen: a press on the RECOMP OPTIONS row opens the page instead.
+std::uint32_t filter(Runtime &r, std::uint32_t buttons) {
+    if (!enabled()) return buttons;
+    init_texts();
+    static std::uint32_t prev = 0u;
+    const std::uint32_t raw = effective_pad_buttons();   // (`buttons` is 0 while a page of the port is open)
+    const std::uint32_t pressed = raw & ~prev;
+    prev = raw;
+    mask_buttons &= raw;   // (released buttons are the game's again)
+    if (!page_open && !osk_active() && (pressed & (0x4000u | 0x2000u | 0x0008u)) != 0u && row_frame != 0u && g_frames_presented - row_frame <= 3u && job_active(r)) {
+        open_page();
+        mask_buttons = raw & (0x4000u | 0x2000u | 0x0008u | 0x1000u | 0x8000u);
+    }
+    if (page_open) return 0u;
+    return buttons & ~mask_buttons;
+}
+
+// Looks for a newer version once per session: when the RECOMP OPTIONS page opens, when the player goes online or when a race starts
+// (never at game start: an unsigned program that goes online right away trips antivirus heuristics).  A failed check is tried
+// again next time.
+void start_background_check() {
+    if (!enabled() || !context().can_update || std::getenv("RR_UPDATE_CHECK_OFF") != nullptr || upd_job != 0) return;
+    if (upd.state != OptionsUpdateView::Idle && upd.state != OptionsUpdateView::Unreachable) return;
+    start_check();
+}
+void note_online() { online_notice = true; start_background_check(); }
+} // namespace recomp
 
 // Handles one of the network imports for the real network.  Returns the PSP result code.
 std::uint32_t net_call(Runtime &rt, AllegrexContext &ctx, const std::string &fn, net::Node &node) {
@@ -2193,6 +2575,7 @@ bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
     if (address == ui::kRallyX && ui::active()) ui::rallyx_frame = g_frames_presented;
     if ((address == netpred::kStart || address == netpred::kSteer) && netpred::active()) netpred::on_entry(*rt, address, ctx);
     if (address == ui::kMenuMgr && ui::active()) ui::menu_mgr(*rt, ctx);
+    if (address == recomp::kStrLookup) { recomp::on_lookup(*rt, ctx); return false; }
     if (address == kPvsBuild) { pvs_hook(ctx); return false; }
     if ((address == 0x088d08c8u || address == 0x088d0940u || address == 0x088d09b8u) && cull_mode() != 0) {
         // RR_NOCULL=n (experiment): bit 1 = 0x088D08C8, 2 = 0x088D0940, 4 = 0x088D09B8 always report "visible"
@@ -3049,6 +3432,7 @@ bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
         if (cam_started) log_line(category::kHle, "CAMFOLLOW cleared at driver input init (mode " + std::to_string(ctx.gpr[5]) + ")");
         cam_started = false; idle_seen = false;
     }
+    if (address == kDriverInputInit && ctx.gpr[5] == 0u) recomp::start_background_check();   // (a race starts: World Tours, single race, time attack, online)
     if ((address == kDriverInputInit || address == kDriverInputUpdate) && std::getenv("RR_TICKSYNC_OFF") == nullptr) {
         // Replays re-simulate the race from the recorded inputs; the recorder / player 0x0883BF48 runs on the 60 Hz ticks and the car
         // physics every step, so every recorded input must reach the car on the same simulated step as in the race.  After each init
@@ -3459,6 +3843,7 @@ void refresh_table() {
     if (g_hle_options.menu_native) for (const std::uint32_t a : {0x0884f290u, 0x089622e0u, 0x08960200u, 0x0895fee8u, 0x08825750u, 0x088742ccu, 0x088728c8u, 0x088eb858u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kAnimStep - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kPadUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    if (recomp::enabled()) table[(recomp::kStrLookup - psprecomp::kFunctionGateBase) >> 2u] = 1u;   // (RECOMP OPTIONS row)
     table[(kSePlay - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kHeliUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kCtrlUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
@@ -3985,7 +4370,8 @@ void hle_watch_sink(bool is_write, std::uint32_t address, std::size_t length, st
         static std::uint32_t lo = 0u, hi = 0u; static bool init = false; static int lines = 0;
         if (!init) { init = true; if (const char *e = std::getenv("RR_WATCH_W")) { unsigned a = 0, l = 4; if (std::sscanf(e, "%x,%x", &a, &l) >= 1) { lo = a & 0x1FFFFFFFu; hi = lo + l; } } }
         static const std::uint32_t from = [] { const char *e = std::getenv("RR_WATCH_FROM"); return e ? static_cast<std::uint32_t>(std::atoi(e)) : 0u; }();
-        if (is_write && hi != 0u && (address & 0x1FFFFFFFu) >= lo && (address & 0x1FFFFFFFu) < hi && lines < 80 && gates::game_step() >= from) {
+        static const int max_lines = [] { const char *e = std::getenv("RR_WATCH_N"); return e ? std::atoi(e) : 80; }();
+        if (is_write && hi != 0u && (address & 0x1FFFFFFFu) >= lo && (address & 0x1FFFFFFFu) < hi && lines < max_lines && gates::game_step() >= from) {
             ++lines;
             log_line(category::kHle, "WWRITE addr=" + hex32(address) + " old=" + hex32(static_cast<std::uint32_t>(old_value)) + " new=" + hex32(static_cast<std::uint32_t>(new_value)) +
                                          " pc=" + hex32(psprecomp::runtime_dispatch_pc()) + " ra=" + hex32(psprecomp::runtime_watch_register(31)) + " step=" + std::to_string(gates::game_step()) + " val=" + std::to_string(std::bit_cast<float>(static_cast<std::uint32_t>(new_value))));
@@ -4023,6 +4409,12 @@ void hle_watch_sink(bool is_write, std::uint32_t address, std::size_t length, st
         if (n == 1u || n == 10u || n == 100u || n == 1000u || n == 10000u || n == 100000u || n == 1000000u)
             log_line(category::kHle, "WREAD n=" + std::to_string(n) + " pc=" + hex32(pc) + " ra=" + hex32(ra) + " addr=" + hex32(address) + " len=" + std::to_string(length) +
                                          " val=" + hex32(static_cast<std::uint32_t>(old_value)) + " step=" + std::to_string(gates::game_step()) + " frame=" + std::to_string(g_frames_presented));
+        static const bool regs = std::getenv("RR_WATCH_REGS") != nullptr;   // (research: the registers at the first read from each place)
+        if (regs && n == 1u) {
+            std::string r = "WREAD regs";
+            for (std::uint32_t k = 1; k < 32u; ++k) r += " r" + std::to_string(k) + "=" + hex32(psprecomp::runtime_watch_register(k));
+            log_line(category::kHle, r);
+        }
         return;
     }
     if (!is_write && (address & 0x1FFFFFFFu) == (kRaceProbe & 0x1FFFFFFFu)) { g_race_probe_frame = g_frames_presented; return; }
@@ -4251,6 +4643,29 @@ void write_report() {
 } // namespace perfrep
 
 std::uint64_t g_interp_pictures = 0;   // menu in-between pictures shown (window title fps)
+// The port's overlay (fps counter, short messages) over the GL picture, just before a swap.
+void draw_overlay_gl(int win_w, int win_h) {
+    if (!g_gl) return;
+    int gx = 0, gy = 0, gw = 0, gh = 0;
+    g_gl->game_area(win_w, win_h, gx, gy, gw, gh);
+    if (gw <= 0 || gh <= 0) return;
+    const float scale = std::max(1.0f, static_cast<float>(gh) / 272.0f);
+    struct Cache { std::uint64_t key{0}; std::vector<std::uint8_t> img; int w{0}, h{0}; float alpha{1.0f}; };
+    static Cache cache[2];
+    for (int panel = 0; panel < 2; ++panel) {
+        const std::uint64_t k = overlay::key(panel, scale);
+        if (k == 0u) { cache[panel].key = 0u; continue; }
+        Cache &c = cache[panel];
+        if (k != c.key || panel == overlay::kToast) {   // (the message fades out: rebuilt every frame while shown, it is small)
+            if (!overlay::build(panel, scale, c.img, c.w, c.h, c.alpha)) { c.key = 0u; continue; }
+            c.key = k;
+        }
+        int x = 0, y = 0;
+        overlay::place(panel, c.w, c.h, gw, gh, x, y);
+        g_gl->draw_overlay(c.img.data(), c.w, c.h, gx + x, gy + y, win_w, win_h, c.alpha);
+    }
+}
+
 void present_display_frame(Runtime &rt) {
     if (g_display.frame_top == 0u) return;
     ++g_frames_presented;
@@ -4282,6 +4697,52 @@ void present_display_frame(Runtime &rt) {
     // Which button pictures to show (controller kind used last, or the keyboard): fonts, controller screen, our pages.
     rr::pad::frame(present_pad_buttons(), present_gamepad_buttons(), present_pad_stick_active(), static_cast<rr::pad::Family>(present_pad_family()));
     lobby_frame();   // (server browser / room setup page, when open; every frame, also without a window: tests)
+    recomp::frame(rt);   // (RECOMP OPTIONS page, when open)
+    {   // hosting: players are waiting for a place or for the race to end (counted by the room service) - tell the host, on the
+        // results screen and in the menus, not while racing (every 30 s while they wait, and at once when another one arrives)
+        static int last_n = 0;
+        static std::uint64_t last_toast = 0;
+        const net::Node *node = net::shared_node();
+        const int n = node != nullptr ? node->browse().host_waiting : 0;
+        const bool racing = g_opp_state <= 2u && gates::scene_frame != 0u && g_frames_presented - gates::scene_frame < 30u;
+        if (n > 0 && !racing && (n > last_n || g_frames_presented - last_toast > 30u * 60u)) {
+            overlay::toast(std::to_string(n) + (n == 1 ? " player is" : " players are") + " waiting to join: choose SELECT after the race to let them in.", 6.0);
+            last_toast = g_frames_presented;
+            log_line("NET", "host: " + std::to_string(n) + " waiting to join");
+        }
+        if (n > last_n || n == 0) last_n = n;
+    }
+    {   // volume changes (F8 / F9 / F10, or the page) show a short message
+        static float last_vol = -1.0f;
+        static bool last_mute = false;
+        const float v = audio_master_volume();
+        const bool m = audio_muted();
+        if (last_vol >= 0.0f && (std::fabs(v - last_vol) > 0.001f || m != last_mute))
+            overlay::toast(m ? std::string("Sound muted") : "Volume " + std::to_string(static_cast<int>(v * 100.0f + 0.5f)) + "%", 1.5);
+        last_vol = v; last_mute = m;
+    }
+    {   // RR_MEMDUMP="frame,frame,...:path" (research): main RAM 0x08800000-0x0A000000 to path_<frame>.bin at those frames
+        static const char *md = std::getenv("RR_MEMDUMP");
+        if (md != nullptr) {
+            const std::string spec(md);
+            const auto colon = spec.find(':');
+            if (colon != std::string::npos) {
+                std::size_t pos = 0;
+                while (pos < colon) {
+                    const unsigned long long f = std::strtoull(spec.c_str() + pos, nullptr, 10);
+                    if (f == g_frames_presented) {
+                        std::vector<std::uint8_t> buf(0x01800000u);
+                        for (std::uint32_t i = 0; i < buf.size(); ++i) buf[i] = rt.memory().load8(0x08800000u + i);
+                        const std::string out = spec.substr(colon + 1) + "_" + std::to_string(f) + ".bin";
+                        if (FILE *fp = std::fopen(out.c_str(), "wb")) { std::fwrite(buf.data(), 1, buf.size(), fp); std::fclose(fp); }
+                        log_line(category::kHle, "MEMDUMP " + out);
+                    }
+                    const auto comma = spec.find(',', pos);
+                    pos = comma == std::string::npos || comma > colon ? colon : comma + 1;
+                }
+            }
+        }
+    }
     {   // RR_TEST_STALL="frame,ms" (netplay tests): this copy freezes for ms at that frame, like a slow PC loading a course
         static const std::pair<unsigned long long, int> stall = [] { unsigned long long f = 0; int ms = 0; if (const char *e = std::getenv("RR_TEST_STALL")) std::sscanf(e, "%llu,%d", &f, &ms); return std::pair<unsigned long long, int>{f, ms}; }();
         if (stall.second > 0 && g_frames_presented == stall.first) { log_line(category::kHle, "TEST stall " + std::to_string(stall.second) + " ms"); std::this_thread::sleep_for(std::chrono::milliseconds(stall.second)); }
@@ -5145,13 +5606,36 @@ void present_display_frame(Runtime &rt) {
                     }
                 }
             }
-            // Live fps readout in the window title, refreshed twice a second.
+            // Frame rate and frame times, twice a second: the port's overlay (Recomp Options > Display > Performance overlay).
+            // The window title only names the game (RR_TITLE_STATS=1 puts the old developer readout back in it).
             static auto fps_t0 = std::chrono::steady_clock::now();
+            static auto ft_last = fps_t0;
+            static double ft_sum = 0.0, ft_max = 0.0;
             static std::uint64_t fps_frames = 0, fps_extra0 = 0;
             ++fps_frames;
             const auto now = std::chrono::steady_clock::now();
+            { const double d = std::chrono::duration<double, std::milli>(now - ft_last).count(); ft_last = now; ft_sum += d; ft_max = std::max(ft_max, d); }
             const double secs = std::chrono::duration<double>(now - fps_t0).count();
             if (secs >= 0.5) {
+                {
+                    const double pictures = static_cast<double>(fps_frames + (g_interp_pictures - fps_extra0));
+                    std::vector<std::string> details;
+                    char d[160];
+                    if (g_gl) std::snprintf(d, sizeof d, "OpenGL %dx  (%dx%d)", g_gl->scale(), 480 * g_gl->scale(), 272 * g_gl->scale());
+                    else std::snprintf(d, sizeof d, "Software renderer  (480x272)");
+                    details.emplace_back(d);
+                    if (g_gl) {
+                        static const char *const kAa[] = {"off", "FXAA", "TAA", "SSAA"};
+                        const int am = std::clamp(g_aa_mode.load(), 0, 3);
+                        if (g_msaa_samples.load() > 1) std::snprintf(d, sizeof d, "AA MSAA %dx%s%s   AF %dx", g_msaa_samples.load(), am != 0 ? " + " : "", am != 0 ? kAa[am] : "", g_aniso.load());
+                        else std::snprintf(d, sizeof d, "AA %s   AF %dx", kAa[am], g_aniso.load());
+                        details.emplace_back(d);
+                    }
+                    if (g_interp_pictures != fps_extra0) details.emplace_back("menu pictures smoothed");
+                    if (g_hle_options.frame_skip != 1) details.emplace_back(g_hle_options.frame_skip == 0 ? "frame skip: automatic" : "frame skip: every " + std::to_string(g_hle_options.frame_skip));
+                    overlay::set_stats(pictures / secs, fps_frames > 0 ? ft_sum / static_cast<double>(fps_frames) : 0.0, ft_max, details);
+                    ft_sum = 0.0; ft_max = 0.0;
+                }
                 char title[360];
                 // Pictures shown per second: game frames plus the menu in-between pictures (the game itself stays at 59.94 Hz there).
                 const std::uint64_t extra = g_interp_pictures - fps_extra0;
@@ -5194,7 +5678,9 @@ void present_display_frame(Runtime &rt) {
                         goto title_done;
                     }
                 }
-                present_set_title(title);
+                static const bool title_stats = std::getenv("RR_TITLE_STATS") != nullptr;
+                if (title_stats) present_set_title(title);
+                else { static bool named = false; if (!named) { named = true; present_set_title("Ridge Racer"); } }
                 fps_t0 = now; fps_frames = 0;
                 title_done:;
             }
@@ -5239,7 +5725,7 @@ void present_display_frame(Runtime &rt) {
                             write_png((std::filesystem::path(ishots) / nm).string().c_str(), px.data(), 480u, 272u);
                         }
                     }
-                    present_gl_swap();
+                    draw_overlay_gl(win_w, win_h); present_gl_swap();
                     ++g_interp_pictures;
                 }
                 {   // a summary every ~10 s of menus
@@ -5256,9 +5742,10 @@ void present_display_frame(Runtime &rt) {
                 }
             }
             if (!shown && !(gpu_direct && g_gl->present_target(g_display.frame_top, win_w, win_h))) g_gl->present_rgba(rgba.data(), 480, 272, win_w, win_h);
-            present_gl_swap();
+            draw_overlay_gl(win_w, win_h); present_gl_swap();
         } else {
             if (osk_active()) ui_page_render(rgba.data(), 480, 272);
+            overlay::blend_into(rgba.data());
             present_frame(rgba.data(), 480, 272);
         }
         perfrep::end_tail();
@@ -7929,6 +8416,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         present_pump();
         present_note_pad_read();
         std::uint32_t buttons = osk_active() ? 0u : effective_pad_buttons();
+        buttons = recomp::filter(rt, buttons);
         if (gates::fast_rate_active() && !gates::table.empty()) {
             // Hand button changes over on 60 Hz tick steps only (see gates::pad_step).
             static std::uint32_t held = 0u;
@@ -8684,6 +9172,10 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 !rt.memory().contains(source, size == 0u ? 1u : size)) {
                 ctx.set_gpr(2, 0x80000102u);
                 return;
+            }
+            if (std::getenv("RR_DMAC_LOG") != nullptr && (((source & 0x1FFFFFFFu) >> 24u) == 4u || ((destination & 0x1FFFFFFFu) >> 24u) == 4u)) {
+                static int n = 0;
+                if (n < 4000) { ++n; log_line(category::kHle, "DMAC f=" + std::to_string(g_frames_presented) + " src=" + hex32(source) + " dst=" + hex32(destination) + " size=" + std::to_string(size) + " ra=" + hex32(ctx.gpr[31])); }
             }
             if (size != 0u) {
                 std::vector<std::uint8_t> data(size);

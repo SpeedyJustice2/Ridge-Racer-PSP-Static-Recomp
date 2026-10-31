@@ -306,6 +306,17 @@ void GeProcessor::load_clut(std::uint32_t data) {
         if (source >= 0x04000000u && source < 0x04200000u) backend_.vram_read_late_ok(source, bytes);
         else backend_.vram_read(source, bytes);
         memory_.copy_out(source, std::span<std::uint8_t>(clut_.data(), bytes));
+        {   // RR_CLUTSRC_LOG=hexword: log palette loads whose first entry is that value (source address + first 32 entries)
+            static const std::uint32_t want = [] { const char *e = std::getenv("RR_CLUTSRC_LOG"); return e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 16)) : 0u; }();
+            static int n = 0;
+            std::uint32_t w0 = 0; std::memcpy(&w0, clut_.data(), 4);
+            if (want != 0u && w0 == want && n < 400) {
+                ++n;
+                std::string l = "CLUTSRC frame=" + std::to_string(frame_) + " src=" + [&] { char t[16]; std::snprintf(t, sizeof t, "%08X", source); return std::string(t); }() + " bytes=" + std::to_string(bytes) + " :";
+                for (std::uint32_t i = 0; i < 32u && i * 4u < bytes; ++i) { std::uint32_t c; std::memcpy(&c, clut_.data() + i * 4u, 4); char t[12]; std::snprintf(t, sizeof t, " %08X", c); l += t; }
+                log_line(category::kGe, l);
+            }
+        }
         // Diagnostic: log each distinct palette (by content hash) with its average colour.
         std::uint64_t hash = 1469598103934665603ull;
         for (std::uint32_t i = 0; i < bytes; ++i) hash = (hash ^ clut_[i]) * 1099511628211ull;
@@ -394,7 +405,10 @@ void GeProcessor::block_transfer() {
     backend_.set_read_reason("ge");
     if (std::getenv("RR_XFER_LOG") != nullptr) {   // every block transfer (limited): source, destination, size
         static int n = 0;
-        if (n < 3000) { ++n; char b[160]; std::snprintf(b, sizeof b, "XFER f=%llu src=%08X+%u,%u stride=%u dst=%08X+%u,%u stride=%u %ux%u bpp=%u", static_cast<unsigned long long>(frame_), src, sx, sy, src_stride, dst, dx, dy, dst_stride, w, h, bpp); log_line(category::kGe, b); }
+        static const char *trig = std::getenv("RR_GAUGE_DRAWS_TRIG");
+        static bool on = trig == nullptr; static std::uint64_t chk = ~0ull;
+        if (!on && chk != frame_) { chk = frame_; if (std::FILE *f = std::fopen(trig, "rb")) { on = true; std::fclose(f); } }
+        if (on && n < 3000) { ++n; char b[160]; std::snprintf(b, sizeof b, "XFER f=%llu src=%08X+%u,%u stride=%u dst=%08X+%u,%u stride=%u %ux%u bpp=%u", static_cast<unsigned long long>(frame_), src, sx, sy, src_stride, dst, dx, dy, dst_stride, w, h, bpp); log_line(category::kGe, b); }
     }
     for (std::uint32_t row = 0; row < h; ++row) {
         const std::uint32_t s = src + ((sy + row) * src_stride + sx) * bpp;
@@ -1264,6 +1278,26 @@ void GeProcessor::execute_prim(std::uint32_t data) {
         }
         if (want_full && kind == GpuPrim::Triangles && !full_.empty())
             backend_.record_full(draw, full_.data(), full_.size(), (cull_enable && !cull_disabled()) ? static_cast<int>(cull_mode) : -1);
+        {   // RR_FBLOG=lo,hi (hex): log draws whose frame buffer starts in [lo, hi) (after RR_GAUGE_DRAWS_TRIG exists, if set)
+            static std::uint32_t lo = 0u, hi = 0u; static bool init = false; static int n = 0;
+            if (!init) { init = true; if (const char *e = std::getenv("RR_FBLOG")) std::sscanf(e, "%x,%x", &lo, &hi); }
+            if (hi != 0u && draw.fb_addr >= lo && draw.fb_addr < hi && n < 400) {
+                static const char *trig = std::getenv("RR_GAUGE_DRAWS_TRIG");
+                static bool on = trig == nullptr; static std::uint64_t chk = ~0ull;
+                if (!on && chk != frame_) { chk = frame_; if (std::FILE *f = std::fopen(trig, "rb")) { on = true; std::fclose(f); } }
+                if (on) {
+                    ++n;
+                    char b[400];
+                    std::snprintf(b, sizeof b, "FBDRAW f=%llu fb=%08X stride=%u fmt=%u thru=%d clear=%d kind=%d n=%zu tex=%d addr=%08X fmt=%u blend=%d atest=%d scis=%d,%d-%d,%d v0=%.1f,%.1f c=%.0f,%.0f,%.0f,%.0f v1=%.1f,%.1f",
+                                  static_cast<unsigned long long>(frame_), draw.fb_addr, draw.fb_stride, draw.fb_format, draw.through ? 1 : 0, draw.clear_mode ? 1 : 0, static_cast<int>(kind), scratch_.size(),
+                                  draw.tex_enable ? 1 : 0, draw.tex_addr, draw.tex_format, draw.blend ? 1 : 0, draw.alpha_test ? 1 : 0, draw.scissor_x0, draw.scissor_y0, draw.scissor_x1, draw.scissor_y1,
+                                  scratch_.empty() ? 0.0 : (double)scratch_[0].x, scratch_.empty() ? 0.0 : (double)scratch_[0].y,
+                                  scratch_.empty() ? 0.0 : (double)scratch_[0].r, scratch_.empty() ? 0.0 : (double)scratch_[0].g, scratch_.empty() ? 0.0 : (double)scratch_[0].b, scratch_.empty() ? 0.0 : (double)scratch_[0].a,
+                                  scratch_.size() < 2 ? 0.0 : (double)scratch_[1].x, scratch_.size() < 2 ? 0.0 : (double)scratch_[1].y);
+                    log_line(category::kGe, b);
+                }
+            }
+        }
         backend_.draw(draw, kind, scratch_.data(), scratch_.size());
         if (timed) {
             // RR_DRAW_TIME=ms: log every draw call whose CPU time (including any batch flush it triggers) exceeds ms.

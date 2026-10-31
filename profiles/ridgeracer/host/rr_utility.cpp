@@ -6,6 +6,7 @@
 #include "rr_menusound.hpp"
 #include "rr_osk_ui.hpp"
 #include "rr_lobby_ui.hpp"
+#include "rr_options_ui.hpp"
 #include "rr_present.hpp"
 
 #include <algorithm>
@@ -206,5 +207,5 @@ void install_utility_hle(Runtime &runtime) {
 
 namespace rr {
 void utility_set_interactive(bool on) { g_interactive = on; }
-bool osk_active() { return osk_ui_active() || lobby_ui_active(); }   // (any full-screen page of the port: game input paused, Esc is "back")
+bool osk_active() { return osk_ui_active() || lobby_ui_active() || options_ui_active(); }   // (any full-screen page of the port: game input paused, Esc is "back")
 }

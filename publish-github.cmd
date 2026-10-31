@@ -11,7 +11,7 @@ if "%SRC:~-1%"=="\" set "SRC=%SRC:~0,-1%"
 set "PUB=%TEMP%\rr-publish"
 set "GIT=%TEMP%\rr-publish-git"
 where git >nul 2>&1 || (echo Git is not installed. Get it from https://git-scm.com/download/win & pause & exit /b 1)
-set "URL=https://github.com/ngrshow/Ridge-Racer-PSP-Static-Recomp.git"
+set "URL=https://github.com/SpeedyJustice2/Ridge-Racer-PSP-Static-Recomp.git"
 if not "%~1"=="" set "URL=%~1"
 echo Target repository: %URL%
 if exist "%PUB%" rmdir /s /q "%PUB%"
@@ -35,8 +35,8 @@ set "GNAME="
 set "GMAIL="
 for /f "delims=" %%A in ('git config --global user.name 2^>nul') do set "GNAME=%%A"
 for /f "delims=" %%A in ('git config --global user.email 2^>nul') do set "GMAIL=%%A"
-if "%GNAME%"=="" set "GNAME=ngrshow"
-if "%GMAIL%"=="" set "GMAIL=ngrshow@users.noreply.github.com"
+if "%GNAME%"=="" set "GNAME=SpeedyJustice2"
+if "%GMAIL%"=="" set "GMAIL=SpeedyJustice2@users.noreply.github.com"
 
 rem Does the repository already have commits?
 set "HASREMOTE="

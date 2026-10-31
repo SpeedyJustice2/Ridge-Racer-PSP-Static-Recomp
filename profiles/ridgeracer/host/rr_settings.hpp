@@ -14,7 +14,7 @@ namespace rr {
 
 struct PlayerSettings {
     std::string game_path;        // the decrypted BOOT.BIN (or a folder that holds PSP_GAME)
-    bool show_launcher = true;    // open the settings window at start (holding Shift opens it anyway)
+    bool show_launcher = false;   // open the settings window at start (holding Shift opens it anyway); the settings are in game (Options > RECOMP OPTIONS)
     bool gpu = true;              // OpenGL renderer; false = the software renderer (original look, 480x272)
     int render_scale = 4;         // internal resolution, x 480x272 (1-8)
     int window_scale = 3;         // window size, x 480x272
@@ -34,12 +34,19 @@ struct PlayerSettings {
     int button_prompts = 0;       // button pictures: 0 automatic (the controller or keyboard used last), 1 Xbox, 2 PlayStation, 3 Nintendo Switch, 4 keyboard
     bool trigger_buttons = true;  // controller triggers: right = CROSS (accelerate), left = SQUARE (brake)
     bool perf_report = true;      // write performance-report.txt next to the game (frame times, CPU/GPU, power) for troubleshooting
+    int perf_overlay = 0;         // over the game picture: 0 off, 1 frame rate, 2 frame rate + frame times + renderer details
+    int draw_distance = 0;        // scenery drawn this many track cells further ahead and behind (0 = the game's own distance)
     bool online = true;           // Wireless Battle over the internet (talks to the room list service only when you open a room or a search)
     int room_visibility = 0;      // rooms you host: 0 anyone can join, 1 with a password, 2 only with the room code (set in game)
     std::string room_password;    // the password for room_visibility = 1
 };
 
 std::filesystem::path settings_file_path();   // ridgeracer.ini beside the executable
+// The settings the game is running with when it was started from its shortcut (no arguments: they came from ridgeracer.ini).
+// The in-game RECOMP OPTIONS page compares against them ("needs a restart") and restarts the game the same way.
+void set_running_settings(const PlayerSettings &s, bool from_shortcut);
+bool started_from_shortcut();
+bool running_settings(PlayerSettings &out);   // false when not set
 PlayerSettings load_settings(const std::filesystem::path &file);
 bool save_settings(const std::filesystem::path &file, const PlayerSettings &s);
 

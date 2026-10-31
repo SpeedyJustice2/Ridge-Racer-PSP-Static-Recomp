@@ -40,7 +40,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
-Set-Location $root
+Set-Location -LiteralPath $root
 $build = if ($WorkDir) { $WorkDir } else { Join-Path $root "build" }
 New-Item -ItemType Directory -Force $build | Out-Null
 
@@ -59,7 +59,7 @@ function Step($m, $key = "") {
 # ---- compiler
 Step "Looking for the compiler" "compiler"
 $zig = Join-Path $root "toolchain\zig\zig.exe"
-if (-not (Test-Path $zig)) {
+if (-not (Test-Path -LiteralPath $zig)) {
   $cmd = Get-Command zig -ErrorAction SilentlyContinue
   if ($cmd) { $zig = $cmd.Source } else { Fail "Compiler not found. Expected toolchain\zig\zig.exe (it is part of the release package)." }
 }
@@ -70,10 +70,10 @@ if ($Jobs -le 0) { $Jobs = [Environment]::ProcessorCount }
 # The compiler builds its own C++ runtime libraries the first time it is used (minutes on a slow PC).  The release package
 # carries a cache with those already built; start from a copy of it.  If anything about it is off the compiler simply rebuilds.
 $warmCache = Join-Path $root "toolchain\zig-cache-warm"
-if ((Test-Path $warmCache) -and -not $PrepareRelease -and -not (Test-Path $env:ZIG_GLOBAL_CACHE_DIR)) {
+if ((Test-Path -LiteralPath $warmCache) -and -not $PrepareRelease -and -not (Test-Path -LiteralPath $env:ZIG_GLOBAL_CACHE_DIR)) {
   Write-Host "Copying the prepared compiler cache..."
   try { Copy-Item -LiteralPath $warmCache -Destination $env:ZIG_GLOBAL_CACHE_DIR -Recurse -Force }
-  catch { Write-Host "(could not copy it; the compiler will build its libraries itself)"; Remove-Item $env:ZIG_GLOBAL_CACHE_DIR -Recurse -Force -ErrorAction SilentlyContinue }
+  catch { Write-Host "(could not copy it; the compiler will build its libraries itself)"; Remove-Item -LiteralPath $env:ZIG_GLOBAL_CACHE_DIR -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 # ---- helpers
@@ -81,7 +81,7 @@ function Quote($a) { if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"
 # Runs the compiler for every item that is out of date, $Jobs at a time.  Item = @{src=..; obj=..; args=@(..)}
 # With -Soft the sources that failed are returned (instead of stopping the build).
 function Invoke-Compiles($items, $label, [switch]$Soft) {
-  $todo = @($items | Where-Object { $Rebuild -or -not (Test-Path $_.obj) -or ((Get-Item $_.obj).LastWriteTime -lt (Get-Item $_.src).LastWriteTime) })
+  $todo = @($items | Where-Object { $Rebuild -or -not (Test-Path -LiteralPath $_.obj) -or ((Get-Item -LiteralPath $_.obj).LastWriteTime -lt (Get-Item -LiteralPath $_.src).LastWriteTime) })
   Write-Host ("{0}: {1} to compile, {2} up to date" -f $label, $todo.Count, ($items.Count - $todo.Count))
   $running = New-Object System.Collections.ArrayList
   $done = 0; $failed = @()
@@ -124,10 +124,18 @@ $prof = Join-Path $root "profiles\ridgeracer"
 $hostDir = Join-Path $prof "host"
 $a3p = Join-Path $prof "third_party\atrac3plus"
 $cFlags = @("cc", "-target", "x86_64-windows-gnu", "-std=c11", "-O2", "-g0", "-DNDEBUG", "-mavx", "-fno-strict-aliasing", "-fwrapv", "-ffp-contract=off", "-Wno-everything")
-$libNames = "user32","gdi32","d3d11","dxgi","d3dcompiler_47","opengl32","mfplat","mfuuid","mf","mfreadwrite","ole32","winmm","comctl32","shell32","uuid","comdlg32","advapi32","shlwapi","ws2_32","winhttp","bcrypt"
+$libNames = "user32","gdi32","d3d11","dxgi","d3dcompiler_47","opengl32","mfplat","mfuuid","mf","mfreadwrite","ole32","winmm","comctl32","shell32","uuid","comdlg32","advapi32","shlwapi","ws2_32","winhttp"
 $hostNames = "main","rr_hle","rr_log","rr_ge","rr_raster","rr_gl","rr_png","rr_atrac","rr_mpeg","rr_pmf","rr_audio","rr_atrac_decoder",
-             "rr_video_win32","rr_osk_ui","rr_lobby_ui","rr_pad","rr_glyph_patch","rr_report","rr_update","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_launcher_win32","rr_present_win32","rr_gen_loader"
+             "rr_video_win32","rr_osk_ui","rr_lobby_ui","rr_options_ui","rr_overlay","rr_pad","rr_glyph_patch","rr_report","rr_updater_client","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_launcher_win32","rr_present_win32","rr_gen_loader"
 $atracNames = "atrac","atrac3plus","atrac3plusdsp","atrac3plusdec","rr_compat"
+
+# The updater (RidgeRacerUpdater.exe): compiled from three source files, a few seconds.  Antivirus heuristics stopped an unsigned
+# game that went to GitHub itself, so checking, downloading and installing updates live in this separate program.
+function Build-Updater([string]$dest) {
+  $src = @("rr_updater_main.cpp", "rr_update.cpp", "rr_http.cpp") | ForEach-Object { Join-Path $hostDir $_ }
+  & $zig @(@("c++", "-target", "x86_64-windows-gnu", "-std=c++20", "-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-I", $hostDir, "-I", (Join-Path $root "include")) + $src + @("-lwinhttp", "-lbcrypt", "-lshell32", "-o", $dest))
+  if ($LASTEXITCODE) { Fail "Building the updater failed." }
+}
 
 # ---- the parts that do not depend on the game: compiler runtime library, code generator, the game's host code
 $coreObjDir = Join-Path $build "obj-core"
@@ -135,17 +143,17 @@ $toolObjDir = Join-Path $build "obj-tools"
 $hostObjDir = Join-Path $build "obj-host"
 $atracObjDir = Join-Path $build "obj-atrac"
 $genExe = Join-Path $build "psp_recomp.exe"
-$core = Get-ChildItem (Join-Path $root "src") -Filter *.cpp
+$core = Get-ChildItem -LiteralPath (Join-Path $root "src") -Filter *.cpp
 $coreObj = @(New-ItemList $core $coreObjDir ($cxx + $inc))
-$toolObj = @(New-ItemList @(Get-Item (Join-Path $root "tools\codegen_main.cpp")) $toolObjDir ($cxx + $inc + @("-I", (Join-Path $root "tools"))))
+$toolObj = @(New-ItemList @(Get-Item -LiteralPath (Join-Path $root "tools\codegen_main.cpp")) $toolObjDir ($cxx + $inc + @("-I", (Join-Path $root "tools"))))
 # -I of the generated folder comes last; it does not exist yet (and the host files do not need it) while preparing a release
 $gen = Join-Path $build "generated"
 $gameArgs = $cxx + $inc + @("-I", $hostDir, "-I", $a3p, "-I", $gen)
-$hostFiles = $hostNames | ForEach-Object { Get-Item (Join-Path $hostDir ($_ + ".cpp")) }
+$hostFiles = $hostNames | ForEach-Object { Get-Item -LiteralPath (Join-Path $hostDir ($_ + ".cpp")) }
 # The program is built apart from the converted game code (RidgeRacerGame.dll): see profiles\ridgeracer\gen\rr_gen_abi.hpp.
 $hostArgs = $gameArgs + @("-DRR_GAME_LIBRARY=1")
 $hostObj = @(New-ItemList $hostFiles $hostObjDir $hostArgs)
-$cfiles = $atracNames | ForEach-Object { Get-Item (Join-Path $a3p ($_ + ".c")) }
+$cfiles = $atracNames | ForEach-Object { Get-Item -LiteralPath (Join-Path $a3p ($_ + ".c")) }
 $cArgs = $cFlags + @("-I", (Join-Path $a3p "compat"), "-I", $a3p)
 $atracObj = @(New-ItemList $cfiles $atracObjDir $cArgs)
 
@@ -155,8 +163,8 @@ function Get-TreeHash {
   $rels = New-Object System.Collections.Generic.List[string]
   foreach ($d in @("include", "src", "tools", "profiles\ridgeracer\host", "profiles\ridgeracer\gen", "profiles\ridgeracer\third_party\atrac3plus")) {
     $p = Join-Path $root $d
-    if (-not (Test-Path $p)) { continue }
-    foreach ($f in (Get-ChildItem $p -Recurse -File)) {
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    foreach ($f in (Get-ChildItem -LiteralPath $p -Recurse -File)) {
       $e = $f.Extension.ToLowerInvariant()
       if ($e -eq ".cpp" -or $e -eq ".hpp" -or $e -eq ".h" -or $e -eq ".c" -or $e -eq ".inc" -or $e -eq ".def") { $rels.Add($f.FullName.Substring($root.Length).Replace("/", "\")) }
     }
@@ -176,7 +184,7 @@ function Build-Generator {
   Invoke-Compiles $coreObj "core library"
   Invoke-Compiles $toolObj "code generator"
   $linkGen = @("c++", "-target", "x86_64-windows-gnu") + (($coreObj + $toolObj) | ForEach-Object { $_.obj }) + @("-o", $genExe)
-  if ($Rebuild -or -not (Test-Path $genExe)) { & $zig @linkGen; if ($LASTEXITCODE) { Fail "Linking the code generator failed." } }
+  if ($Rebuild -or -not (Test-Path -LiteralPath $genExe)) { & $zig @linkGen; if ($LASTEXITCODE) { Fail "Linking the code generator failed." } }
 }
 
 # ---- release preparation (run by make-release.cmd): everything that does not need the game, plus a warm compiler cache
@@ -184,7 +192,7 @@ if ($PrepareRelease) {
   Step "Preparing a release: building the parts that do not depend on the game" "compile"
   $outRoot = $PrepareRelease
   $pre = Join-Path $outRoot "prebuilt"
-  if (Test-Path $pre) { Remove-Item $pre -Recurse -Force }
+  if (Test-Path -LiteralPath $pre) { Remove-Item -LiteralPath $pre -Recurse -Force }
   New-Item -ItemType Directory -Force $pre | Out-Null
   Build-Generator
   Invoke-Compiles $hostObj "host code"
@@ -196,21 +204,22 @@ if ($PrepareRelease) {
   # The program itself (everything except the converted game code, which becomes RidgeRacerGame.dll on the player's PC).  It is
   # shipped inside Setup.exe and, with SDL2.dll, as the small update package.
   $resP = Join-Path $build "rr.res"
-  Push-Location $hostDir; & $zig rc "rr.rc" $resP; $rcP = $LASTEXITCODE; Pop-Location
+  Push-Location -LiteralPath $hostDir; & $zig rc "rr.rc" $resP; $rcP = $LASTEXITCODE; Pop-Location
   if ($rcP) { Fail "Building resources failed." }
   $relP = { param($p) $p.Substring($build.Length + 1) }
   $objsP = @(($hostObj + $atracObj + $coreObj) | ForEach-Object { & $relP $_.obj })
   $libsP = $libNames | ForEach-Object { "-l$_" }
-  Push-Location $build
+  Push-Location -LiteralPath $build
   & $zig @(@("c++", "-target", "x86_64-windows-gnu", "-O2") + $objsP + @("rr.res") + $libsP + @("-Wl,--stack,67108864", "-o", (Join-Path $pre "RidgeRacerNative.exe")))
   $lcP = $LASTEXITCODE
   Pop-Location
   if ($lcP) { Fail "Linking the program failed." }
+  Build-Updater (Join-Path $pre "RidgeRacerUpdater.exe")
   Set-Content -LiteralPath (Join-Path $pre "manifest.txt") (Get-TreeHash) -Encoding ASCII
   # Warm cache: use the compiler the way the installer will (same target and CPU flags, same libraries), on tiny programs.
   Step "Preparing the compiler cache" "compile"
   $warm = Join-Path $outRoot "toolchain\zig-cache-warm"
-  if (Test-Path $warm) { Remove-Item $warm -Recurse -Force }
+  if (Test-Path -LiteralPath $warm) { Remove-Item -LiteralPath $warm -Recurse -Force }
   New-Item -ItemType Directory -Force (Split-Path $warm) | Out-Null
   $env:ZIG_GLOBAL_CACHE_DIR = $warm
   $env:ZIG_LOCAL_CACHE_DIR = Join-Path $build "zig-cache-local-warm"
@@ -243,30 +252,30 @@ if ($PrepareRelease) {
 Step "Finding your game" "game"
 if (-not $Game) {
   $saved = Join-Path $build "game_path.txt"
-  if (Test-Path $saved) { $Game = (Get-Content $saved -Raw).Trim() }
+  if (Test-Path -LiteralPath $saved) { $Game = (Get-Content -LiteralPath $saved -Raw).Trim() }
 }
 function Resolve-Boot($p) {
   if (-not $p) { return $null }
-  if (Test-Path $p -PathType Leaf) { return (Resolve-Path $p).Path }
+  if (Test-Path -LiteralPath $p -PathType Leaf) { return (Resolve-Path -LiteralPath $p).Path }
   foreach ($rel in @("PSP_GAME\SYSDIR\BOOT.BIN", "SYSDIR\BOOT.BIN", "BOOT.BIN")) {
     $c = Join-Path $p $rel
-    if (Test-Path $c -PathType Leaf) { return (Resolve-Path $c).Path }
+    if (Test-Path -LiteralPath $c -PathType Leaf) { return (Resolve-Path -LiteralPath $c).Path }
   }
   return $null
 }
 # A disc image (.iso): take BOOT.BIN out of it with a small helper built by the bundled compiler (a few seconds).
 function Get-BootFromIso($iso) {
   $toolExe = Join-Path $build "rr_iso_tool.exe"
-  if (-not (Test-Path $toolExe)) {
+  if (-not (Test-Path -LiteralPath $toolExe)) {
     Write-Host "Building the disc image helper..."
     & $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -g0 -mavx -Wno-everything -I $hostDir (Join-Path $root "tools\rr_iso_tool.cpp") (Join-Path $hostDir "rr_iso.cpp") -o $toolExe
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $toolExe)) { Fail "Could not build the disc image helper." }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $toolExe)) { Fail "Could not build the disc image helper." }
   }
   $dest = Join-Path $build "iso_boot\BOOT.BIN"
   New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
-  Remove-Item $dest -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $dest -ErrorAction SilentlyContinue
   $out = & $toolExe $iso --file "PSP_GAME/SYSDIR/BOOT.BIN" $dest 2>&1
-  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dest)) { Fail ("Could not read BOOT.BIN from the disc image: " + ($out -join " ")) }
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $dest)) { Fail ("Could not read BOOT.BIN from the disc image: " + ($out -join " ")) }
   return $dest
 }
 $picked = $null
@@ -295,24 +304,24 @@ if ($head[0] -eq 0x7E -and $head[1] -eq 0x50 -and $head[2] -eq 0x53 -and $head[3
   Fail "That BOOT.BIN (or the disc image) is still encrypted ('~PSP'). The build needs a decrypted copy of your own game's executable (an ELF file starting with 'ELF')."
 }
 if (-not ($head[0] -eq 0x7F -and $head[1] -eq 0x45 -and $head[2] -eq 0x4C -and $head[3] -eq 0x46)) { Fail "That file is not an ELF executable. Expected a decrypted BOOT.BIN." }
-$hash = (Get-FileHash $bin -Algorithm SHA256).Hash
-Set-Content (Join-Path $build "game_path.txt") $picked
+$hash = (Get-FileHash -LiteralPath $bin -Algorithm SHA256).Hash
+Set-Content -LiteralPath (Join-Path $build "game_path.txt") $picked
 Write-Host "BOOT.BIN ok: $bin"
 
 # ---- code generator (ready-made when the release package carries it and it matches this source exactly)
 Step "Building the code generator" "codegen"
 $usedPrebuilt = $false
 $preDir = Join-Path $root "prebuilt"
-if (-not $NoPrebuilt -and -not $Rebuild -and (Test-Path (Join-Path $preDir "manifest.txt")) -and (Test-Path (Join-Path $preDir "psp_recomp.exe"))) {
+if (-not $NoPrebuilt -and -not $Rebuild -and (Test-Path -LiteralPath (Join-Path $preDir "manifest.txt")) -and (Test-Path -LiteralPath (Join-Path $preDir "psp_recomp.exe"))) {
   try {
-    $want = (Get-Content (Join-Path $preDir "manifest.txt") -Raw).Trim()
+    $want = (Get-Content -LiteralPath (Join-Path $preDir "manifest.txt") -Raw).Trim()
     $have = Get-TreeHash
     if ($want -eq $have) {
       Write-Host "Using the ready-made tools and game-independent code from the package."
       $now = Get-Date
       foreach ($pair in @(@("obj-core", $coreObjDir), @("obj-tools", $toolObjDir), @("obj-host", $hostObjDir), @("obj-atrac", $atracObjDir))) {
         New-Item -ItemType Directory -Force $pair[1] | Out-Null
-        foreach ($f in (Get-ChildItem (Join-Path $preDir $pair[0]) -Filter *.o)) {
+        foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $preDir $pair[0]) -Filter *.o)) {
           $dest = Join-Path $pair[1] $f.Name
           Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
           (Get-Item -LiteralPath $dest).LastWriteTime = $now.AddSeconds(2)   # newer than its source: counts as up to date
@@ -328,16 +337,16 @@ Build-Generator
 # ---- generate
 Step "Generating code from your game" "generate"
 $stamp = Join-Path $gen ".source-sha256"
-$have = (Test-Path (Join-Path $gen "generated_registry.cpp")) -and (Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq $hash)
+$have = (Test-Path -LiteralPath (Join-Path $gen "generated_registry.cpp")) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $hash)
 if ($have) { Write-Host "Already generated for this BOOT.BIN." }
 else {
-  if (Test-Path $gen) { Remove-Item $gen -Recurse -Force }
-  Remove-Item (Join-Path $build "obj-gen") -Recurse -Force -ErrorAction SilentlyContinue
-  Remove-Item (Join-Path $build "obj-unity") -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $gen) { Remove-Item -LiteralPath $gen -Recurse -Force }
+  Remove-Item -LiteralPath (Join-Path $build "obj-gen") -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $build "obj-unity") -Recurse -Force -ErrorAction SilentlyContinue
   & $genExe $bin --auto $gen --jobs 0 --builtin-accessors --function-gates 0x08804000 4096 | Out-Host
   if ($LASTEXITCODE) { Fail "Code generation failed." }
-  if (-not (Test-Path (Join-Path $gen "generated_registry.cpp"))) { Fail "Generation finished but generated_registry.cpp is missing." }
-  Set-Content $stamp $hash
+  if (-not (Test-Path -LiteralPath (Join-Path $gen "generated_registry.cpp"))) { Fail "Generation finished but generated_registry.cpp is missing." }
+  Set-Content -LiteralPath $stamp $hash
 }
 
 if ($GenerateOnly) { Write-Host "Generated: $gen"; exit 0 }
@@ -349,14 +358,14 @@ $objs += $hostObj
 $objs += $atracObj
 # The generated files are compiled several at a time as one unit ("batches"): every compiler start otherwise re-reads the same
 # large headers, which was a third of the time.  If a batch ever fails, its files are compiled one by one instead.
-$genFiles = @(Get-ChildItem $gen -Filter *.cpp | Sort-Object Name)
+$genFiles = @(Get-ChildItem -LiteralPath $gen -Filter *.cpp | Sort-Object Name)
 $objGen = Join-Path $build "obj-gen"
 $unityDir = Join-Path $build "unity"
 $unityObjDir = Join-Path $build "obj-unity"
 $genItems = @()
 if ($NoUnity) {
   $genItems = @(New-ItemList $genFiles $objGen $gameArgs)
-  $genItems += @(New-ItemList @(Get-Item (Join-Path $prof "gen\rr_gen_shim.cpp")) $objGen $gameArgs)
+  $genItems += @(New-ItemList @(Get-Item -LiteralPath (Join-Path $prof "gen\rr_gen_shim.cpp")) $objGen $gameArgs)
   $objs += $genItems
   Invoke-Compiles ($hostObj + $atracObj + $genItems) "game"
 } else {
@@ -379,16 +388,16 @@ if ($NoUnity) {
     $name = "unity_{0:D3}" -f $bi; $bi++
     $wrapper = Join-Path $unityDir ($name + ".cpp")
     $text = (($b | ForEach-Object { '#include "' + $_.Name + '"' }) -join "`n") + "`n"
-    if (-not (Test-Path $wrapper) -or ((Get-Content $wrapper -Raw) -ne $text)) { [System.IO.File]::WriteAllText($wrapper, $text) }
+    if (-not (Test-Path -LiteralPath $wrapper) -or ((Get-Content -LiteralPath $wrapper -Raw) -ne $text)) { [System.IO.File]::WriteAllText($wrapper, $text) }
     # a batch is rebuilt when any of its files is newer than the batch object
     $newest = ($b | ForEach-Object { $_.LastWriteTime } | Measure-Object -Maximum).Maximum
     $objPath = Join-Path $unityObjDir ($name + ".o")
-    if ((Test-Path $objPath) -and ((Get-Item $objPath).LastWriteTime -lt $newest)) { Remove-Item $objPath -Force }
+    if ((Test-Path -LiteralPath $objPath) -and ((Get-Item -LiteralPath $objPath).LastWriteTime -lt $newest)) { Remove-Item -LiteralPath $objPath -Force }
     $batchItems += @{ src = $wrapper; obj = $objPath; args = $gameArgs }
     $batchMembers[$wrapper] = $b
   }
   $otherItems = @(New-ItemList $others $objGen $gameArgs)
-  $otherItems += @(New-ItemList @(Get-Item (Join-Path $prof "gen\rr_gen_shim.cpp")) $objGen $gameArgs)
+  $otherItems += @(New-ItemList @(Get-Item -LiteralPath (Join-Path $prof "gen\rr_gen_shim.cpp")) $objGen $gameArgs)
   # big files first so the long ones do not end up last
   $all = @($hostObj + $atracObj + $otherItems + $batchItems)
   $failedSrc = Invoke-Compiles $all "game" -Soft
@@ -398,7 +407,7 @@ if ($NoUnity) {
     foreach ($fs in $failedSrc) {
       if ($batchMembers.ContainsKey($fs)) {
         $name = [System.IO.Path]::GetFileNameWithoutExtension($fs)
-        Remove-Item (Join-Path $unityObjDir ($name + ".o")) -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $unityObjDir ($name + ".o")) -Force -ErrorAction SilentlyContinue
         $retry += @(New-ItemList $batchMembers[$fs] $objGen $gameArgs)
         $batchItems = @($batchItems | Where-Object { $_.src -ne $fs })
       } else { Fail ("{0} failed to compile." -f $fs) }
@@ -412,7 +421,7 @@ if ($NoUnity) {
 
 # ---- resources (visual styles for the settings window)
 $res = Join-Path $build "rr.res"
-if ($Rebuild -or -not (Test-Path $res)) { Push-Location $hostDir; & $zig rc "rr.rc" $res; $rc = $LASTEXITCODE; Pop-Location; if ($rc) { Fail "Building resources failed." } }
+if ($Rebuild -or -not (Test-Path -LiteralPath $res)) { Push-Location -LiteralPath $hostDir; & $zig rc "rr.rc" $res; $rc = $LASTEXITCODE; Pop-Location; if ($rc) { Fail "Building resources failed." } }
 
 # ---- link
 Step "Linking" "link"
@@ -425,7 +434,7 @@ $rel = { param($p) $p.Substring($build.Length + 1) }
 # 1) the program: this project's own code only (no converted game code)
 $progObjs = @(($hostObj + $atracObj) | ForEach-Object { & $rel $_.obj }) + @($coreObj | ForEach-Object { & $rel $_.obj })
 $linkGame = @("c++", "-target", "x86_64-windows-gnu", "-O2") + $progObjs + @("rr.res") + $libs + @("-Wl,--stack,67108864", "-o", $exe)
-Push-Location $build
+Push-Location -LiteralPath $build
 & $zig @linkGame
 $lc = $LASTEXITCODE
 Pop-Location
@@ -435,15 +444,18 @@ Step "Linking the game library" "link"
 $dll = Join-Path $out "RidgeRacerGame.dll"
 $libObjs = @($objs | Where-Object { $hostObj.obj -notcontains $_.obj -and $atracObj.obj -notcontains $_.obj } | ForEach-Object { & $rel $_.obj })
 $linkLib = @("c++", "-target", "x86_64-windows-gnu", "-O2", "-shared") + $libObjs + @("-o", $dll)
-Push-Location $build
+Push-Location -LiteralPath $build
 & $zig @linkLib
 $lc2 = $LASTEXITCODE
 Pop-Location
 if ($lc2) { Fail "Linking the game library failed." }
-Remove-Item (Join-Path $out "RidgeRacerGame.lib") -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $out "RidgeRacerGame.lib") -Force -ErrorAction SilentlyContinue
+# 3) the updater: a small program of its own, so the game itself never downloads or installs anything
+Step "Building the updater" "link"
+Build-Updater (Join-Path $out "RidgeRacerUpdater.exe")
 # Controller support for PlayStation / Switch / other pads (loaded at run time; without it only XInput pads work).
 $sdlDll = Join-Path $root "profiles\ridgeracer\third_party\sdl2\SDL2.dll"
-if (Test-Path $sdlDll) {
+if (Test-Path -LiteralPath $sdlDll) {
   try { Copy-Item -LiteralPath $sdlDll -Destination (Join-Path $out "SDL2.dll") -Force } catch { Write-Host "Note: could not copy SDL2.dll ($($_.Exception.Message)); only Xbox-style controllers will work." }
 }
 
@@ -452,7 +464,7 @@ Write-Host ("Total build time: {0:N0} s{1}" -f ((Get-Date) - $script:allStart).T
 Write-Host "`nDone: $exe" -ForegroundColor Green
 # First start: remember the game the player picked so the settings window opens with it filled in.
 $ini = Join-Path $out "ridgeracer.ini"
-if (-not (Test-Path $ini)) { Set-Content $ini ("game_path=" + $picked) }
-if ($CleanBuild) { try { Remove-Item $build -Recurse -Force -ErrorAction Stop } catch { Write-Host "Note: could not delete the work folder $build ($($_.Exception.Message))" } }
+if (-not (Test-Path -LiteralPath $ini)) { Set-Content -LiteralPath $ini ("game_path=" + $picked) }
+if ($CleanBuild) { try { Remove-Item -LiteralPath $build -Recurse -Force -ErrorAction Stop } catch { Write-Host "Note: could not delete the work folder $build ($($_.Exception.Message))" } }
 if ($Progress) { Write-Host "@@DONE $exe" }
-if (-not $NoLaunch) { Start-Process $exe -WorkingDirectory $out }
+if (-not $NoLaunch) { $psi = New-Object System.Diagnostics.ProcessStartInfo $exe; $psi.WorkingDirectory = $out; $psi.UseShellExecute = $true; [System.Diagnostics.Process]::Start($psi) | Out-Null }   # (Start-Process reads [ ] in a path as a wildcard)

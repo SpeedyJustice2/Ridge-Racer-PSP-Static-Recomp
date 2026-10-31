@@ -106,10 +106,12 @@ add_executable(RidgeRacerNative
     host/rr_http.cpp
     host/rr_relay.cpp
     host/rr_lobby_ui.cpp
+    host/rr_options_ui.cpp
+    host/rr_overlay.cpp
     host/rr_pad.cpp
     host/rr_glyph_patch.cpp
     host/rr_report.cpp
-    host/rr_update.cpp
+    host/rr_updater_client.cpp
     host/rr_gen_loader.cpp
     host/rr_sysinfo.cpp
     ${RR_LAUNCHER_SOURCE}
@@ -164,7 +166,11 @@ if(NOT WIN32 AND RR_HAVE_SDL2)
     target_link_libraries(RidgeRacerNative PRIVATE ${CMAKE_DL_LIBS})
 endif()
 if(WIN32)
-    target_link_libraries(RidgeRacerNative PRIVATE user32 gdi32 d3d11 dxgi d3dcompiler opengl32 mfplat mfuuid ole32 winmm comctl32 shell32 uuid ws2_32 winhttp bcrypt)
+    target_link_libraries(RidgeRacerNative PRIVATE user32 gdi32 d3d11 dxgi d3dcompiler opengl32 mfplat mfuuid ole32 winmm comctl32 shell32 uuid ws2_32 winhttp)
+    # The updater is a program of its own (see host/rr_updater_main.cpp): the game has no download or install code.
+    add_executable(RidgeRacerUpdater host/rr_updater_main.cpp host/rr_update.cpp host/rr_http.cpp)
+    target_include_directories(RidgeRacerUpdater PRIVATE host)
+    target_link_libraries(RidgeRacerUpdater PRIVATE winhttp bcrypt shell32)
 endif()
 
 # Optional, developer use only: FFmpeg (shared build) for plain ATRAC3 files and for the RR_ATRAC_COMPARE check.

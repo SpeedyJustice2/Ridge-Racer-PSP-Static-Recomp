@@ -336,6 +336,8 @@ bool present_bug_report_requested() {
 }
 
 void present_set_title(const char *title) { if (g_window != nullptr) SDL_SetWindowTitle(g_window, title); }
+void present_set_fullscreen(bool on) { if (g_window != nullptr && on != g_fullscreen) set_fullscreen(on); }
+bool present_fullscreen() { return g_fullscreen; }
 
 // Software-raster path: shows a 480x272 RGBA frame (only used when the GL renderer is not running).
 void present_frame(const std::uint8_t *rgba, int width, int height) {

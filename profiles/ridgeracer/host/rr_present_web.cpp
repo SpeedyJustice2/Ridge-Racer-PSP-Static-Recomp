@@ -417,6 +417,8 @@ void present_take_timing(double &swap_ms, double &pace_ms) { swap_ms = 0.0; pace
 void present_note_pad_read() {}
 void present_take_latency(PresentLatency &out) { out = PresentLatency{}; }
 void present_set_title(const char *title) { if (g_open) rr_js_title(title); }
+void present_set_fullscreen(bool) {}
+bool present_fullscreen() { return false; }
 bool present_bug_report_requested() { return false; }
 bool present_screenshot_requested() { return false; }
 bool present_ramdump_requested() { return false; }

@@ -24,8 +24,8 @@ function Show-Message($text, $icon = "Information") {
 }
 
 # ---- is everything we need here?
-$zigOk = (Test-Path (Join-Path $kit "toolchain\zig\zig.exe")) -or ($null -ne (Get-Command zig -ErrorAction SilentlyContinue))
-if (-not $zigOk -or -not (Test-Path (Join-Path $kit "build.ps1"))) {
+$zigOk = (Test-Path -LiteralPath (Join-Path $kit "toolchain\zig\zig.exe")) -or ($null -ne (Get-Command zig -ErrorAction SilentlyContinue))
+if (-not $zigOk -or -not (Test-Path -LiteralPath (Join-Path $kit "build.ps1"))) {
   Show-Message "Setup files are missing. Please extract the whole download (including the 'toolchain' folder) and run Install again." "Error"
   exit 1
 }
@@ -478,7 +478,7 @@ $btnNext.Add_Click({
           $lnk.Save()
         } catch { }
       }
-      if ($chkPlay.Checked) { Start-Process -FilePath (Join-Path $script:installDir "RidgeRacerNative.exe") -WorkingDirectory $script:installDir }
+      if ($chkPlay.Checked) { $psi = New-Object System.Diagnostics.ProcessStartInfo (Join-Path $script:installDir "RidgeRacerNative.exe"); $psi.WorkingDirectory = $script:installDir; $psi.UseShellExecute = $true; [System.Diagnostics.Process]::Start($psi) | Out-Null }   # (Start-Process reads [ ] in a path as a wildcard)
       $script:closing = $true
       $form.Close()
     }

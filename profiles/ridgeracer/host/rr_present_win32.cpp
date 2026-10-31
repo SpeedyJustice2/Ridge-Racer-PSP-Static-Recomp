@@ -709,6 +709,9 @@ bool present_screenshot_requested() {
     return fire;
 }
 
+void present_set_fullscreen(bool on) { if (g_window != nullptr) set_fullscreen(g_window, on); }
+bool present_fullscreen() { return g_fullscreen; }
+
 void present_set_title(const char *title) {
     if (g_window != nullptr) SetWindowTextA(g_window, title);
 }

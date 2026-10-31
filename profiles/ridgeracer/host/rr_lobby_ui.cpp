@@ -1,6 +1,8 @@
 #include "rr_lobby_ui.hpp"
 #include "rr_osk_ui.hpp"
+#include "rr_options_ui.hpp"
 #include "rr_ui_canvas.hpp"
+#include "rr_ui_repeat.hpp"
 #include "rr_pad_ui.hpp"
 #include "rr_version.hpp"
 
@@ -62,7 +64,9 @@ struct State {
     TextFor text_for{TextFor::Search};
     BusyFor busy_for{BusyFor::Probe};
     std::string busy_text;
-    std::uint32_t frames{0}, prev_pad{0}, held{0}, events{0};
+    std::uint32_t frames{0}, prev_pad{0}, events{0};
+    ui::NavRepeat repeat;
+    ui::Ticks60 ticks;
     bool armed{false};
     // pointer
     float mx{-1}, my{-1};
@@ -459,6 +463,7 @@ void lobby_ui_set_rooms(const std::vector<LobbyRoom> &rooms, int status, bool fr
 
 namespace { std::string g_update_to; }   // (kept across pages: the room service refuses this game version)
 void lobby_ui_set_update(const std::string &newest) { g_update_to = newest; }
+void lobby_ui_toast(const std::string &text) { if (g.page != Page::None) toast(text); }
 
 
 void lobby_ui_lookup_result(bool found, const LobbyRoom &room, int status, const std::string &other_version) {
@@ -480,7 +485,7 @@ void lobby_ui_lookup_result(bool found, const LobbyRoom &room, int status, const
     if (g.modal != Modal::Busy || g.busy_for != BusyFor::Lookup) return;
     g.modal = Modal::None;
     if (status != 200) { toast("Could not reach the room service."); g.events |= kOskCancel; return; }
-    if (!g_update_to.empty()) { toast("Your game is out of date: get " + g_update_to + " to play online."); g.events |= kOskCancel; return; }
+    if (!g_update_to.empty()) { toast("Your game is out of date: install " + g_update_to + " in Options > Recomp Options to play online."); g.events |= kOskCancel; return; }
     if (!other_version.empty()) { toast("That race is on another version of the game (" + other_version + ")."); g.events |= kOskCancel; return; }
     if (!found) { toast("No race with that room code right now."); g.events |= kOskCancel; return; }
     try_join(room);
@@ -512,7 +517,7 @@ void lobby_ui_probe_result(const std::string &result) {
         return;
     }
     g.events |= kOskCancel;
-    if (result == "update") toast("Your game is out of date: get " + (g_update_to.empty() ? std::string("the newest version") : g_update_to) + " to play online.");
+    if (result == "update") toast("Your game is out of date: install " + (g_update_to.empty() ? std::string("the newest version") : g_update_to) + " in Options > Recomp Options.");
     else if (result.rfind("version", 0) == 0) toast("That race is on another version of the game" + (result.size() > 8 ? " (" + result.substr(8) + ")." : std::string(".")));
     else if (result == "badpw") toast("Wrong password.");
     else if (result == "full") toast("That race is full.");
@@ -532,7 +537,7 @@ LobbyRequest lobby_ui_update(const LobbyInput &in) {
 }
 namespace {
 void update_impl(const LobbyInput &in) {
-    ++g.frames;
+    g.frames = g.ticks.next();
 
     if (g.modal == Modal::Text) {
         // (letters typed on a keyboard must not count as buttons, but its arrow keys move around the letter grid)
@@ -597,12 +602,7 @@ void update_impl(const LobbyInput &in) {
     } else {
         const std::uint32_t pressed = in.pad & ~g.prev_pad;
         std::uint32_t nav = pressed;
-        if (in.pad & kDirs) {
-            ++g.held;
-            if (g.held > 20u && (g.held % 5u) == 0u) nav |= in.pad & kDirs;   // auto-repeat
-        } else {
-            g.held = 0u;
-        }
+        nav |= g.repeat.step(in.pad, kDirs);   // auto-repeat (timed, see rr_ui_repeat.hpp)
         g.prev_pad = in.pad;
         if (g.modal == Modal::Busy) {
             if (pressed & (kCircle | kSelect)) activate(W_BUSY_CANCEL);
@@ -809,7 +809,11 @@ void render_browser(const Canvas &cv) {
         const float cy = kListY + kRowH * kRowsVisible * 0.5f;
         if (!g_update_to.empty()) {
             cv.text_centered(240.0f, cy - 9.0f, "This version of the game (" RR_GAME_VERSION ") is out of date for online play.", 11.0f, kInk);
+#if defined(_WIN32)
+            cv.text_centered(240.0f, cy + 6.0f, "Install " + g_update_to + " in Options > Recomp Options > Updates & Help, then try again.", 9.5f, kMid);
+#else
             cv.text_centered(240.0f, cy + 6.0f, "Download " + g_update_to + " from the game's release page, then try again.", 9.5f, kMid);
+#endif
             cv.text_centered(240.0f, cy + 19.0f, "Your saves and settings stay as they are.", 9.5f, kMid);
         }
         else if (!g.have_list && (g.status == 0 || g.status == 200)) { spinner(cv, 240.0f, cy - 12.0f, 7.0f); cv.text_centered(240.0f, cy + 12.0f, "Looking for races...", 11.0f, kMid); }
@@ -956,9 +960,13 @@ void lobby_ui_render(std::uint8_t *rgba, int w, int h) {
 }
 
 void ui_page_render(std::uint8_t *rgba, int w, int h) {
-    if (lobby_ui_active()) lobby_ui_render(rgba, w, h);
+    if (options_ui_active() && !osk_ui_active()) options_ui_render(rgba, w, h);
+    else if (lobby_ui_active()) lobby_ui_render(rgba, w, h);
     else osk_ui_render(rgba, w, h);
 }
-std::uint64_t ui_page_state_key() { return lobby_ui_active() ? lobby_ui_state_key() : osk_ui_state_key(); }
+std::uint64_t ui_page_state_key() {
+    if (options_ui_active() && !osk_ui_active()) return options_ui_state_key() ^ 0x0F0F0F0F0F0Full;
+    return lobby_ui_active() ? lobby_ui_state_key() : osk_ui_state_key();
+}
 
 } // namespace rr

@@ -67,6 +67,8 @@ void lobby_ui_set_rooms(const std::vector<LobbyRoom> &rooms, int status, bool fr
 void lobby_ui_lookup_result(bool found, const LobbyRoom &room, int status, const std::string &other_version = {});
 // The room service refuses this game version: `newest` = the version to get (empty = all fine).  Shown on both pages.
 void lobby_ui_set_update(const std::string &newest);
+// A short message at the bottom of the open page (does nothing when no page is open).
+void lobby_ui_toast(const std::string &text);
 void lobby_ui_probe_result(const std::string &result);   // "ok", "badpw", "gone", "full", "racing", "busy", "update", "version <v>", "error"
 // Once a frame while active.
 LobbyRequest lobby_ui_update(const LobbyInput &in);

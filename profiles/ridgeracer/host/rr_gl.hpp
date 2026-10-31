@@ -60,6 +60,7 @@ public:
     // requested MSAA sample count (0/1 = off), fixed for the run.
     struct Enhance { bool fxaa{false}; float sharpen{0.0f}; bool mipmaps{true}; int aniso{8}; float ui_crisp{0.8f}; bool smooth_cutouts{false}; int msaa{0}; };
     void set_enhance(const Enhance &e);
+    [[nodiscard]] const Enhance &enhance() const { return enhance_; }
 
     // Call once per presented frame (ages caches and the "recently drawn" test used by has_target).
     void end_frame();
@@ -78,6 +79,10 @@ public:
     bool take_capture(std::vector<std::uint8_t> &rgba, int &width, int &height);
     // Same for a CPU-side 480x272 RGBA frame (movies, loading screens drawn by the CPU, software fallbacks).
     void present_rgba(const std::uint8_t *rgba, int width, int height, int win_w, int win_h);
+    // The port's overlay (fps counter, short messages): an RGBA image drawn 1:1 at window pixel (x, y), blended over what was
+    // presented, before the swap.  game_area = where the game picture sits in the window (letterbox).
+    void draw_overlay(const std::uint8_t *rgba, int width, int height, int x, int y, int win_w, int win_h, float alpha);
+    void game_area(int win_w, int win_h, int &x, int &y, int &w, int &h) const;
 
     // Menu frame interpolation (high refresh rates outside races; see rr_gl.cpp).  While recording, every draw into a
     // 512-wide screen buffer is also kept (state, palette, vertices) with a snapshot of the buffer taken before its first
@@ -151,6 +156,7 @@ private:
     void upload_from_vram(Rt &rt);   // uploads the rows recorded in cpu_row0..cpu_row1
     unsigned get_texture(const GpuDraw &d, bool &valid);
     void fallback_software(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count);
+    void log_gauge(const GpuDraw &d, const GpuVertex *data, std::size_t n, bool software);   // RR_GAUGE_LOG diagnostic
     bool compile_programs();
     bool compile_post();
     void post_pass(unsigned tex, int src_w, int src_h, int vis_w, int win_w, int win_h);

@@ -29,6 +29,8 @@ void make_bug_report_async(const std::string &reason, const std::filesystem::pat
 void announce(const std::filesystem::path &zip, bool crashed);
 // The game showed nothing new for `seconds`: reports\freeze-<time>.txt (state and the last log lines).
 void write_freeze_report(unsigned seconds);
+// Opens a web address in the default browser (Windows; xdg-open elsewhere).
+void open_url(const char *url);
 // "RidgeRacerNative --bug-report <reason>": builds a report, announces it, returns the exit code.
 int run_report_mode(const std::string &reason);
 

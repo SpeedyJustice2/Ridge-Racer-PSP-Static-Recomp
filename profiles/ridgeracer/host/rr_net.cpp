@@ -1468,6 +1468,7 @@ void Node::online_end() {
         o.worker.post([url]() -> Worker::Completion { http_request("POST", url, 4000); return nullptr; });
     }
     o.hosting = false;
+    browse_.host_waiting = 0;
     o.client = false;
     o.have_target = false;
     o.target_pw.clear();
@@ -1790,8 +1791,10 @@ void Node::online_tick(std::uint64_t now) {
                 }
                 if (!op->hosting) return;
                 const auto t_now = self->now_ms();
+                self->browse_.host_waiting = 0;
                 for (const auto &line : split(r.body, '\n')) {
                     const auto t = split(line, ' ');
+                    if (t.size() >= 2 && t[0] == "waiting") { self->browse_.host_waiting = std::max(0, std::atoi(t[1].c_str())); continue; }
                     if (t.size() < 4 || t[0] != "joiner") continue;
                     Mac m{};
                     if (!parse_mac(t[1], m)) continue;

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "rr_raster.hpp"
 
 #include "psprecomp/guest_memory.hpp"
@@ -497,6 +498,22 @@ void SoftwareBackend::draw(const GpuDraw &d_in, GpuPrim prim, const GpuVertex *v
             const std::size_t bytes = static_cast<std::size_t>(std::max(d.tex_stride, d.tex_width)) * d.tex_height * bits / 8u;
             const std::uint8_t *p = static_cast<const psprecomp::GuestMemory &>(memory_).raw_pointer(d.tex_addr, bytes);
             if (p != nullptr) { tex.data = p; tex.valid = true; }
+            {   // RR_TEXDUMP=addr with RR_GAUGE_DRAWS_TRIG (test rig): dump that texture and its palette (software renderer)
+                static const std::uint32_t want = [] { const char *e = std::getenv("RR_TEXDUMP"); return e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 16)) : 0u; }();
+                static int dumps = 0;
+                if (p != nullptr && want != 0u && d.tex_addr == want && dumps < 3) {
+                    static const char *trig = std::getenv("RR_GAUGE_DRAWS_TRIG");
+                    std::FILE *tf = trig ? std::fopen(trig, "rb") : nullptr;
+                    if (tf || !trig) {
+                        if (tf) std::fclose(tf);
+                        std::string fn = "swdump_tex" + std::to_string(dumps) + ".bin";
+                        if (std::FILE *f = std::fopen(fn.c_str(), "wb")) { std::fwrite(p, 1, bytes, f); std::fclose(f); }
+                        fn = "swdump_clut" + std::to_string(dumps) + ".bin";
+                        if (d.clut) if (std::FILE *f = std::fopen(fn.c_str(), "wb")) { std::fwrite(d.clut, 1, 1024, f); std::fclose(f); }
+                        ++dumps;
+                    }
+                }
+            }
         }
         if (!tex.valid) ++unsupported_texture_draws_;
     }

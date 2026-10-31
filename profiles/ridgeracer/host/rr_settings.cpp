@@ -88,7 +88,7 @@ PlayerSettings load_settings(const fs::path &file) {
         if (eq == std::string::npos) continue;
         const std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
         if (k == "game_path") s.game_path = v;
-        else if (k == "show_launcher") s.show_launcher = to_bool(v, s.show_launcher);
+        else if (k == "settings_window") s.show_launcher = to_bool(v, s.show_launcher);   // ("show_launcher" of beta 1.1 and older is ignored: the settings are in game now)
         else if (k == "renderer") s.gpu = v != "software";
         else if (k == "render_scale") s.render_scale = to_int(v, s.render_scale, 1, 8);
         else if (k == "window_scale") s.window_scale = to_int(v, s.window_scale, 1, 8);
@@ -111,6 +111,8 @@ PlayerSettings load_settings(const fs::path &file) {
         else if (k == "room_visibility") s.room_visibility = to_int(v, s.room_visibility, 0, 2);
         else if (k == "room_password") s.room_password = v.substr(0, 32);
         else if (k == "performance_report") s.perf_report = to_bool(v, s.perf_report);
+        else if (k == "performance_overlay") s.perf_overlay = to_int(v, s.perf_overlay, 0, 2);
+        else if (k == "draw_distance") s.draw_distance = to_int(v, s.draw_distance, 0, 8);
     }
     return s;
 }
@@ -120,9 +122,9 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
     if (!o) return false;
     static const char *const aa_names[] = {"off", "fxaa", "msaa2", "msaa4", "msaa8"};
     static const char *const kPromptNames[] = {"auto", "xbox", "playstation", "nintendo", "keyboard"};
-    o << "# Ridge Racer settings. Written by the settings window (start the game with Shift held, or with --launcher, to open it).\n"
+    o << "# Ridge Racer settings. Change them in game: Options > RECOMP OPTIONS (or start the game with Shift held for the settings window).\n"
       << "game_path=" << s.game_path << "\n"
-      << "show_launcher=" << (s.show_launcher ? 1 : 0) << "\n"
+      << "settings_window=" << (s.show_launcher ? 1 : 0) << "\n"
       << "\n[display]\n"
       << "renderer=" << (s.gpu ? "opengl" : "software") << "\n"
       << "render_scale=" << s.render_scale << "\n"
@@ -157,7 +159,11 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
       << "room_password=" << s.room_password << "\n"
       << "\n[diagnostics]\n"
       << "# 1 = write performance-report.txt next to the game (frame times, CPU and GPU names, power state) - handy when the game runs slowly\n"
-      << "performance_report=" << (s.perf_report ? 1 : 0) << "\n";
+      << "performance_report=" << (s.perf_report ? 1 : 0) << "\n"
+      << "# frame-rate counter over the game picture: 0 off, 1 frame rate, 2 frame rate and details\n"
+      << "performance_overlay=" << s.perf_overlay << "\n"
+      << "# draw scenery this many track cells further (0 = the game's own distance; 2-8 = further, costs some speed)\n"
+      << "draw_distance=" << s.draw_distance << "\n";
     return static_cast<bool>(o);
 }
 
@@ -305,11 +311,21 @@ std::vector<std::string> to_args(const PlayerSettings &s, int monitor_hz) {
         a.push_back("--button-prompts"); a.push_back(prompt_names[std::clamp(s.button_prompts, 0, 4)]);
     }
     a.push_back(s.trigger_buttons ? "--triggers" : "--no-triggers");
+    if (s.perf_overlay > 0) { a.push_back("--perf-overlay"); a.push_back(std::to_string(std::clamp(s.perf_overlay, 0, 2))); }
+    if (s.draw_distance > 0) { a.push_back("--draw-distance"); a.push_back(std::to_string(std::clamp(s.draw_distance, 0, 8))); }
     if (s.perf_report) { a.push_back("--perf-report"); a.push_back((executable_dir() / "performance-report.txt").string()); }
     a.push_back("--volume"); a.push_back(std::to_string(s.volume));
     a.push_back("--menu-volume"); a.push_back(std::to_string(s.menu_volume));
     return a;
 }
+
+namespace {
+PlayerSettings g_running;
+bool g_running_set = false, g_from_shortcut = false;
+}
+void set_running_settings(const PlayerSettings &s, bool from_shortcut) { g_running = s; g_running_set = true; g_from_shortcut = from_shortcut; }
+bool started_from_shortcut() { return g_from_shortcut; }
+bool running_settings(PlayerSettings &out) { if (g_running_set) out = g_running; return g_running_set; }
 
 std::filesystem::path executable_dir() { return exe_dir(); }
 

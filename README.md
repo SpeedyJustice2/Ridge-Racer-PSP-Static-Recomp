@@ -21,7 +21,7 @@ A native PC port of Ridge Racer (PSP), made by statically recompiling the game's
 1. Download **Setup.exe** from the [Releases](../../releases) page and run it. (Windows may show an "unknown publisher" warning because the file is not code-signed; choose *More info → Run anyway*.)
 2. Pick your game: a **decrypted** disc image (`.iso`) or the folder that contains `PSP_GAME`.
 3. Pick where to install it (any drive). Setup builds the game in the background; this can take 20 minutes or more on the first install and needs no other downloads.
-4. Press *Finish*. A settings window opens on the first start.
+4. Press *Finish*. The settings are in the game: **Options > RECOMP OPTIONS** (hold Shift while starting the game for the old settings window).
 
 `README-BETA.md` in this repository is the player's guide (install, controls, bug reports). Setup copies it into the game folder as `README.txt`.
 
@@ -40,7 +40,7 @@ The port reads the game's executable (`PSP_GAME/SYSDIR/BOOT.BIN`). It must be th
 Buttons are mapped by position like the PSP on every controller. Esc quits, F11 or Alt+Enter toggles full screen, F12 saves a screenshot, Ctrl+F12 makes a bug report, F8 mutes, F9/F10 change volume.
 
 ## Reporting bugs
-The game makes a bug report for you: `RidgeRacer-bug-report-<date>.zip`, saved where you choose (the game asks, then offers to open the [bug report page](https://github.com/ngrshow/Ridge-Racer-PSP-Static-Recomp/issues/new?template=bug_report.yml)). You get one automatically after a crash; press **Ctrl+F12** in game when something looks wrong; or click **Bug report...** in the settings window (hold Shift while starting the game) after a freeze. Attach it to an issue with a few words about what happened (issues are public, so look inside the zip first if you are unsure; it can include folder paths with your Windows user name). It contains the game's logs, settings (room password removed), crash files and a short PC summary - no game files.
+The game makes a bug report for you: `RidgeRacer-bug-report-<date>.zip`, saved where you choose (the game asks, then offers to open the [bug report page](https://github.com/SpeedyJustice2/Ridge-Racer-PSP-Static-Recomp/issues/new?template=bug_report.yml)). You get one automatically after a crash; press **Ctrl+F12** in game when something looks wrong (or use Options > Recomp Options > Updates & Help); or click **Bug report...** in the settings window (hold Shift while starting the game) after a freeze. Attach it to an issue with a few words about what happened (issues are public, so look inside the zip first if you are unsure; it can include folder paths with your Windows user name). It contains the game's logs, settings (room password removed), crash files and a short PC summary - no game files.
 
 ## Known limits
 Car LOD pop-in, some intro camera shots and Time Attack on some tracks are not fully checked. Online play has been tested with up to 3 players.

@@ -77,6 +77,9 @@ void present_note_pad_read();
 void present_take_latency(PresentLatency &out);
 // Window title (used for the live fps readout).
 void present_set_title(const char *title);
+// Borderless full screen on / off (what F11 does), and whether it is on.
+void present_set_fullscreen(bool on);
+bool present_fullscreen();
 // True once each time F12 is pressed (screenshot request).
 [[nodiscard]] bool present_screenshot_requested();
 [[nodiscard]] bool present_bug_report_requested();   // Ctrl+F12 (F12 alone is a screenshot)

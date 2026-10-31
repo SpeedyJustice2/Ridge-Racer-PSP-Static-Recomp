@@ -27,7 +27,7 @@
 namespace rr::update {
 namespace {
 
-const char *kLatestUrl = "https://api.github.com/repos/ngrshow/Ridge-Racer-PSP-Static-Recomp/releases/latest";
+const char *kLatestUrl = "https://api.github.com/repos/SpeedyJustice2/Ridge-Racer-PSP-Static-Recomp/releases/latest";
 
 std::vector<int> numbers_of(const std::string &s) {
     std::vector<int> v;
@@ -79,10 +79,26 @@ bool newer(const std::string &a, const std::string &b) {
     return false;
 }
 
+// Tests ask another release than the latest one: RR_UPDATE_URL, or the first line of update-test-url.txt next to the program
+// (written by test-update.ps1, removed by -Cleanup and after a successful test install).
+std::string source_url() {
+    if (const char *e = std::getenv("RR_UPDATE_URL"); e != nullptr && *e != '\0') return e;
+#ifdef _WIN32
+    if (FILE *f = _wfopen((program_dir() + L"\\update-test-url.txt").c_str(), L"rb")) {
+        char b[512] = {};
+        const std::size_t n = std::fread(b, 1, sizeof b - 1, f);
+        std::fclose(f);
+        std::string u(b, n);
+        while (!u.empty() && (u.back() == '\r' || u.back() == '\n' || u.back() == ' ')) u.pop_back();
+        if (u.rfind("https://", 0) == 0) return u;
+    }
+#endif
+    return kLatestUrl;
+}
+
 bool check(Info &out) {
     out = {};
-    const char *over = std::getenv("RR_UPDATE_URL");   // (tests)
-    const net::HttpResult r = net::http_request("GET", over != nullptr ? over : kLatestUrl, 8000);
+    const net::HttpResult r = net::http_request("GET", source_url(), 8000);
     if (r.status != 200) return false;
     const std::string &j = r.body;
     out.tag = json_string(j, "tag_name", 0);
@@ -113,6 +129,13 @@ bool check(Info &out) {
         for (std::size_t i = 0; i + 64 <= body.size(); ++i) {
             if (is_hex64(body.substr(i, 64)) && (i == 0 || !std::isxdigit(static_cast<unsigned char>(body[i - 1]))) &&
                 (i + 64 == body.size() || !std::isxdigit(static_cast<unsigned char>(body[i + 64])))) { out.sha256 = lower(body.substr(i, 64)); break; }
+        }
+    }
+    if (out.pkg_sha256.empty() && !out.pkg_url.empty()) {   // fall back to the hash after "RidgeRacer-Update.zip" in the release text
+        const std::size_t name = lower(body).find("ridgeracer-update.zip");
+        for (std::size_t i = name == std::string::npos ? body.size() : name; i + 64 <= body.size(); ++i) {
+            if (is_hex64(body.substr(i, 64)) && !std::isxdigit(static_cast<unsigned char>(body[i - 1])) &&
+                (i + 64 == body.size() || !std::isxdigit(static_cast<unsigned char>(body[i + 64])))) { out.pkg_sha256 = lower(body.substr(i, 64)); break; }
         }
     }
     out.notes = body.substr(0, 600);
@@ -287,6 +310,7 @@ std::string apply_package(const std::wstring &zip, const std::wstring &install_d
 
 std::string restart(const std::wstring &install_dir) {
     const std::wstring exe = install_dir + L"\\RidgeRacerNative.exe";
+    SetEnvironmentVariableW(L"RR_UPDATE_URL", nullptr);   // (an update test: the restarted game asks GitHub's real latest release again)
     STARTUPINFOW si{};
     si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
@@ -296,6 +320,35 @@ std::string restart(const std::wstring &install_dir) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return {};
+}
+
+std::wstring program_dir() {
+    wchar_t exe[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    std::wstring dir(exe, n);
+    return dir.substr(0, dir.find_last_of(L'\\'));
+}
+
+std::string install(const Info &info, std::atomic<int> &percent, bool &replaced, std::wstring &setup_file) {
+    replaced = false;
+    setup_file.clear();
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"RidgeRacerUpdate";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring install_dir = program_dir();
+    std::string err;
+    if (!info.pkg_url.empty()) {   // the small package: only the program is replaced, the game library built on this PC stays
+        err = download(info.pkg_url, info.pkg_sha256, dir + L"\\RidgeRacer-Update.zip", percent);
+        if (err.empty()) {
+            bool needs_setup = false;
+            err = apply_package(dir + L"\\RidgeRacer-Update.zip", install_dir, needs_setup);
+            if (err.empty() && !needs_setup) { replaced = true; return {}; }
+        }
+    }
+    err = download(info.url, info.sha256, dir + L"\\Setup.exe", percent);   // the full installer (the game library changed too)
+    if (err.empty()) setup_file = dir + L"\\Setup.exe";
+    return err;
 }
 
 void cleanup_old_files() {
@@ -326,6 +379,8 @@ std::string run_setup(const std::wstring &setup, const std::wstring &install_dir
 std::string download(const std::string &, const std::string &, const std::wstring &, std::atomic<int> &) { return "Updating is only built in on Windows."; }
 std::string apply_package(const std::wstring &, const std::wstring &, bool &) { return "Updating is only built in on Windows."; }
 std::string restart(const std::wstring &) { return "Updating is only built in on Windows."; }
+std::wstring program_dir() { return {}; }
+std::string install(const Info &, std::atomic<int> &, bool &replaced, std::wstring &setup_file) { replaced = false; setup_file.clear(); return "Updating is only built in on Windows."; }
 void cleanup_old_files() {}
 std::string run_setup(const std::wstring &, const std::wstring &, const std::wstring &) { return "Updating is only built in on Windows."; }
 #endif

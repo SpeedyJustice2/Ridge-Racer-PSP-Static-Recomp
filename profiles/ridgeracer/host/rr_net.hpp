@@ -73,6 +73,8 @@ struct BrowseState {
     std::string update_to;
     // a room code that belongs to a race on another game version: that version (browse_lookup)
     std::string lookup_other_version;
+    // our room (host): players waiting for a free place or for the race to end (the room service counts their tries)
+    int host_waiting{0};
 };
 
 class Node {

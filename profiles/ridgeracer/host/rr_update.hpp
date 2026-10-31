@@ -16,6 +16,8 @@ struct Info {
     std::string notes;          // first lines of the release text
 };
 
+// The release the check asks for (GitHub's latest one, or a test release, see rr_update.cpp).
+std::string source_url();
 // Blocking (run it on a helper thread).  Returns false when GitHub could not be reached.
 bool check(Info &out);
 // True when version string `b` is newer than `a` (compares the numbers in them: "beta1" < "beta1.1" < "beta2").
@@ -28,6 +30,11 @@ std::string download(const std::string &url, const std::string &sha256, const st
 std::string apply_package(const std::wstring &zip, const std::wstring &install_dir, bool &needs_setup);
 // Starts the program again (after apply_package).
 std::string restart(const std::wstring &install_dir);
+// The folder the running program is in.
+std::wstring program_dir();
+// Downloads and installs `info` for the running game: the small package first (then `replaced` = true: call restart()),
+// otherwise the full Setup.exe (then `setup_file` is set: call run_setup()).  Returns "" or an error message.
+std::string install(const Info &info, std::atomic<int> &percent, bool &replaced, std::wstring &setup_file);
 // Deletes the *.old files an earlier update left next to the program.
 void cleanup_old_files();
 // Starts the downloaded Setup.exe with the current game folder and game path filled in.  Returns "" or an error message.

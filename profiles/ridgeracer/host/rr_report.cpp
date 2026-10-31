@@ -551,6 +551,23 @@ void make_bug_report_async(const std::string &reason, const fs::path &screenshot
     std::thread([reason, screenshot] { announce(make_bug_report(reason, screenshot), false); }).detach();
 }
 
+void open_url(const char *url) {
+    if (url == nullptr || *url == '\0') return;
+#if defined(_WIN32)
+    const int n = MultiByteToWideChar(CP_UTF8, 0, url, -1, nullptr, 0);   // (UTF-8: folder names may hold any letters)
+    if (n <= 0) return;
+    std::wstring w(static_cast<std::size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, url, -1, w.data(), n);
+    ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__EMSCRIPTEN__)
+    (void)url;
+#else
+    const std::string u(url);
+    if (u.find_first_of("'\"\\$`") != std::string::npos) return;
+    std::thread([u] { const std::string cmd = "xdg-open '" + u + "' >/dev/null 2>&1"; (void)std::system(cmd.c_str()); }).detach();
+#endif
+}
+
 int run_report_mode(const std::string &reason) {
     const bool crashed = reason == "crash" || reason == "error";
     announce(make_bug_report(reason), crashed);

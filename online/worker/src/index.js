@@ -11,6 +11,9 @@
 //                                                 handicap); vis = 0 listed, 1 listed with a password (pw), 2 not listed
 //                                                 (joined by room code only).  Only a hash of the password is kept.
 //                                                 open = 1 while the host's game accepts entries, 0 during a race.
+//                                                 The reply ends with "waiting <n>" while players wait for a free place or for
+//                                                 the race to end (their joins / probes were answered "full" / "racing" in the
+//                                                 last 10 s): the host's game tells the host.
 //   GET  /rooms?ver=[&name=]                      reply = listed rooms ("room <mac> <ep> <lep> <name> <n> <max> <vis> <info> <est> <open>");
 //                                                 ep/lep are "-" for password rooms (given out by /join instead); est = rough
 //                                                 round trip in ms between the asker and the host from their locations, -1 = unknown
@@ -35,6 +38,7 @@
 
 const ROOM_TTL_MS = 15000;
 const JOINER_TTL_MS = 60000;
+const WAIT_TTL_MS = 10000;   // a waiting player asks again every 3 s
 const MAX_ROOMS = 500;
 const MAX_LIST = 100;
 const MAX_RELAY = 400;   // open relay sockets
@@ -184,7 +188,9 @@ export class Lobby {
       room.pwHash = pw ? await sha256hex(mac + ":" + pw) : "";
       Object.assign(room, { ep, lep, name, ver, info, vis: vis === 1 && !pw ? 0 : vis, geo: geoOf(request) || room.geo || null,
                             n: intIn(q.get("n"), 1, 8, 1), max: intIn(q.get("max"), 1, 8, 8), open: intIn(q.get("open"), 0, 1, 1) === 1, seen: now });
-      return text([...room.joiners].map(([jm, j]) => `joiner ${jm} ${j.ep} ${j.lep}\n`).join(""));
+      let waiting = 0;
+      if (room.waiting) for (const [wm, t] of room.waiting) { if (now - t > WAIT_TTL_MS || room.joiners.has(wm)) room.waiting.delete(wm); else ++waiting; }
+      return text([...room.joiners].map(([jm, j]) => `joiner ${jm} ${j.ep} ${j.lep}\n`).join("") + (waiting > 0 ? `waiting ${waiting}\n` : ""));
     }
 
     if (path === "/join" && request.method === "POST") {
@@ -197,8 +203,9 @@ export class Lobby {
       if (!room) return text("gone\n");
       if (room.ver !== ver) return text(`version ${room.ver}\n`);
       if (room.vis === 1 && (await sha256hex(roomMac + ":" + (q.get("pw") || ""))) !== room.pwHash) return text("badpw\n");
-      if (room.n >= room.max && !room.joiners.has(mac)) return text("full\n");
-      if (!room.open) return text("racing\n");   // the host's game takes no entries until the race is over (the player can wait)
+      const wait = () => { if (!room.waiting) room.waiting = new Map(); if (room.waiting.size < 64 || room.waiting.has(mac)) room.waiting.set(mac, now); };
+      if (room.n >= room.max && !room.joiners.has(mac)) { wait(); return text("full\n"); }
+      if (!room.open) { wait(); return text("racing\n"); }   // the host's game takes no entries until the race is over (the player can wait)
       if (q.get("probe") === "1") return text(`ok ${room.ep} ${room.lep}\n`);
       if (room.joiners.size >= 32 && !room.joiners.has(mac)) return text("busy\n");
       room.joiners.set(mac, { ep, lep, t: now });

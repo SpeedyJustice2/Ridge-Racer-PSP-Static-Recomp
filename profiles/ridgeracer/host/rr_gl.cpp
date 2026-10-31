@@ -40,7 +40,7 @@ using GLfloat = float;
 using GLsizeiptr = std::ptrdiff_t;
 using GLintptr = std::ptrdiff_t;
 
-constexpr GLenum GL_TRIANGLES = 0x0004, GL_LINES = 0x0001, GL_POINTS = 0x0000;
+constexpr GLenum GL_TRIANGLES = 0x0004, GL_LINES = 0x0001, GL_POINTS = 0x0000, GL_TRIANGLE_STRIP = 0x0005;
 constexpr GLenum GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0;
 constexpr GLenum GL_FLOAT = 0x1406, GL_UNSIGNED_BYTE = 0x1401;
 constexpr GLenum GL_TEXTURE_2D = 0x0DE1, GL_TEXTURE0 = 0x84C0, GL_TEXTURE1 = 0x84C1;
@@ -88,6 +88,7 @@ constexpr GLenum GL_LINEAR_MIPMAP_LINEAR = 0x2703, GL_TEXTURE_MAX_ANISOTROPY = 0
     X(void, Uniform1i, (GLint, GLint))                                                                                   \
     X(void, Uniform2f, (GLint, GLfloat, GLfloat))                                                                        \
     X(void, Uniform3f, (GLint, GLfloat, GLfloat, GLfloat))                                                               \
+    X(void, Uniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))                                                      \
     X(void, GenBuffers, (GLsizei, GLuint *))                                                                             \
     X(void, BindBuffer, (GLenum, GLuint))                                                                                \
     X(void, BufferData, (GLenum, GLsizeiptr, const void *, GLenum))                                                      \
@@ -313,6 +314,27 @@ void main() {
     vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
     v_uv = vec2(p.x * u_vis, 1.0 - p.y);  // texture row 0 is the top of the PSP image
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+// Overlay panel: a texture drawn into a rectangle of the window (u_rect = x0, y0, x1, y1 in -1..1), blended over the picture.
+const char *kOverlayVertexShader = R"(
+uniform vec4 u_rect;
+out vec2 v_uv;
+void main() {
+    vec2 p = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));   // strip of 4: (0,0) (1,0) (0,1) (1,1)
+    v_uv = vec2(p.x, 1.0 - p.y);
+    gl_Position = vec4(mix(u_rect.xy, u_rect.zw, p), 0.0, 1.0);
+}
+)";
+const char *kOverlayFragmentShader = R"(
+in vec2 v_uv;
+uniform sampler2D u_src;
+uniform float u_alpha;
+out vec4 o_color;
+void main() {
+    vec4 c = texture(u_src, v_uv);
+    o_color = vec4(c.rgb, c.a * u_alpha);
 }
 )";
 
@@ -594,6 +616,9 @@ struct GlBackend::Gl {
     bool mip_ready{false};
     float max_aniso{1.0f};
     unsigned post_program{}, post_vao{};
+    unsigned ovl_program{}, ovl_tex{};          // the port's own overlay (fps counter, short messages), drawn last over the window
+    int ovl_w{0}, ovl_h{0}, ovl_rect{-1}, ovl_src{-1}, ovl_alpha{-1};
+    bool ovl_tried{false};
     int post_src{-1}, post_texel{-1}, post_fxaa{-1}, post_sharp{-1}, post_radius{-1}, post_vis{-1}, post_xmax{-1}, post_ss{-1};
     int loc_jit{-1};
     // temporal AA
@@ -1672,7 +1697,34 @@ unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
     rb_lag_ = (d.fb_addr == 0x041FC000u && scene_tex) ||
               (sun_lag && ((d.fb_addr == 0x041FFF00u && scene_tex) || (d.tex_addr == 0x041FFF00u && d.tex_width == 1u && d.tex_height == 1u)));
     const std::uint64_t rb_before = stats_.readbacks;
+    // RR_TEXDUMP=addr (hex) with RR_GAUGE_DRAWS_TRIG: once the trigger file exists, write that texture's memory before and
+    // after the coherency read (texdump_pre.bin / texdump_post.bin) and its palette (texdump_clut.bin), up to 3 times.
+    static const std::uint32_t texdump_addr = [] { const char *e = std::getenv("RR_TEXDUMP"); return e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 16)) : 0u; }();
+    static int texdumps = 0;
+    bool texdump_now = false;
+    if (texdump_addr != 0u && d.tex_addr == texdump_addr && texdumps < 3) {
+        static const char *trig = std::getenv("RR_GAUGE_DRAWS_TRIG");
+        std::FILE *tf = trig ? std::fopen(trig, "rb") : nullptr;
+        if (tf || !trig) {
+            if (tf) std::fclose(tf);
+            texdump_now = true;
+            if (const std::uint8_t *m = static_cast<const psprecomp::GuestMemory &>(memory_).raw_pointer(d.tex_addr, bytes)) {
+                const std::string fn = "texdump_pre" + std::to_string(texdumps) + ".bin";
+                if (std::FILE *f = std::fopen(fn.c_str(), "wb")) { std::fwrite(m, 1, bytes, f); std::fclose(f); }
+            }
+            if (d.clut != nullptr) { const std::string fn = "texdump_clut" + std::to_string(texdumps) + ".bin"; if (std::FILE *f = std::fopen(fn.c_str(), "wb")) { std::fwrite(d.clut, 1, 1024, f); std::fclose(f); } }
+        }
+    }
     vram_read(d.tex_addr, static_cast<std::uint32_t>(bytes));
+    if (texdump_now) {
+        if (const std::uint8_t *m = static_cast<const psprecomp::GuestMemory &>(memory_).raw_pointer(d.tex_addr, bytes)) {
+            const std::string fn = "texdump_post" + std::to_string(texdumps) + ".bin";
+            if (std::FILE *f = std::fopen(fn.c_str(), "wb")) { std::fwrite(m, 1, bytes, f); std::fclose(f); }
+        }
+        char b[200]; std::snprintf(b, sizeof b, "TEXDUMP %d addr=%08X bytes=%zu readbacks=%llu", texdumps, d.tex_addr, bytes, static_cast<unsigned long long>(stats_.readbacks - rb_before));
+        events_.emplace_back(b);
+        ++texdumps;
+    }
     bool from_render_target = stats_.readbacks != rb_before;   // the GPU drew this texture (screen copy etc.)
     if (!from_render_target)
         for (const auto &r : rts_) if (ranges_overlap(d.tex_addr, static_cast<std::uint32_t>(bytes), r->addr, r->bytes())) { from_render_target = true; break; }
@@ -1809,8 +1861,52 @@ unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
     return entry.tex;
 }
 
+void GlBackend::log_gauge(const GpuDraw &d, const GpuVertex *data, std::size_t n, bool software) {
+        // RR_GAUGE_LOG=N: log (at most N distinct draws) every draw into the 128-pixel-wide off-screen surface (stride 128: the speedometer /
+        // rev gauge is drawn into a 128x128 surface that is later drawn as a sprite), with all state that could mask or stencil it and its
+        // first vertices.  Draws that differ only in position or colour are logged again, so a drive shows how the fill changes.
+        static const int gauge_log = [] { const char *e = std::getenv("RR_GAUGE_LOG"); return e ? std::max(0, std::atoi(e)) : 0; }();
+        static int gauge_logged = 0;
+        static std::uint64_t gauge_seen[2048]; static int gauge_seen_n = 0;
+        if (gauge_log > 0 && gauge_logged < gauge_log && gauge_seen_n < 2048 && d.fb_stride < 512u && d.fb_addr >= 0x041C0000u && d.fb_addr < 0x04200000u && n >= 1u) {
+            std::uint64_t sig = 1469598103934665603ull;
+            auto mix = [&sig](std::uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+            for (const std::uint64_t part : {static_cast<std::uint64_t>(d.fb_addr), static_cast<std::uint64_t>(d.fb_stride), static_cast<std::uint64_t>(d.through ? 1 : 0),
+                                             static_cast<std::uint64_t>(d.clear_mode ? 1 : 0), static_cast<std::uint64_t>(d.clear_color ? 1 : 0), static_cast<std::uint64_t>(d.clear_alpha ? 1 : 0),
+                                             static_cast<std::uint64_t>(d.stencil_test ? 1 : 0), static_cast<std::uint64_t>(d.stencil_func), static_cast<std::uint64_t>(d.stencil_ref),
+                                             static_cast<std::uint64_t>(d.stencil_zpass), static_cast<std::uint64_t>(d.mask_rgb), static_cast<std::uint64_t>(d.mask_alpha),
+                                             static_cast<std::uint64_t>(d.tex_enable ? d.tex_addr : 0u), static_cast<std::uint64_t>(d.blend ? 1 : 0), static_cast<std::uint64_t>(d.blend_src),
+                                             static_cast<std::uint64_t>(d.blend_dst), static_cast<std::uint64_t>(d.alpha_test ? 1 : 0), static_cast<std::uint64_t>(d.atest_func),
+                                             static_cast<std::uint64_t>(d.atest_ref), static_cast<std::uint64_t>(static_cast<std::uint32_t>(d.scissor_x0)),
+                                             static_cast<std::uint64_t>(static_cast<std::uint32_t>(d.scissor_y0)), static_cast<std::uint64_t>(static_cast<std::uint32_t>(d.scissor_x1)),
+                                             static_cast<std::uint64_t>(static_cast<std::uint32_t>(d.scissor_y1)), static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(software ? 1 : 0)}) mix(part);
+            for (std::size_t k = 0; k < n && k < 4; ++k)
+                for (const float f : {data[k].x, data[k].y, data[k].u, data[k].v, data[k].r, data[k].g, data[k].b, data[k].a})
+                    mix(static_cast<std::uint64_t>(static_cast<std::int64_t>(f * 4.0f)));
+            bool fresh = true;
+            for (int q = 0; q < gauge_seen_n; ++q) if (gauge_seen[q] == sig) { fresh = false; break; }
+            if (fresh) {
+                gauge_seen[gauge_seen_n++] = sig;
+                ++gauge_logged;
+                char b[760];
+                int len = std::snprintf(b, sizeof b,
+                    "GAUGE%s f=%llu n=%zu fb=%08X stride=%u fmt=%u thru=%d clear=%d/%d/%d stencil=%d(f%u ref%02X m%02X z%u) mask=%06X/%02X tex=%d addr=%08X %ux%u fmt=%u talpha=%d tfunc=%u blend=%d(%u,%u) atest=%d(%u,%u) depth=%d scis=%d,%d-%d,%d v:",
+                    software ? "(sw)" : "", static_cast<unsigned long long>(frame_), n, d.fb_addr, d.fb_stride, d.fb_format, d.through ? 1 : 0, d.clear_mode ? 1 : 0, d.clear_color ? 1 : 0, d.clear_alpha ? 1 : 0,
+                    d.stencil_test ? 1 : 0, d.stencil_func, d.stencil_ref, d.stencil_mask, d.stencil_zpass, d.mask_rgb, d.mask_alpha, d.tex_enable ? 1 : 0, d.tex_addr,
+                    d.tex_width, d.tex_height, d.tex_format, d.tex_alpha ? 1 : 0, d.tex_func, d.blend ? 1 : 0, d.blend_src, d.blend_dst, d.alpha_test ? 1 : 0, d.atest_func, d.atest_ref,
+                    d.depth_test ? 1 : 0, d.scissor_x0, d.scissor_y0, d.scissor_x1, d.scissor_y1);
+                for (std::size_t k = 0; k < n && k < 4 && len > 0 && len < static_cast<int>(sizeof b) - 90; ++k)
+                    len += std::snprintf(b + len, sizeof b - static_cast<std::size_t>(len), " [%.1f,%.1f uv %.1f,%.1f rgba %.0f,%.0f,%.0f,%.0f]",
+                                         static_cast<double>(data[k].x), static_cast<double>(data[k].y), static_cast<double>(data[k].u), static_cast<double>(data[k].v),
+                                         static_cast<double>(data[k].r), static_cast<double>(data[k].g), static_cast<double>(data[k].b), static_cast<double>(data[k].a));
+                events_.emplace_back(b);
+            }
+        }
+}
+
 void GlBackend::fallback_software(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std::size_t count) {
     RR_CRUMB(2, 27);
+    log_gauge(d, v, count, true);
     const prof::Scope prof_scope(prof::kSoftware);
     flush();
     const std::uint32_t target_bytes = d.fb_stride * 272u * (d.fb_format == 3u ? 4u : 2u);
@@ -2062,6 +2158,34 @@ void GlBackend::draw_gl(const GpuDraw &d, GpuPrim prim, const GpuVertex *v, std:
         quad_scratch_.assign(v, v + count);
         bound_through_triangles(quad_scratch_.data(), quad_scratch_.size());
         data = quad_scratch_.data();
+    } else if (prim == GpuPrim::Lines && d.through && std::getenv("RR_GL_LINES_OLD") == nullptr) {
+        // 2D lines are drawn as 1-pixel-thick quads that cover the same pixels as the software renderer (floor of each
+        // point along the line, both end points included).  GL_LINES leaves out a line that lies exactly on a pixel edge:
+        // the game renders the rev-gauge palette (bar / ring gauges: ORDYNE, Gnade, ...) as horizontal lines on row 0 of a
+        // one-row 8888 target (0x041E4E40), so with GL_LINES the palette never changed and the gauge stayed full.
+        quad_scratch_.clear();
+        for (std::size_t i = 0; i + 1 < count; i += 2) {
+            GpuVertex a = v[i], b = v[i + 1];
+            const float dx = b.x - a.x, dy = b.y - a.y;
+            const bool horiz = std::fabs(dx) >= std::fabs(dy);
+            if (horiz ? a.x > b.x : a.y > b.y) std::swap(a, b);
+            GpuVertex q[4] = {a, b, a, b};
+            if (horiz) {
+                const float slope = b.x != a.x ? (b.y - a.y) / (b.x - a.x) : 0.0f;
+                q[1].x += 1.0f; q[1].y += slope; q[3].x += 1.0f; q[3].y += slope + 1.0f; q[2].y += 1.0f;
+            } else {
+                const float slope = b.y != a.y ? (b.x - a.x) / (b.y - a.y) : 0.0f;
+                q[1].y += 1.0f; q[1].x += slope; q[3].y += 1.0f; q[3].x += slope + 1.0f; q[2].x += 1.0f;
+            }
+            for (GpuVertex &p : q) {
+                p.ub[0] = std::min(a.u, b.u); p.ub[1] = std::min(a.v, b.v); p.ub[2] = std::max(a.u, b.u); p.ub[3] = std::max(a.v, b.v);
+            }
+            quad_scratch_.push_back(q[0]); quad_scratch_.push_back(q[1]); quad_scratch_.push_back(q[2]);
+            quad_scratch_.push_back(q[1]); quad_scratch_.push_back(q[3]); quad_scratch_.push_back(q[2]);
+        }
+        data = quad_scratch_.data();
+        n = quad_scratch_.size();
+        if (n == 0u) return;
     } else if (prim == GpuPrim::Lines) {
         mode = GL_LINES;
     } else if (prim == GpuPrim::Points) {
@@ -2173,6 +2297,36 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
             }
         }
     }
+    {
+        // RR_GAUGE_DRAWS=N (test rig): log every 2D draw inside the speedometer corner (x >= 340, y >= 190) for frame
+        // RR_GAUGE_DRAWS_F (default: the first frame with such draws after frame 3000), with its full state and first vertices.
+        static const int gd_max = [] { const char *e = std::getenv("RR_GAUGE_DRAWS"); return e ? std::max(0, std::atoi(e)) : 0; }();
+        static const long long gd_f = [] { const char *e = std::getenv("RR_GAUGE_DRAWS_F"); return e ? std::atoll(e) : 3000ll; }();
+        static int gd_n = 0; static unsigned long long gd_frame = 0;
+        static const char *gd_trig = std::getenv("RR_GAUGE_DRAWS_TRIG");   // file: start logging once it exists
+        static unsigned long long gd_checked = ~0ull; static bool gd_on = false;
+        if (gd_max > 0 && gd_trig != nullptr && !gd_on && gd_checked != frame_) { gd_checked = frame_; std::FILE *tf = std::fopen(gd_trig, "rb"); if (tf) { gd_on = true; std::fclose(tf); } }
+        if (gd_max > 0 && gd_n < gd_max && n >= 1u && (gd_trig ? gd_on : static_cast<long long>(frame_) >= gd_f) && (gd_frame == 0 || gd_frame == frame_)) {
+            float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+            for (std::size_t k = 0; k < n; ++k) { x0 = std::min(x0, data[k].x); y0 = std::min(y0, data[k].y); x1 = std::max(x1, data[k].x); y1 = std::max(y1, data[k].y); }
+            if (x0 >= 300.0f && y0 >= 100.0f && x1 <= 490.0f && y1 <= 285.0f) {
+                gd_frame = frame_; ++gd_n;
+                char b[700];
+                int o = std::snprintf(b, sizeof b,
+                    "GDRAW f=%llu thru=%d mode=%u n=%zu bbox=%.1f,%.1f-%.1f,%.1f clear=%d tex=%d addr=%08X fmt=%u %ux%u s%u tfunc=%u talpha=%d blend=%d eq=%u src=%u dst=%u fixa=%06X fixb=%06X atest=%d(%u,%u) ctest=%d(%u,%06X,%06X) stest=%d(%u,%u,%02X ops%u%u%u) zt=%d(%u) zw=%d mask=%06X/%02X fb=%08X fmt=%u scis=%d,%d-%d,%d v:",
+                    static_cast<unsigned long long>(frame_), d.through ? 1 : 0, mode, n, (double)x0, (double)y0, (double)x1, (double)y1, d.clear_mode ? 1 : 0, d.tex_enable ? 1 : 0, d.tex_addr, d.tex_format, d.tex_width, d.tex_height, d.tex_stride,
+                    d.tex_func, d.tex_alpha ? 1 : 0, d.blend ? 1 : 0, d.blend_eq, d.blend_src, d.blend_dst, d.fix_a & 0xFFFFFFu, d.fix_b & 0xFFFFFFu,
+                    d.alpha_test ? 1 : 0, d.atest_func, d.atest_ref, d.color_test ? 1 : 0, d.ctest_func, d.ctest_ref & 0xFFFFFFu, d.ctest_mask & 0xFFFFFFu, d.stencil_test ? 1 : 0, d.stencil_func, d.stencil_ref, d.stencil_mask,
+                    d.stencil_sfail, d.stencil_zfail, d.stencil_zpass, d.depth_test ? 1 : 0, d.depth_func, d.depth_write ? 1 : 0, d.mask_rgb & 0xFFFFFFu, d.mask_alpha & 0xFFu, d.fb_addr, d.fb_format,
+                    d.scissor_x0, d.scissor_y0, d.scissor_x1, d.scissor_y1);
+                for (std::size_t k = 0; k < n && k < 4u && o > 0 && o < static_cast<int>(sizeof b) - 80; ++k)
+                    o += std::snprintf(b + o, sizeof b - o, " [%.1f,%.1f z%.0f uv%.1f,%.1f c%.0f,%.0f,%.0f,%.0f]", (double)data[k].x, (double)data[k].y, (double)data[k].z,
+                                       (double)data[k].u, (double)data[k].v, (double)data[k].r, (double)data[k].g, (double)data[k].b, (double)data[k].a);
+                events_.emplace_back(b);
+            }
+        }
+    }
+    log_gauge(d, data, n, false);
     {
         // RR_BIGDRAW_LOG=N: log (at most N distinct kinds of draw using the glare texture 0x04195540; the first version's budget went on intro fades) big blended textured draws into the scene buffers (bbox >= 200x100 px): the
         // glare/light-shaft layer over the road looks blocky, and this shows which texture/buffer it is sampled from.
@@ -2466,9 +2620,47 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
     // default (no env var): only the speedometer's 128x128 render-target sprite (0x041D3FC0), whose empty texels carry alpha 1-5; the
     // title screen's big faint circle got a hard edge when the cut covered every 2D blend.
     static const bool hud_cut_explicit = std::getenv("RR_HUD_FAINT_CUT") != nullptr;
+    // The speedometer surface does not always sit at 0x041D3FC0 (the gauge surface moves with the car's resources: 0x041E51C0 in the
+    // smoke replay, and some cars still showed the faint box), so also recognise it by shape: a 128x128 CLUT4 sprite covering the
+    // bottom-right 128x128 corner of the screen.  CLUT4 or CLUT8: the bar and ring gauges (ORDYNE / Gnade / Assoluto cars) use a
+    // 128x128 CLUT8 image whose palette the game renders each frame (see the 2D line quads in draw_gl).
+    bool gauge_sprite = false;
+    if (d.through && d.blend && d.tex_enable && !d.clear_mode && d.tex_width == 128u && d.tex_height == 128u && (d.tex_format == 4u || d.tex_format == 5u) && n >= 3u) {
+        float gx0 = 1e30f, gy0 = 1e30f, gx1 = -1e30f, gy1 = -1e30f;
+        for (std::size_t k = 0; k < n; ++k) { gx0 = std::min(gx0, data[k].x); gy0 = std::min(gy0, data[k].y); gx1 = std::max(gx1, data[k].x); gy1 = std::max(gy1, data[k].y); }
+        gauge_sprite = gx0 >= 351.5f && gy0 >= 143.5f && gx1 <= 480.5f && gy1 <= 272.5f && (gx1 - gx0) >= 120.0f && (gy1 - gy0) >= 120.0f;
+    }
+    {
+        // RR_GAUGE_LOG=N also logs the speedometer sprite's palette set-up and its 32 first palette entries whenever they change:
+        // some gauges (bar / ring fill) may be driven by palette entries that light up with the rev count.
+        static const int gauge_pal_log = [] { const char *e = std::getenv("RR_GAUGE_LOG"); return e ? std::max(0, std::atoi(e)) : 0; }();
+        static int gauge_pal_logged = 0;
+        static std::uint64_t gauge_pal_last = 0;
+        if (gauge_pal_log > 0 && gauge_pal_logged < gauge_pal_log && gauge_sprite && d.clut != nullptr) {
+            const std::uint32_t esz = d.clut_format == 3u ? 4u : 2u;
+            const std::uint32_t first = d.clut_start * 1u;
+            std::uint64_t h = 1469598103934665603ull;
+            for (std::uint32_t i = 0; i < 32u * esz && (first * esz + i) < 1024u; ++i) h = (h ^ d.clut[first * esz + i]) * 1099511628211ull;
+            h = (h ^ d.clut_shift) * 1099511628211ull; h = (h ^ d.clut_mask) * 1099511628211ull; h = (h ^ d.clut_start) * 1099511628211ull;
+            if (h != gauge_pal_last) {
+                gauge_pal_last = h;
+                ++gauge_pal_logged;
+                std::string line = "GAUGEPAL f=" + std::to_string(frame_) + " tex=" + [&] { char t[16]; std::snprintf(t, sizeof t, "%08X", d.tex_addr); return std::string(t); }() +
+                                   " clutfmt=" + std::to_string(d.clut_format) + " shift=" + std::to_string(d.clut_shift) + " mask=" + std::to_string(d.clut_mask) +
+                                   " start=" + std::to_string(d.clut_start) + " entries:";
+                for (std::uint32_t e = 0; e < 32u && ((first + e) * esz + esz) <= 1024u; ++e) {
+                    std::uint32_t v = 0;
+                    for (std::uint32_t k = 0; k < esz; ++k) v |= static_cast<std::uint32_t>(d.clut[(first + e) * esz + k]) << (8u * k);
+                    char t[16]; std::snprintf(t, sizeof t, esz == 4u ? " %08X" : " %04X", v);
+                    line += t;
+                }
+                events_.emplace_back(line);
+            }
+        }
+    }
     uc_1i(g, g.loc_acut, (atest && d.blend && !d.through && src_rt == nullptr) ? g_alpha_cutoff.load(std::memory_order_relaxed)
                            : (hud_cut_explicit ? (hud_faint_cut > 0 && d.through && d.blend && d.tex_enable && !d.clear_mode && src_rt == nullptr && d.tex_addr != 0x04195540u && d.blend_src != 6u)
-                                                  : (d.through && d.blend && d.tex_enable && !d.clear_mode && src_rt == nullptr && d.tex_addr == 0x041D3FC0u && d.tex_width == 128u && d.tex_height == 128u)) ? (hud_cut_explicit ? hud_faint_cut : 8) : 0);
+                                                  : (d.through && d.blend && d.tex_enable && !d.clear_mode && src_rt == nullptr && (d.tex_addr == 0x041D3FC0u || gauge_sprite) && d.tex_width == 128u && d.tex_height == 128u)) ? (hud_cut_explicit ? hud_faint_cut : 8) : 0);
     {
         // RR_DEBUG_CLASS=1: tint 3D draws by kind so a screenshot shows what trees etc. really are.
         // red = alpha-tested + nearest, yellow = alpha-tested + bilinear, blue = blended + nearest, cyan = blended + bilinear.
@@ -2869,6 +3061,79 @@ void GlBackend::present_rgba(const std::uint8_t *rgba, int width, int height, in
     g.BindFramebuffer(GL_READ_FRAMEBUFFER, g.scratch_fbo);
     g.BlitFramebuffer(0, 0, width, height, lx, ly + lh, lx + lw, ly, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     capture_default_fb(win_w, win_h);
+}
+
+void GlBackend::game_area(int win_w, int win_h, int &x, int &y, int &w, int &h) const { letterbox(win_w, win_h, x, y, w, h); }
+
+void GlBackend::draw_overlay(const std::uint8_t *rgba, int width, int height, int x, int y, int win_w, int win_h, float alpha) {
+    if (!ok_ || rgba == nullptr || width <= 0 || height <= 0 || win_w <= 0 || win_h <= 0) return;
+    Gl &g = *gl_;
+    if (!g.ovl_tried) {   // (compiled on first use)
+        g.ovl_tried = true;
+        const std::string header = gles_ ? "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n" : "#version 330 core\n";
+        const auto compile = [&](GLenum type, const char *body) {
+            const std::string src = header + body;
+            const char *ptr = src.c_str();
+            const unsigned sh = g.CreateShader(type);
+            g.ShaderSource(sh, 1, &ptr, nullptr);
+            g.CompileShader(sh);
+            GLint st = 0;
+            g.GetShaderiv(sh, GL_COMPILE_STATUS, &st);
+            if (!st) { g.DeleteShader(sh); return 0u; }
+            return sh;
+        };
+        const unsigned vs = compile(GL_VERTEX_SHADER, kOverlayVertexShader), fs = compile(GL_FRAGMENT_SHADER, kOverlayFragmentShader);
+        if (vs != 0u && fs != 0u) {
+            g.ovl_program = g.CreateProgram();
+            g.AttachShader(g.ovl_program, vs);
+            g.AttachShader(g.ovl_program, fs);
+            g.LinkProgram(g.ovl_program);
+            GLint st = 0;
+            g.GetProgramiv(g.ovl_program, GL_LINK_STATUS, &st);
+            if (!st) g.ovl_program = 0u;
+            else { g.ovl_rect = g.GetUniformLocation(g.ovl_program, "u_rect"); g.ovl_src = g.GetUniformLocation(g.ovl_program, "u_src"); g.ovl_alpha = g.GetUniformLocation(g.ovl_program, "u_alpha"); }
+        }
+        if (vs) g.DeleteShader(vs);
+        if (fs) g.DeleteShader(fs);
+        if (g.post_vao == 0u) g.GenVertexArrays(1, &g.post_vao);
+        events_.emplace_back(g.ovl_program != 0u ? "overlay: ready" : "overlay: shader unavailable");
+    }
+    if (g.ovl_program == 0u) return;
+    if (g.ovl_tex == 0u || g.ovl_w != width || g.ovl_h != height) {
+        if (g.ovl_tex == 0u) g.GenTextures(1, &g.ovl_tex);
+        g.BindTexture(GL_TEXTURE_2D, g.ovl_tex);
+        g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        g.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        g.ovl_w = width; g.ovl_h = height;
+    }
+    g.BindTexture(GL_TEXTURE_2D, g.ovl_tex);
+    g.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    g.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    g.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    g.Disable(GL_SCISSOR_TEST);
+    g.Disable(GL_STENCIL_TEST);
+    g.Disable(GL_DEPTH_TEST);
+    g.ColorMask(1, 1, 1, 1);
+    g.Enable(GL_BLEND);
+    g.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    g.BlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    g.Viewport(0, 0, win_w, win_h);
+    g.UseProgram(g.ovl_program);
+    g.BindVertexArray(g.post_vao);
+    g.ActiveTexture(GL_TEXTURE0);
+    g.BindTexture(GL_TEXTURE_2D, g.ovl_tex);
+    g.BindSampler(0, 0u);
+    g.Uniform1i(g.ovl_src, 0);
+    g.Uniform1f(g.ovl_alpha, alpha);
+    // window pixels (top-left origin) to -1..1 (bottom-left origin)
+    const float x0 = static_cast<float>(x) / win_w * 2.0f - 1.0f, x1 = static_cast<float>(x + width) / win_w * 2.0f - 1.0f;
+    const float y0 = 1.0f - static_cast<float>(y + height) / win_h * 2.0f, y1 = 1.0f - static_cast<float>(y) / win_h * 2.0f;
+    g.Uniform4f(g.ovl_rect, x0, y0, x1, y1);
+    g.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    g.Disable(GL_BLEND);
 }
 
 void GlBackend::capture_default_fb(int win_w, int win_h) {

@@ -1,7 +1,6 @@
 // The settings window shown before the game starts (Windows).  Plain Win32 controls, no resource file.
 #include "rr_settings.hpp"
 #include "rr_report.hpp"
-#include "rr_update.hpp"
 #include "rr_version.hpp"
 #include "rr_links.hpp"
 
@@ -72,100 +71,8 @@ struct Launcher {
     std::vector<int> fps_items;   // value of each frame-rate entry
     int monitor_hz = 60;
     int max_window_scale = 8;
-    // built-in updater
-    rr::update::Info upd;
-    std::atomic<int> pct{0};
-    std::atomic<bool> working{false};
-    std::string upd_err;
-    std::wstring upd_file, upd_pkg, install_dir;
-    std::atomic<int> mode{0};   // 1 = program replaced in place, 2 = full Setup downloaded
-    std::thread helper;
-    std::shared_ptr<rr::update::Info> checked;
-
-    ~Launcher() { if (helper.joinable()) helper.join(); }
-
-    void start_check() {
-        if (std::getenv("RR_NO_UPDATE_CHECK") != nullptr) return;
-        HWND w = wnd;
-        checked = std::make_shared<rr::update::Info>();
-        auto result = checked;
-        std::thread([w, result] {   // (detached: it only touches what it owns, so closing the window never waits for the network)
-            if (rr::update::check(*result) && result->available) PostMessageW(w, kMsgChecked, 1, 0);
-        }).detach();
-    }
-
-    void start_download() {
-        std::wstring who = widen(upd.tag);
-        if (MessageBoxW(wnd, (L"A newer version is available: " + who + L"\n\nThe update is downloaded from the project's GitHub page and checked against its published SHA-256 hash. "
-                              L"The game then restarts with the new version (a few seconds). If this version also changes the game library, the full Setup opens "
-                              L"instead with your game folder filled in. Your settings and saves are kept.\n\nDownload and update now?").c_str(),
-                        L"Ridge Racer - Update", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
-        wchar_t tmp[MAX_PATH];
-        GetTempPathW(MAX_PATH, tmp);
-        std::wstring dir = std::wstring(tmp) + L"RidgeRacerUpdate";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        upd_file = dir + L"\\Setup.exe";
-        upd_pkg = dir + L"\\RidgeRacer-Update.zip";
-        wchar_t exe[MAX_PATH * 2];
-        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
-        install_dir = std::wstring(exe, n);
-        install_dir = install_dir.substr(0, install_dir.find_last_of(L'\\'));
-        if (helper.joinable()) helper.join();
-        working = true;
-        mode = 0;
-        EnableWindow(item(kIdUpdate), FALSE);
-        HWND w = wnd;
-        helper = std::thread([this, w] {
-            std::atomic<int> &p = pct;
-            std::thread ticker([&p, w, this] { while (working) { PostMessageW(w, kMsgProgress, static_cast<WPARAM>(p.load()), 0); Sleep(200); } });
-            upd_err.clear();
-            // 1) the small package: only the program is replaced, the game library built on this PC stays
-            if (!upd.pkg_url.empty()) {
-                upd_err = rr::update::download(upd.pkg_url, upd.pkg_sha256, upd_pkg, pct);
-                if (upd_err.empty()) {
-                    bool needs_setup = false;
-                    upd_err = rr::update::apply_package(upd_pkg, install_dir, needs_setup);
-                    DeleteFileW(upd_pkg.c_str());
-                    if (upd_err.empty() && !needs_setup) mode = 1;
-                    else if (upd_err.empty()) upd_err = "needs setup";
-                }
-            } else upd_err = "needs setup";
-            // 2) otherwise (this update changes the game library too) the full Setup
-            if (mode == 0 && upd_err == "needs setup") {
-                upd_err = rr::update::download(upd.url, upd.sha256, upd_file, pct);
-                if (upd_err.empty()) mode = 2;
-            }
-            working = false;
-            ticker.join();
-            PostMessageW(w, kMsgDownloaded, 0, 0);
-        });
-    }
-
-    void finish_download() {
-        if (helper.joinable()) helper.join();
-        if (!upd_err.empty()) {
-            MessageBoxW(wnd, widen(upd_err).c_str(), L"Ridge Racer - Update", MB_OK | MB_ICONERROR);
-            SetWindowTextW(item(kIdUpdate), (L"Update to " + widen(upd.tag)).c_str());
-            EnableWindow(item(kIdUpdate), TRUE);
-            return;
-        }
-        read_settings();
-        if (mode == 1) {   // the program was replaced in place: start the new one and close this one
-            const std::string e = rr::update::restart(install_dir);
-            if (!e.empty()) { MessageBoxW(wnd, widen(e).c_str(), L"Ridge Racer - Update", MB_OK | MB_ICONINFORMATION); }
-            play = false;
-            DestroyWindow(wnd);
-            return;
-        }
-        const std::string e = rr::update::run_setup(upd_file, install_dir, widen(s.game_path));
-        if (!e.empty()) {
-            MessageBoxW(wnd, widen(e).c_str(), L"Ridge Racer - Update", MB_OK | MB_ICONERROR);
-            EnableWindow(item(kIdUpdate), TRUE);
-            return;
-        }
-        play = false;
-        DestroyWindow(wnd);   // (the game exe is replaced by Setup)
-    }
+    // (updates are installed from the game: Options > RECOMP OPTIONS > UPDATES & HELP, through RidgeRacerUpdater.exe)
+    bool working = false;
 
     int px(int dip) const { return MulDiv(dip, dpi, 96); }
     HWND item(int id) const { return GetDlgItem(wnd, id); }
@@ -266,15 +173,13 @@ struct Launcher {
         combo(kIdPrompts, 136, cy + 24, 200, {L"Automatic (what you use)", L"Xbox", L"PlayStation", L"Nintendo Switch", L"Keyboard"});
         check(kIdTriggers, L"Triggers accelerate and brake", 352, cy + 24, W - 352 - 24);
 
-        check(kIdShowAtStart, L"Show this window when the game starts  (hold Shift while starting to open it anyway)", 14, 492, W - 28);
+        check(kIdShowAtStart, L"Show this window at start  (the same settings are in game: Options > Recomp Options)", 14, 492, W - 28);
         // Community
         add(L"BUTTON", L"Join our Discord", BS_PUSHBUTTON | WS_TABSTOP, 12, 520, 150, 32, kIdDiscord);
         add(L"STATIC", L"Get news and updates, and find opponents to race against.", SS_LEFT, 174, 520 + 8, W - 174 - 12, 20, 0);
         const int by = 564;
         add(L"BUTTON", L"Defaults", BS_PUSHBUTTON | WS_TABSTOP, 12, by, 90, 28, kIdDefaults);
         add(L"BUTTON", L"Bug report...", BS_PUSHBUTTON | WS_TABSTOP, 110, by, 110, 28, kIdBugReport);
-        add(L"BUTTON", L"Update", BS_PUSHBUTTON | WS_TABSTOP, 228, by, 164, 28, kIdUpdate);
-        ShowWindow(item(kIdUpdate), SW_HIDE);
         add(L"BUTTON", L"Quit", BS_PUSHBUTTON | WS_TABSTOP, W - 12 - 90 - 8 - 110, by, 90, 28, IDCANCEL);
         add(L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, W - 12 - 110, by, 110, 28, IDOK);
     }
@@ -422,7 +327,6 @@ struct Launcher {
             const int id = LOWORD(wp), code = HIWORD(wp);
             if (id == IDOK) { if (path_ok && prepare_disc()) { read_settings(); play = true; DestroyWindow(wnd); } return 0; }
             if (id == IDCANCEL) { if (!working) DestroyWindow(wnd); return 0; }
-            if (id == kIdUpdate) { start_download(); return 0; }
             if (id == kIdDiscord) { ShellExecuteW(nullptr, L"open", RR_URL_DISCORD_W, nullptr, nullptr, SW_SHOWNORMAL); return 0; }
             if (id == kIdBrowse) { browse(); return 0; }
             if (id == kIdBrowseIso) { browse_iso(); return 0; }
@@ -443,15 +347,6 @@ struct Launcher {
             if ((id == kIdPath && code == EN_CHANGE) || (id == kIdRenderer && code == CBN_SELCHANGE)) refresh();
             return 0;
         }
-        case kMsgChecked:
-            if (checked) upd = *checked;
-            SetWindowTextW(item(kIdUpdate), (L"Update to " + widen(upd.tag)).c_str());
-            ShowWindow(item(kIdUpdate), SW_SHOW);
-            return 0;
-        case kMsgProgress:
-            if (working) SetWindowTextW(item(kIdUpdate), (L"Downloading " + std::to_wstring(static_cast<int>(wp)) + L"%").c_str());
-            return 0;
-        case kMsgDownloaded: finish_download(); return 0;
         case WM_HSCROLL: refresh(); return 0;
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(wp);
@@ -570,7 +465,6 @@ bool run_launcher(PlayerSettings &settings) {
     L.build();
     L.show_settings();
     ShowWindow(h, SW_SHOW);
-    L.start_check();
     SetForegroundWindow(h);
     SetFocus(GetDlgItem(h, IDOK));
 
