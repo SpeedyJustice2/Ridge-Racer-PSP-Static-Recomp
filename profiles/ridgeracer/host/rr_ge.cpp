@@ -677,6 +677,7 @@ void GeProcessor::execute_prim(std::uint32_t data) {
     const std::uint32_t vbase = vertex_addr_;
     const std::uint32_t index_unit = vt.idx == 1u ? 1u : (vt.idx == 2u ? 2u : (vt.idx == 3u ? 4u : 0u));
     draw.src_addr = index_unit != 0u ? index_addr_ : vbase;
+    draw.lit = (reg_[0x17] & 1u) != 0u && !vt.through;
 
     sub_scope.emplace(prof::kPrimVerts);
     for (std::uint32_t i = 0; i < count; ++i) {

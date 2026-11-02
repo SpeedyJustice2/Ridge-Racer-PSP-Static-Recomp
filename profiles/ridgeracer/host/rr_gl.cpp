@@ -1,6 +1,7 @@
 #include "rr_gl.hpp"
 #include "rr_crumb.hpp"
 #include "rr_png.hpp"
+#include "rr_texhd.hpp"
 #include "rr_tuning.hpp"
 #include "rr_prof.hpp"
 #include "rr_log.hpp"
@@ -193,6 +194,8 @@ uniform vec3 u_tex_env;
 uniform vec2 u_tex_size;
 uniform int u_rt_psp_filter;   // 1: a stretched-up render target is filtered between the PSP's own texels (glow buffers)
 uniform vec2 u_tex_off;
+uniform float u_tex_sharpen; // > 0: unsharp mask in texel space (car textures: the PSP's own textures are soft)
+uniform float u_grad_scale; // < 1: sample a sharper mip level (car textures)
 uniform float u_ui_ramp;    // > 0: crisp magnification for 2D sprites - the blend between two texels is squeezed into this fraction of a texel
 uniform float u_dst_scale;  // > 0: the texture is a scaled render target; shrinking draws average the whole source footprint
 uniform int u_tex_snap;     // 1: nearest sampling of a scaled render target - read the centre of the texel's pixel block
@@ -222,6 +225,8 @@ void main() {
     vec3 rgb = c.rgb;
     float a = c.a;
     if (u_tex_enable != 0) {
+        vec2 duvx = dFdx(uv), duvy = dFdy(uv);
+        float gs = u_grad_scale > 0.0 ? u_grad_scale : 1.0;   // (of the unsnapped coordinates: the crisp ramp below must not change the mip level)
         vec2 tuv = u_tex_snap != 0 ? floor(uv) + 0.5 : uv;
         if (u_ui_ramp > 0.0 && u_tex_snap == 0) {
             // Text and icons are small bitmaps that bilinear filtering turns to mush when they are drawn large: keep
@@ -262,7 +267,15 @@ void main() {
             vec4 t11 = textureLod(u_tex, (clamp(p0 + vec2(1.0, 1.0), lo, hi) + u_tex_off) / u_tex_size, 0.0);
             t = mix(mix(t00, t10, fr.x), mix(t01, t11, fr.x), fr.y);
         } else {
-            t = texture(u_tex, (tuv + u_tex_off) / u_tex_size);
+            vec2 gx = duvx * gs / u_tex_size, gy = duvy * gs / u_tex_size;
+            t = textureGrad(u_tex, (tuv + u_tex_off) / u_tex_size, gx, gy);
+            if (u_tex_sharpen > 0.0) {
+                // unsharp mask over the neighbouring texels; fades out once a texel is smaller than a pixel
+                float mag = clamp(1.5 - max(length(duvx), length(duvy)), 0.0, 1.0);
+                vec4 n = textureGrad(u_tex, (tuv + vec2(1.0, 0.0) + u_tex_off) / u_tex_size, gx, gy) + textureGrad(u_tex, (tuv - vec2(1.0, 0.0) + u_tex_off) / u_tex_size, gx, gy) +
+                         textureGrad(u_tex, (tuv + vec2(0.0, 1.0) + u_tex_off) / u_tex_size, gx, gy) + textureGrad(u_tex, (tuv - vec2(0.0, 1.0) + u_tex_off) / u_tex_size, gx, gy);
+                t.rgb = clamp(t.rgb + u_tex_sharpen * mag * (t.rgb - n.rgb * 0.25), 0.0, 1.0);
+            }
         }
         if (u_tex_func == 0) {            // modulate
             rgb = t.rgb * rgb;
@@ -610,7 +623,7 @@ struct GlBackend::Gl {
     void(RR_GLAPI *GetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void *) = nullptr;
     unsigned program{}, vao{}, vbo{};
     int loc_rt{-1}, loc_pt{-1}, loc_clear{-1}, loc_tex_enable{-1}, loc_tex_func{-1}, loc_tex_alpha{-1}, loc_tex_double{-1}, loc_tex_env{-1},
-        loc_tex_size{-1}, loc_tex_off{-1}, loc_tex_snap{-1}, loc_dst_scale{-1}, loc_rt_psp_filter{-1}, loc_ui_ramp{-1}, loc_dbg{-1}, loc_acut{-1}, loc_atest{-1}, loc_atest_func{-1}, loc_atest_ref{-1}, loc_atest_mask{-1}, loc_ctest{-1}, loc_ct_func{-1}, loc_ct_ref{-1}, loc_ct_mask{-1}, loc_alpha_mode{-1}, loc_tex{-1}, loc_fog{-1}, loc_fog_color{-1};
+        loc_tex_size{-1}, loc_tex_off{-1}, loc_tex_snap{-1}, loc_dst_scale{-1}, loc_rt_psp_filter{-1}, loc_ui_ramp{-1}, loc_grad_scale{-1}, loc_tex_sharpen{-1}, loc_dbg{-1}, loc_acut{-1}, loc_atest{-1}, loc_atest_func{-1}, loc_atest_ref{-1}, loc_atest_mask{-1}, loc_ctest{-1}, loc_ct_func{-1}, loc_ct_ref{-1}, loc_ct_mask{-1}, loc_alpha_mode{-1}, loc_tex{-1}, loc_fog{-1}, loc_fog_color{-1};
     unsigned samplers[2][4]{};  // [filter linear][clamp_u + 2*clamp_v]
     unsigned mip_samplers[4]{}; // trilinear (+ anisotropic) for 3D textures
     bool mip_ready{false};
@@ -748,7 +761,7 @@ bool GlBackend::compile_programs() {
     const auto loc = [&](const char *name) { return g.GetUniformLocation(g.program, name); };
     g.loc_rt = loc("u_rt"); g.loc_pt = loc("u_pt"); g.loc_clear = loc("u_clear"); g.loc_tex_enable = loc("u_tex_enable"); g.loc_tex_func = loc("u_tex_func");
     g.loc_tex_alpha = loc("u_tex_alpha"); g.loc_tex_double = loc("u_tex_double"); g.loc_tex_env = loc("u_tex_env");
-    g.loc_tex_size = loc("u_tex_size"); g.loc_tex_off = loc("u_tex_off"); g.loc_tex_snap = loc("u_tex_snap"); g.loc_dst_scale = loc("u_dst_scale"); g.loc_rt_psp_filter = loc("u_rt_psp_filter"); g.loc_ui_ramp = loc("u_ui_ramp"); g.loc_dbg = loc("u_dbg"); g.loc_acut = loc("u_acut"); g.loc_atest = loc("u_atest"); g.loc_atest_func = loc("u_atest_func");
+    g.loc_tex_size = loc("u_tex_size"); g.loc_tex_off = loc("u_tex_off"); g.loc_tex_snap = loc("u_tex_snap"); g.loc_dst_scale = loc("u_dst_scale"); g.loc_rt_psp_filter = loc("u_rt_psp_filter"); g.loc_ui_ramp = loc("u_ui_ramp"); g.loc_grad_scale = loc("u_grad_scale"); g.loc_tex_sharpen = loc("u_tex_sharpen"); g.loc_dbg = loc("u_dbg"); g.loc_acut = loc("u_acut"); g.loc_atest = loc("u_atest"); g.loc_atest_func = loc("u_atest_func");
     g.loc_ctest = loc("u_ctest"); g.loc_ct_func = loc("u_ct_func"); g.loc_ct_ref = loc("u_ct_ref"); g.loc_ct_mask = loc("u_ct_mask");
     g.loc_atest_ref = loc("u_atest_ref"); g.loc_atest_mask = loc("u_atest_mask"); g.loc_alpha_mode = loc("u_alpha_mode"); g.loc_fog = loc("u_fog"); g.loc_fog_color = loc("u_fog_color");
     g.loc_tex = loc("u_tex"); g.loc_jit = loc("u_jit");
@@ -823,8 +836,14 @@ bool GlBackend::compile_post() {
 
 void GlBackend::set_enhance(const Enhance &e) {
     RR_CRUMB(2, 25);
+    const bool hd_changed = (enhance_.tex_sharp == 3) != (e.tex_sharp == 3);
     enhance_ = e;
     if (!ok_) return;
+    if (hd_changed) {   // HD car textures on/off: upload every texture again
+        for (auto &kv : textures_) gl_->DeleteTextures(1, &kv.second.tex);
+        textures_.clear();
+        texture_bytes_ = 0;
+    }
     Gl &g = *gl_;
     if (!g.mip_ready) {
         g.GetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &g.max_aniso);
@@ -1753,6 +1772,14 @@ unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
     h = (h ^ params) * 0x9E3779B97F4A7C15ull;
     h ^= h >> 31u;
     auto it = textures_.find(h);
+    if (it != textures_.end() && enhance_.tex_sharp == 3 && d.lit && !d.through && (d.tex_format == 4u || d.tex_format == 5u) &&
+        (!it->second.hd_tried || (!it->second.hd_ok && it->second.hd_gen != texhd::generation()))) {
+        // HD car textures: first drawn by an unlit pass, now by a lit one (a car): upload it again with the HD look-up
+        gl_->DeleteTextures(1, &it->second.tex);
+        texture_bytes_ -= it->second.bytes;
+        textures_.erase(it);
+        it = textures_.end();
+    }
     if (it != textures_.end()) {
         it->second.last_use = frame_;
         ++stats_.texture_hits;
@@ -1798,6 +1825,46 @@ unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
         // bleed would smear colour into nearly the whole 512x512 image (~15 ms) for nothing.
         if (always || (!dynamic_big && !from_render_target)) bleed_transparent_texels(decode_scratch_, d.tex_width, d.tex_height);
     }
+    static const std::uint64_t png_from = std::getenv("RR_TEXPNG_FROM") ? std::strtoull(std::getenv("RR_TEXPNG_FROM"), nullptr, 0) : ~0ull;
+    if (static const char *pngdir = std::getenv("RR_TEXPNG"); pngdir != nullptr && (d.lit || frame_ >= png_from) && !d.through) {   // (research) car textures as PNG
+        static int dumped = 0;
+        if (dumped < 3000) {
+            ++dumped;
+            char nm[160];
+            std::snprintf(nm, sizeof nm, "%s/tex_%08X_%ux%u_f%u_c%08X_%llu.png", pngdir, d.tex_addr, d.tex_width, d.tex_height, d.tex_format,
+                          d.clut != nullptr ? static_cast<unsigned>(d.clut[0] | (d.clut[1] << 8) | (d.clut[2] << 16) | (d.clut[3] << 24)) : 0u, static_cast<unsigned long long>(frame_));
+            write_png(nm, reinterpret_cast<const std::uint8_t *>(decode_scratch_.data()), d.tex_width, d.tex_height);
+        }
+    }
+    // HD car textures: showroom textures are remembered, race textures that are scaled-down copies of one get it back
+    const std::vector<std::uint32_t> *up = &decode_scratch_;
+    std::uint32_t up_w = d.tex_width, up_h = d.tex_height;
+    // (only textures of lit draws: the cars; the scenery is pre-lit and must never be swapped)
+    // Cars: lit, palette textures (rr_texhd only uses the car models as sources, so scenery such as trees never matches).
+    const bool hd_try = enhance_.tex_sharp == 3 && d.lit && !d.through && !from_render_target && (d.tex_format == 4u || d.tex_format == 5u);
+    bool hd_ok = false;
+    const int hd_gen = texhd::generation();
+    if (hd_try) {
+        std::string why;
+        if (texhd::upgrade(decode_scratch_.data(), d.tex_width, d.tex_height, hd_scratch_, up_w, up_h, why)) {
+            up = &hd_scratch_;
+            hd_ok = true;
+            if (!why.empty()) { char b[40]; std::snprintf(b, sizeof b, " tex=%08X", d.tex_addr); events_.emplace_back(why + b); }
+            if (const char *dd = std::getenv("RR_TEXHD_DUMP"); dd != nullptr && !why.empty()) {   // (tests) the composite as PNG
+                char nm[200]; std::snprintf(nm, sizeof nm, "%s/hd_%08X_%ux%u.png", dd, d.tex_addr, up_w, up_h);
+                write_png(nm, reinterpret_cast<const std::uint8_t *>(hd_scratch_.data()), up_w, up_h);
+                std::snprintf(nm, sizeof nm, "%s/src_%08X_%ux%u.png", dd, d.tex_addr, d.tex_width, d.tex_height);
+                write_png(nm, reinterpret_cast<const std::uint8_t *>(decode_scratch_.data()), d.tex_width, d.tex_height);
+            }
+        } else if (const char *dd = std::getenv("RR_TEXHD_DUMP"); dd != nullptr && d.tex_width >= 128u) {   // (tests) misses
+            static int nmiss = 0;
+            if (nmiss < 200) {
+                ++nmiss;
+                char nm[200]; std::snprintf(nm, sizeof nm, "%s/miss_%08X_%ux%u_%llu.png", dd, d.tex_addr, d.tex_width, d.tex_height, static_cast<unsigned long long>(frame_));
+                write_png(nm, reinterpret_cast<const std::uint8_t *>(decode_scratch_.data()), d.tex_width, d.tex_height);
+            }
+        }
+    }
     Gl &g = *gl_;
     const auto tu0 = Clk::now();
     CachedTexture entry;
@@ -1806,8 +1873,8 @@ unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
     g.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
     g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     g.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    g.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(d.tex_width), static_cast<GLsizei>(d.tex_height), 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, decode_scratch_.data());
+    g.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(up_w), static_cast<GLsizei>(up_h), 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, up->data());
     if (enhance_.mipmaps && d.tex_width > 1u && d.tex_height > 1u) g.GenerateMipmap(GL_TEXTURE_2D);
     tt_upload = std::chrono::duration<double, std::milli>(Clk::now() - tu0).count();
     if (events_budget_ != 0u) {
@@ -1853,7 +1920,10 @@ unsigned GlBackend::get_texture(const GpuDraw &d, bool &valid) {
         }
     }
     entry.last_use = frame_;
-    entry.bytes = d.tex_width * d.tex_height * 4u;
+    entry.bytes = up_w * up_h * 4u;
+    entry.hd_tried = hd_try;
+    entry.hd_ok = hd_ok;
+    entry.hd_gen = hd_gen;
     texture_bytes_ += entry.bytes;
     textures_.emplace(h, entry);
     ++stats_.texture_uploads;
@@ -1969,7 +2039,7 @@ bool GlBackend::same_state(const GpuDraw &a, const GpuDraw &b) {
         a.clear_alpha != b.clear_alpha || a.clear_depth != b.clear_depth || a.stencil_test != b.stencil_test ||
         (a.stencil_test && (a.stencil_func != b.stencil_func || a.stencil_ref != b.stencil_ref || a.stencil_mask != b.stencil_mask ||
                             a.stencil_sfail != b.stencil_sfail || a.stencil_zfail != b.stencil_zfail || a.stencil_zpass != b.stencil_zpass)) ||
-        a.tex_enable != b.tex_enable || a.blend != b.blend || a.alpha_test != b.alpha_test || a.color_test != b.color_test || a.depth_test != b.depth_test ||
+        a.tex_enable != b.tex_enable || (a.tex_enable && a.lit != b.lit) || a.blend != b.blend || a.alpha_test != b.alpha_test || a.color_test != b.color_test || a.depth_test != b.depth_test ||
         a.depth_write != b.depth_write || a.fog != b.fog || (a.fog && a.fog_color != b.fog_color) || a.mask_rgb != b.mask_rgb || a.mask_alpha != b.mask_alpha ||
         a.scissor_x0 != b.scissor_x0 || a.scissor_y0 != b.scissor_y0 || a.scissor_x1 != b.scissor_x1 || a.scissor_y1 != b.scissor_y1)
         return false;
@@ -2247,8 +2317,23 @@ GlBackend::Rt *GlBackend::find_source_rt(const GpuDraw &d, const Rt &dst, std::u
 }
 
 void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data, std::size_t n, Rt &rt_ref) {
+    {   // RR_TEX3D_LOG=frame,count (car texture research): every textured 3D draw of those frames
+        static const std::pair<std::uint64_t, std::uint64_t> tl = [] {
+            const char *e = std::getenv("RR_TEX3D_LOG");
+            std::uint64_t a = ~0ull, n = 1; if (e) { a = std::strtoull(e, nullptr, 0); if (const char *c = std::strchr(e, ',')) n = std::strtoull(c + 1, nullptr, 0); }
+            return std::pair<std::uint64_t, std::uint64_t>{a, n};
+        }();
+        if (frame_ >= tl.first && frame_ < tl.first + tl.second && !d.through && d.tex_enable) {
+            char b[260];
+            std::snprintf(b, sizeof b, "TEX3D f=%llu tex=%08X %ux%u fmt=%u lin=%d atest=%d blend=%d s%u d%u lit=%d src=%08X n=%zu fb=%08X", static_cast<unsigned long long>(frame_), d.tex_addr, d.tex_width, d.tex_height,
+                          d.tex_format, d.tex_linear ? 1 : 0, d.alpha_test ? 1 : 0, d.blend ? 1 : 0, d.blend_src, d.blend_dst, d.lit ? 1 : 0, d.src_addr, n, d.fb_addr);
+            events_.emplace_back(b);
+        }
+    }
     RR_CRUMB(2, 10);
-    if (const int hide = g_hide_class.load(std::memory_order_relaxed); hide != 0 && !d.clear_mode) {
+    { static const bool init = [] { if (const char *e = std::getenv("RR_HIDE_CLASS")) g_hide_class = std::atoi(e); return true; }(); (void)init; }   // (tests: F4's draw-class hiding from the start)
+    static const std::uint64_t hide_from = std::getenv("RR_HIDE_FROM") ? std::strtoull(std::getenv("RR_HIDE_FROM"), nullptr, 0) : 0u;
+    if (const int hide = g_hide_class.load(std::memory_order_relaxed); hide != 0 && !d.clear_mode && frame_ >= hide_from) {
         const bool through = d.through;
         const bool blend = d.blend, atest = d.alpha_test;
         const bool hit = hide == 5 ? through
@@ -2577,8 +2662,25 @@ void GlBackend::submit_gl(const GpuDraw &d, unsigned mode, const GpuVertex *data
             static bool told = false;
             if (!told) { told = true; char b[160]; std::snprintf(b, sizeof b, "GLARERAMP off for tex=%08X src=%u dst=%u tex_alpha=%d ui_crisp=%.2f", d.tex_addr, d.blend_src, d.blend_dst, d.tex_alpha ? 1 : 0, static_cast<double>(enhance_.ui_crisp)); events_.emplace_back(b); }
         }
-        uc_1f(g, g.loc_ui_ramp, (enhance_.ui_crisp > 0.0f && src_rt == nullptr && d.through && d.tex_linear && d.tex_alpha && (glare_crisp || (d.tex_addr != 0x04195540u && d.blend_src != 6u)))
-                                       ? 1.0f - 0.85f * std::min(enhance_.ui_crisp, 1.0f) : 0.0f);
+        // Car textures (Recomp Options > Graphics > Car textures): the cars are the only GE-lit 3D models (the scenery is pre-lit).
+        // Magnified, their texels keep a solid interior and blend only across a narrow edge band (Sharp) or almost none (Pixel,
+        // a nearest-neighbour look that stays anti-aliased).  Shrunk or at a distance nothing changes (the ramp opens to a full
+        // texel once a texel is smaller than a pixel).  RR_CAR_TEX_ALL=1: every filtered 3D texture (test).
+        static const bool car_tex_all = std::getenv("RR_CAR_TEX_ALL") != nullptr;
+        // RR_CAR_SHARPEN=x overrides the unsharp-mask strength (Sharp 1.0, Pixel 0.6 by default)
+        const auto car_sharpen = [&]() { static const float o = std::getenv("RR_CAR_SHARPEN") ? static_cast<float>(std::atof(std::getenv("RR_CAR_SHARPEN"))) : -1.0f;
+                                          return o >= 0.0f ? o : (enhance_.tex_sharp >= 2 ? 0.6f : 1.0f); };
+        // Car textures are recognised by their lit draws into a full-size picture (not the 64x64 reflection map); unlit
+        // passes over the same texture (the cars' second, unlit layer) follow it.
+        static std::unordered_map<std::uint32_t, std::uint64_t> car_texs;   // texture address -> last frame seen lit
+        if ((enhance_.tex_sharp == 1 || enhance_.tex_sharp == 2) && d.lit && !d.through && d.fb_addr != 0x041fe000u) { if (car_texs.size() > 4096u) car_texs.clear(); car_texs[d.tex_addr] = frame_; }
+        const auto seen_lit = [&]() { auto f = car_texs.find(d.tex_addr); return f != car_texs.end() && frame_ - f->second < 120u; };
+        const bool car_tex = (enhance_.tex_sharp == 1 || enhance_.tex_sharp == 2) && src_rt == nullptr && !d.through && mode == GL_TRIANGLES && !d.alpha_test && (d.lit || car_tex_all || seen_lit());
+        const float ui_ramp = (enhance_.ui_crisp > 0.0f && src_rt == nullptr && d.through && d.tex_linear && d.tex_alpha && (glare_crisp || (d.tex_addr != 0x04195540u && d.blend_src != 6u)))
+                                  ? 1.0f - 0.85f * std::min(enhance_.ui_crisp, 1.0f) : 0.0f;
+        uc_1f(g, g.loc_ui_ramp, car_tex ? (enhance_.tex_sharp >= 2 ? 0.04f : 0.3f) : ui_ramp);
+        uc_1f(g, g.loc_grad_scale, (car_tex || (enhance_.tex_sharp == 3 && d.lit && !d.through && (d.tex_format == 4u || d.tex_format == 5u) && src_rt == nullptr)) ? 0.5f : 1.0f);   // one mip level sharper on the cars
+        uc_1f(g, g.loc_tex_sharpen, car_tex ? car_sharpen() : 0.0f);
         uc_1i(g, g.loc_tex_func, static_cast<GLint>(d.tex_func));
         uc_1i(g, g.loc_tex_alpha, d.tex_alpha ? 1 : 0);
         uc_1i(g, g.loc_tex_double, d.tex_double ? 1 : 0);

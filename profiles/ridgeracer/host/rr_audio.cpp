@@ -190,6 +190,13 @@ std::uint32_t audio_channel_queued(int channel) {
     return static_cast<std::uint32_t>(g_channels[channel].count);
 }
 
+std::uint32_t audio_channel_soft_limit(int channel) {   // a backlog above this would soon be trimmed (see audio_channel_push)
+    if (channel < 0 || channel >= kAudioChannels) return 0u;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const Channel &c = g_channels[channel];
+    return static_cast<std::uint32_t>(std::max(kTrimHigh, c.prime + 3072u) - 1536u);
+}
+
 void audio_channel_clear(int channel) {
     if (channel < 0 || channel >= kAudioChannels) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -742,7 +749,7 @@ bool audio_start() { g_started = true; return true; }
 void audio_stop() { g_started = false; }
 #else
 std::uint32_t audio_latency_trim_frames() { return 0u; }
-bool audio_start() { g_started = true; return false; }
+bool audio_start() { g_started = true; dump_open(); return g_dump != nullptr; }   // (no device: RR_AUDIO_DUMP still records each channel, test rig)
 void audio_stop() { g_started = false; }
 #endif
 

@@ -18,6 +18,8 @@
 #include "rr_present.hpp"
 #include "rr_pad.hpp"
 #include "rr_report.hpp"
+#include "rr_savedata.hpp"
+#include "rr_texhd.hpp"
 #include "rr_settings.hpp"
 #include "rr_raster.hpp"
 #include "rr_gl.hpp"
@@ -810,6 +812,7 @@ std::size_t g_replay_pos = 0;
 double g_ctrl_game60 = 0.0;   // controller reads counted in 59.94 Hz frames of game time
 extern std::uint64_t g_vblank_period_us, g_base_vblank_us;
 bool g_replay_active = false;
+std::uint64_t g_memdump_burst_from = 0;   // RR_MEMDUMP_NARR
 // Test-rig input ("RIG anchor kind a b buttons" lines, made by a script from a play log): button changes timed against anchors
 // so a recorded play-through still lines up when the race runs differently.  Anchors in order: 0 boot (a = read number),
 // each race start (first driver input record call after an init; a = record call count, b = reads after that count was
@@ -889,6 +892,7 @@ std::uint32_t effective_pad_buttons() {
                 while (std::getline(in, line)) {
                     unsigned b = 0; unsigned long long n = 0;
                     if (std::sscanf(line.c_str(), "wait %llu", &n) == 1) q.push_back({0u, n});
+                    else if (std::sscanf(line.c_str(), "auto %llu", &n) == 1) q.push_back({0xffffffffu, n});   // RR_AUTOPILOT drives for READS reads
                     else if (std::sscanf(line.c_str(), "%x %llu", &b, &n) == 2) { q.push_back({b, n}); q.push_back({0u, 6u}); }
                     off = in.tellg() < 0 ? off + static_cast<std::streamoff>(line.size() + 1) : static_cast<std::streamoff>(in.tellg());
                 }
@@ -899,7 +903,11 @@ std::uint32_t effective_pad_buttons() {
             log_line(category::kHle, "LIVEPAD " + hex32(cur) + " x" + std::to_string(left) + " at read " + std::to_string(g_ctrl_reads) +
                                          " frame " + std::to_string(g_frames_presented));
         }
-        if (left > 0u) { --left; return cur; }
+        if (left > 0u) {
+            --left;
+            if (cur == 0xffffffffu) { std::uint32_t ap = 0u; return autopilot_buttons(ap) ? ap : 0u; }
+            return cur;
+        }
         return 0u;
     }
     if (g_rig_active) {
@@ -1383,6 +1391,7 @@ void apply_live(const PlayerSettings &s) {
         e.sharpen = sharpen_levels[std::clamp(s.sharpen, 0, 3)];
         e.ui_crisp = crisp_levels[std::clamp(s.ui_crisp, 0, 2)];
         e.smooth_cutouts = s.smooth_cutouts;
+        // (car textures: not in the options yet; --car-textures on the command line sets them)
         g_gl->set_enhance(e);
         for (const std::string &line : g_gl->take_events()) log_line(category::kGe, line);
         g_hle_options.aniso = e.aniso; g_hle_options.sharpen = e.sharpen; g_hle_options.ui_crisp = e.ui_crisp; g_hle_options.smooth_cutouts = e.smooth_cutouts;
@@ -1475,6 +1484,19 @@ void frame(Runtime &r) {
         }
         if (page_open) options_ui_set_update(upd);
     }
+    {   // save export / import finished (its window ran on another thread)
+        rr::savedata::Result res;
+        if (rr::savedata::take_result(res)) {
+            if (!res.message.empty()) options_ui_toast(res.message);
+            if (res.restart) {
+                // The game holds its save in memory and would write the old progress back: restart now (or stop when it can't).
+                log_line(category::kHle, "SAVE import: restarting so the game loads the imported save");
+                if (page_open) { save(options_ui_settings()); options_ui_end(); page_open = false; }
+                if (!updater_start_restart()) r.stop("save imported: start the game again to load it");
+                else r.stop("restart to load the imported save");
+            }
+        }
+    }
     if (!page_open) return;
     LobbyInput in;
     present_take_typed(in.typed);
@@ -1509,6 +1531,23 @@ void frame(Runtime &r) {
     case OptionsRequest::BugReport: rr::report::make_bug_report_async("recomp options"); options_ui_toast("Making the bug report..."); break;
     case OptionsRequest::OpenIssues: rr::report::open_url(RR_URL_ISSUES); options_ui_toast("Opened the bug report page in your browser"); break;
     case OptionsRequest::OpenDiscord: rr::report::open_url(RR_URL_DISCORD); options_ui_toast("Opened the Discord invite in your browser"); break;
+    case OptionsRequest::ExportSave:
+        if (rr::savedata::busy()) break;
+        rr::savedata::export_async(); options_ui_toast("Choose where to save the copy...");
+        break;
+    case OptionsRequest::ImportSave:
+        if (rr::savedata::busy()) break;
+        rr::savedata::import_async(); options_ui_toast("Choose the save to import...");
+        break;
+    case OptionsRequest::OpenSaveFolder: {
+        std::error_code ec;
+        const std::filesystem::path dir = std::filesystem::absolute(rr::savedata::root(), ec);
+        std::filesystem::create_directories(dir, ec);
+        const std::u8string u = dir.u8string();
+        rr::report::open_url(std::string(u.begin(), u.end()).c_str());
+        options_ui_toast("Opened the save folder");
+        break;
+    }
     case OptionsRequest::OpenScreenshots: {
         std::error_code ec;
         const std::filesystem::path dir = std::filesystem::absolute(g_hle_options.shot_dir, ec);
@@ -2140,6 +2179,55 @@ bool is_hud_update(std::uint32_t a) { for (const std::uint32_t h : kHudUpdates) 
 // current cell's string.  RR_DRAW_CELLS=N (or --draw-distance N) draws what is visible from the N cells before and after
 // the current one too: the strings are merged (union) into a buffer of our own and the table entry points there for the call.
 constexpr std::uint32_t kPvsBuild = 0x088d95ecu;
+constexpr std::uint32_t kCourseSceneDraw = 0x088e9a60u;   // course scene behind the menu car display (see hook())
+constexpr std::uint32_t kSoundUpdate = 0x0890fe80u;    // sound manager per-step update (narrator sequencing, see hook())
+bool menu_sound_gate() {
+    static const bool off = std::getenv("RR_MENU_SOUND_GATE_OFF") != nullptr;
+    return !off && g_hle_options.fps_mult > 1.0 && fast_rate_active() && (scene_frame == 0u || g_frames_presented - scene_frame > 4u);
+}
+constexpr std::uint32_t kUnlockTeardown = 0x088e9a1cu;   // unlock screen teardown (see hook())
+constexpr std::uint32_t kStreamUpdate = 0x088d2aacu;   // course-object streaming update (see hook())
+// Course objects that come and go with the camera's course distance (MapManager items at scene+0x30A0: [+0x10] item pointers,
+// [+0x18] count; item +8 = window start, +0xC = window length in course-distance units, wrapping at the course length): the
+// streaming update 0x088D2AAC loads an item while (camera distance - start) mod length < window length.  RR_STREAM_AHEAD=N
+// (experiment) opens every window N units earlier, so objects ahead are in place before they come into view.
+int stream_ahead() {
+    static const int n = [] { const char *e = std::getenv("RR_STREAM_AHEAD"); return e ? std::max(0, std::atoi(e)) : 0; }();
+    return n;
+}
+void widen_stream_windows(std::uint32_t mgr, int ahead) {
+    auto &m = rt->memory();
+    const auto okp = [](std::uint32_t a) { return a >= 0x08800000u && a < 0x0a000000u; };
+    if (!okp(mgr)) return;
+    static std::uint32_t len_addr = 0u;
+    if (len_addr == 0u) {   // the course length global (lui/lw at 0x088D2AF4 / 0x088D2AF8, relocated in memory)
+        const std::uint32_t lui = m.load32(0x088d2af4u), lw = m.load32(0x088d2af8u);
+        if ((lui >> 26) != 0x0fu || (lw >> 26) != 0x23u) return;
+        len_addr = ((lui & 0xffffu) << 16) + static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(lw & 0xffffu)));
+        log_line(category::kHle, "STREAMAHEAD course length word at " + hex32(len_addr));
+    }
+    const std::int32_t course_len = static_cast<std::int32_t>(m.load32(len_addr));
+    const std::uint32_t count = m.load32(mgr + 0x18u), items = m.load32(mgr + 0x10u);
+    if (course_len <= 0 || count == 0u || count > 4096u || !okp(items)) return;
+    static std::unordered_map<std::uint32_t, std::pair<std::int32_t, std::int32_t>> done;   // item -> (start, len) as we left it
+    int changed = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t it = m.load32(items + i * 4u);
+        if (!okp(it)) continue;
+        const std::int32_t start = static_cast<std::int32_t>(m.load32(it + 8u)), len = static_cast<std::int32_t>(m.load32(it + 12u));
+        auto f = done.find(it);
+        if (f != done.end() && f->second.first == start && f->second.second == len) continue;   // already ours
+        if (len <= 0 || len >= course_len) { done[it] = {start, len}; continue; }               // whole lap (or empty): leave it
+        const std::int32_t add = std::min<std::int32_t>(ahead, course_len - 1 - len);
+        std::int32_t ns = start - add;
+        if (ns < 0) ns += course_len;
+        m.store32(it + 8u, static_cast<std::uint32_t>(ns));
+        m.store32(it + 12u, static_cast<std::uint32_t>(len + add));
+        done[it] = {ns, len + add};
+        ++changed;
+    }
+    if (changed > 0) log_line(category::kHle, "STREAMAHEAD opened " + std::to_string(changed) + " windows " + std::to_string(ahead) + " units earlier (course length " + std::to_string(course_len) + ", frame " + std::to_string(g_frames_presented) + ")");
+}
 int cull_mode() { static const int n = std::getenv("RR_NOCULL") ? std::atoi(std::getenv("RR_NOCULL")) : 0; return n; }
 int draw_cells() {
     static const int n = [] {
@@ -2222,6 +2310,12 @@ void pvs_hook(psprecomp::AllegrexContext &ctx) {
         }
     }
     if (cells <= 0) return;
+    // Only while a race (or its intro / replay) is on screen.  The other 3D scenes (post-race and unlock screens, showcases)
+    // share this builder but may not have every object of the neighbouring cells loaded: merging their lists made the scene
+    // draw 0x088D2AAC read through a null pointer (beta 1.2 crash after the first World Tours unlock, draw distance 8).
+    // RR_DRAWDIST_ANYWHERE=1 restores the old behaviour.
+    static const bool anywhere = std::getenv("RR_DRAWDIST_ANYWHERE") != nullptr;
+    if (!anywhere && (scene_frame == 0u || g_frames_presented - scene_frame > 4u)) return;
     std::vector<std::vector<std::uint8_t>> vis(static_cast<std::size_t>(groups));
     if (!parse(m.load32(table + static_cast<std::uint32_t>(cell) * 4u), vis)) return;
     for (std::int32_t c = cell - cells; c <= cell + cells; ++c) {
@@ -2232,6 +2326,11 @@ void pvs_hook(psprecomp::AllegrexContext &ctx) {
             if (vis[gi].size() < extra[gi].size()) vis[gi].resize(extra[gi].size(), 0u);
             for (std::size_t k = 0; k < extra[gi].size(); ++k) vis[gi][k] |= extra[gi][k];
         }
+    }
+    {   // the builder writes one halfword per object into a fixed buffer (scene + 0x14 .. + 0xFC4, ~2000 entries) without a bound
+        // check, so a merged list must stay well below that
+        std::size_t total = 0; for (const auto &g : vis) for (auto b : g) total += b;
+        if (total + static_cast<std::size_t>(groups) * 6u > 1600u) return;
     }
     std::vector<std::uint8_t> out;
     for (const auto &v : vis) {
@@ -2260,6 +2359,17 @@ void pvs_hook(psprecomp::AllegrexContext &ctx) {
     patched_at = table + static_cast<std::uint32_t>(cell) * 4u;
     patched_old = m.load32(patched_at);
     m.store32(patched_at, buf);
+    if (std::getenv("RR_PVS_STAT") != nullptr) {   // test rig: how many objects the merged list holds (the builder's output has no bound)
+        static std::size_t max_n = 0, max_own = 0; static std::uint64_t calls = 0;
+        std::size_t n = 0; for (const auto &g : vis) for (auto b : g) n += b;
+        std::vector<std::vector<std::uint8_t>> own(static_cast<std::size_t>(groups));
+        std::size_t n_own = 0;
+        if (parse(patched_old, own)) for (const auto &g : own) for (auto b : g) n_own += b;
+        max_n = std::max(max_n, n); max_own = std::max(max_own, n_own);
+        if ((++calls % 600u) == 0u || n > 1500u)
+            log_line(category::kHle, "PVSSTAT frame=" + std::to_string(g_frames_presented) + " scene=" + hex32(ctx.gpr[4]) + " cell=" + std::to_string(cell) + " groups=" + std::to_string(groups) +
+                                         " merged=" + std::to_string(n) + " own=" + std::to_string(n_own) + " max_merged=" + std::to_string(max_n) + " max_own=" + std::to_string(max_own));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -2408,7 +2518,11 @@ void turntable(Runtime &rt, psprecomp::AllegrexContext &ctx) {
     const std::uint32_t cur = rt.memory().load32(a);
     if (a == at && gates::fast_rate_active() && std::getenv("RR_TURNTABLE_OFF") == nullptr) {
         const float p = std::bit_cast<float>(prev), c = std::bit_cast<float>(cur);
-        if (c == p + 1.0f) {
+        // On the unlock screen (same function) this word is a frame timer: Cross tears the course down and sets it to -6, and
+        // the screen only leaves when it equals -3.0 exactly (c.eq.s at 0x08874B74).  Cut steps never hit -3.0, so the screen
+        // stayed up on released course data and the next Cross tore it down a second time (MapManager::Delete assert, then the
+        // beta 1.2 crash after the first World Tours unlock).  Negative values are counted in whole steps.
+        if (c == p + 1.0f && p >= 0.0f) {
             const float n = p + static_cast<float>(1.0 / g_hle_options.fps_mult);
             rt.memory().store32(a, std::bit_cast<std::uint32_t>(n));
             prev = std::bit_cast<std::uint32_t>(n);
@@ -2577,6 +2691,120 @@ bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
     if (address == ui::kMenuMgr && ui::active()) ui::menu_mgr(*rt, ctx);
     if (address == recomp::kStrLookup) { recomp::on_lookup(*rt, ctx); return false; }
     if (address == kPvsBuild) { pvs_hook(ctx); return false; }
+    if (address == kSoundUpdate && menu_sound_gate()) {
+        // The sound manager's per-step update 0x0890FE80 (called once per game step from 0x08820648) also sequences the
+        // narrator's multi-part lines (machine select: "ORDYNE" / "BAYONET" / "TYPE R") with step counters made for 60 steps a
+        // second.  In the menus at the raised rate it ran every step, so each part was keyed off and replaced after 1/mult of its
+        // length: the car names were cut off.  Outside races it now runs on the 60 Hz ticks only.  RR_MENU_SOUND_GATE_OFF=1.
+        if (!menu_tick(game_step())) { ctx.gpr[2] = 0u; return true; }
+        return false;
+    }
+    if ((address == 0x088055acu || address == 0x08805570u || address == 0x08806edcu) && std::getenv("RR_IO_LOG") != nullptr) {
+        // RR_IO_LOG=1 (research): the game's seek / read wrappers and its decompressor (state: [+0] input end, [+4] input, [+0xC] output)
+        auto &m = rt->memory();
+        char b[200];
+        if (address == 0x088055acu) std::snprintf(b, sizeof b, "IOSEEK fd=%d off=%u frame=%llu", static_cast<int>(ctx.gpr[4]), ctx.gpr[5], static_cast<unsigned long long>(g_frames_presented));
+        else if (address == 0x08805570u) std::snprintf(b, sizeof b, "IOREAD fd=%d buf=%08X size=%u frame=%llu", static_cast<int>(ctx.gpr[4]), ctx.gpr[5], ctx.gpr[6], static_cast<unsigned long long>(g_frames_presented));
+        else std::snprintf(b, sizeof b, "DECOMP state=%08X in=%08X..%08X out=%08X a1=%08X ra=%08X frame=%llu", ctx.gpr[4], m.load32(ctx.gpr[4] + 4u), m.load32(ctx.gpr[4]), m.load32(ctx.gpr[4] + 12u), ctx.gpr[5], ctx.gpr[31], static_cast<unsigned long long>(g_frames_presented));
+        log_line(category::kHle, b);
+    }
+    if (address == kUnlockTeardown) {
+        // 0x088E9A1C: the unlock screen's teardown (MapManager::Delete of the course scene, then frees).  It must run once; a
+        // second call finds MapManager::m_isValid == 0 (the game prints "MapManager::Allocate  m_isValid == 1  in Delete" and
+        // carries on) and frees everything again.  Skip it when the course scene is already deleted.  RR_STREAM_GUARD_OFF=1.
+        static const bool off = std::getenv("RR_STREAM_GUARD_OFF") != nullptr;
+        auto &m = rt->memory();
+        const std::uint32_t lui = m.load32(0x088e9a28u), addiu = m.load32(0x088e9a34u);
+        if (!off && (lui >> 26) == 0x0fu && (addiu >> 26) == 0x09u) {
+            const std::uint32_t mm = ((lui & 0xffffu) << 16) + static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(addiu & 0xffffu)));
+            if (mm >= 0x08800000u && mm < 0x0a000000u && m.load8(mm + 0x32c8u) == 0u) {
+                static int logged = 0;
+                if (logged++ < 20) log_line(category::kHle, "TEARDOWNGUARD skipped a second unlock-screen teardown 0x088E9A1C at frame " + std::to_string(g_frames_presented) + " (MapManager " + hex32(mm) + " already deleted)");
+                return true;
+            }
+        }
+        return false;
+    }
+    if (address == kCourseSceneDraw) {
+        // The course scene drawn behind the menus' car display (0x088E9A60, called from the machine select / unlock screen
+        // 0x088742CC).  After the first World Tours unlock (beta 1.2 at 144 fps, smooth menus) the course data was already
+        // released (streaming manager 0x08A438C0: items counted but its loaded-item bitset gone) when this screen drew the course
+        // once more, and drawing it read freed memory (crashes at 0x088D2AAC, then 0x088D9CF0).  Skip the draw in that state.
+        // RR_STREAM_GUARD_OFF=1 disables it.
+        static const bool off = std::getenv("RR_STREAM_GUARD_OFF") != nullptr;
+        if (!off) {
+            auto &m = rt->memory();
+            constexpr std::uint32_t kMgr = 0x08a438c0u;   // course scene 0x08A40820 + 0x30A0 (static data)
+            const std::uint32_t count = m.load32(kMgr + 0x18u), bits = m.load32(kMgr + 0x20u), items = m.load32(kMgr + 0x10u);
+            const auto ok = [](std::uint32_t a) { return a >= 0x08800000u && a < 0x0a000000u; };
+            if (!ok(bits) || (count != 0u && !ok(items))) {
+                static int logged = 0;
+                if (logged++ < 20) log_line(category::kHle, "SCENEGUARD skipped the course scene draw 0x088E9A60 at frame " + std::to_string(g_frames_presented) +
+                                                                 " (course data released: count=" + std::to_string(count) + " bits=" + hex32(bits) + " items=" + hex32(items) + ")");
+                return true;
+            }
+        }
+        return false;
+    }
+    if (address == kStreamUpdate) {
+        if (const int ahead = stream_ahead(); ahead > 0) widen_stream_windows(ctx.gpr[4], ahead);
+        if (static const char *sl = std::getenv("RR_STREAM_LOG"); sl != nullptr) {
+            // RR_STREAM_LOG=every (research): the streaming manager's items (course-distance window start/length, flags, loaded bit)
+            // and the camera's course distance, every N presented frames (items in full the first 3 times).
+            static const std::uint64_t every = std::max<std::uint64_t>(1u, std::strtoull(sl, nullptr, 0));
+            static std::uint64_t last = 0; static int full = 0;
+            auto &m = rt->memory();
+            const std::uint32_t mgr = ctx.gpr[4], tgt = ctx.gpr[5];
+            const auto okp = [](std::uint32_t a) { return a >= 0x08800000u && a < 0x0a000000u; };
+            if (okp(mgr) && okp(tgt) && g_frames_presented - last >= every) {
+                last = g_frames_presented;
+                const std::uint32_t count = m.load32(mgr + 0x18u), bits = m.load32(mgr + 0x20u), items = m.load32(mgr + 0x10u);
+                const float camd = std::bit_cast<float>(m.load32(tgt + 0x2c0u));
+                std::string t = "STREAM frame=" + std::to_string(g_frames_presented) + " mgr=" + hex32(mgr) + " count=" + std::to_string(count) + " cam=" + std::to_string(static_cast<int>(camd)) +
+                                " ra=" + hex32(ctx.gpr[31]) + " loaded:";
+                int nl = 0;
+                if (okp(bits) && okp(items) && count < 4096u) {
+                    for (std::uint32_t i = 0; i < count; ++i) if ((m.load32(bits + (i >> 5) * 4u) >> (i & 31u)) & 1u) { ++nl; if (nl <= 40) t += " " + std::to_string(i); }
+                    t += " (" + std::to_string(nl) + ")";
+                    log_line(category::kHle, t);
+                    if (full < 3) {
+                        ++full;
+                        for (std::uint32_t i = 0; i < count; ++i) {
+                            const std::uint32_t it = m.load32(items + i * 4u);
+                            if (!okp(it)) continue;
+                            char b[200];
+                            std::snprintf(b, sizeof b, "STREAMITEM %u at %08X w0=%08X flags=%08X start=%d len=%d w4=%08X w5=%08X w6=%08X w7=%08X", i, it, m.load32(it), m.load32(it + 4u),
+                                          static_cast<int>(m.load32(it + 8u)), static_cast<int>(m.load32(it + 12u)), m.load32(it + 16u), m.load32(it + 20u), m.load32(it + 24u), m.load32(it + 28u));
+                            log_line(category::kHle, b);
+                        }
+                    }
+                }
+            }
+        }
+        // Course-object streaming update 0x088D2AAC(mgr = scene + 0x30A0, target, ...): after the first World Tours unlock
+        // (beta 1.2, two crashes on Ian's PC) it ran with items to handle ([mgr+0x18] != 0) but no loaded-item bitset
+        // ([mgr+0x20] == 0) and read address 0.  Skip the update in that state instead of crashing; the next call with a
+        // set-up manager runs normally.  RR_STREAM_GUARD_OFF=1 disables the guard.
+        static const bool off = std::getenv("RR_STREAM_GUARD_OFF") != nullptr;
+        auto &m = rt->memory();
+        const std::uint32_t mgr = ctx.gpr[4];
+        const auto ok = [](std::uint32_t a) { return a >= 0x08800000u && a < 0x0a000000u; };
+        if (!off && ok(mgr)) {
+            const std::uint32_t count = m.load32(mgr + 0x18u), bits = m.load32(mgr + 0x20u), items = m.load32(mgr + 0x10u);
+            if (count != 0u && (!ok(bits) || !ok(items) || !ok(ctx.gpr[5]))) {
+                static int logged = 0;
+                if (logged++ < 20) {
+                    std::string w;
+                    for (std::uint32_t o = 0u; o < 0x40u; o += 4u) w += " " + hex32(m.load32(mgr + o));
+                    log_line(category::kHle, "STREAMGUARD skipped 0x088D2AAC at frame " + std::to_string(g_frames_presented) + " mgr=" + hex32(mgr) +
+                                                 " target=" + hex32(ctx.gpr[5]) + " ra=" + hex32(ctx.gpr[31]) + " words:" + w);
+                }
+                ctx.gpr[2] = 0u;
+                return true;
+            }
+        }
+        return false;
+    }
     if ((address == 0x088d08c8u || address == 0x088d0940u || address == 0x088d09b8u) && cull_mode() != 0) {
         // RR_NOCULL=n (experiment): bit 1 = 0x088D08C8, 2 = 0x088D0940, 4 = 0x088D09B8 always report "visible"
         const int bit = address == 0x088d08c8u ? 1 : address == 0x088d0940u ? 2 : 4;
@@ -3849,6 +4077,11 @@ void refresh_table() {
     table[(kCtrlUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kInfoWinUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kPvsBuild - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    table[(kStreamUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    table[(kCourseSceneDraw - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    table[(kUnlockTeardown - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    if (std::getenv("RR_IO_LOG") != nullptr) for (const std::uint32_t a : {0x088055acu, 0x08805570u, 0x08806edcu}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    table[(kSoundUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     if (std::getenv("RR_NOCULL") != nullptr) for (const std::uint32_t a : {0x088d08c8u, 0x088d0940u, 0x088d09b8u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kDriverInputInit - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     for (const std::uint32_t a : kHudUpdates) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
@@ -4720,6 +4953,13 @@ void present_display_frame(Runtime &rt) {
         if (last_vol >= 0.0f && (std::fabs(v - last_vol) > 0.001f || m != last_mute))
             overlay::toast(m ? std::string("Sound muted") : "Volume " + std::to_string(static_cast<int>(v * 100.0f + 0.5f)) + "%", 1.5);
         last_vol = v; last_mute = m;
+    }
+    if (g_memdump_burst_from != 0u && g_frames_presented >= g_memdump_burst_from && g_frames_presented < g_memdump_burst_from + 6u) {
+        std::vector<std::uint8_t> buf(0x01800000u);
+        for (std::uint32_t i = 0; i < buf.size(); ++i) buf[i] = rt.memory().load8(0x08800000u + i);
+        const std::string out = std::string(std::getenv("RR_MEMDUMP_NARR")) + "_" + std::to_string(g_frames_presented) + "_s" + std::to_string(gates::game_step()) + ".bin";
+        if (FILE *fp = std::fopen(out.c_str(), "wb")) { std::fwrite(buf.data(), 1, buf.size(), fp); std::fclose(fp); }
+        log_line(category::kHle, "MEMDUMP " + out);
     }
     {   // RR_MEMDUMP="frame,frame,...:path" (research): main RAM 0x08800000-0x0A000000 to path_<frame>.bin at those frames
         static const char *md = std::getenv("RR_MEMDUMP");
@@ -6292,7 +6532,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 log_line(category::kBoot, "GPU renderer active, internal scale " + std::to_string(gl->scale()) + "x");
                 GlBackend::Enhance enhance;
                 g_aa_mode = g_hle_options.aa_mode; enhance.msaa = g_hle_options.msaa; enhance.sharpen = g_hle_options.sharpen;
-                enhance.mipmaps = g_hle_options.mipmaps; enhance.aniso = g_hle_options.aniso; enhance.ui_crisp = g_hle_options.ui_crisp; enhance.smooth_cutouts = g_hle_options.smooth_cutouts;
+                enhance.mipmaps = g_hle_options.mipmaps; enhance.aniso = g_hle_options.aniso; enhance.ui_crisp = g_hle_options.ui_crisp; enhance.smooth_cutouts = g_hle_options.smooth_cutouts; enhance.tex_sharp = g_hle_options.tex_sharp;
                 gl->set_enhance(enhance);
                 g_alpha_cutoff = g_hle_options.alpha_cutoff;
                 for (const std::string &line : gl->take_events()) log_line(category::kBoot, line);
@@ -8545,7 +8785,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         static AudioChannel channels[8];
         // Sends `samples` frames at `buffer` to the mixer (lazily opening the device; only with a window and not RR_NO_AUDIO).
         const auto audio_play = [](Runtime &rt, std::uint32_t channel, std::uint32_t buffer, std::uint32_t vol_l, std::uint32_t vol_r) {
-            static const bool enabled = g_hle_options.window && std::getenv("RR_NO_AUDIO") == nullptr;
+            static const bool enabled = (g_hle_options.window || std::getenv("RR_AUDIO_DUMP") != nullptr) && std::getenv("RR_NO_AUDIO") == nullptr;
             if (!enabled || channel >= 8u || buffer == 0u) return;
             static const bool started = (audio_set_master_volume(g_hle_options.volume), audio_set_menu_gain(g_hle_options.menu_volume),
                                          audio_set_time_stretch(g_hle_options.frame_skip != 0), audio_start());
@@ -8614,6 +8854,16 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             }
             audio_channel_push(static_cast<int>(channel), pcm.data(), frames, stereo, static_cast<int>(std::min<std::uint32_t>(vol_l, 0x8000u)),
                                static_cast<int>(std::min<std::uint32_t>(vol_r, 0x8000u)));
+            // Back-pressure in the menus: there the game's clock can run ahead of real time for a while (catch-up after slow
+            // frames at a raised frame rate), so it hands over sound faster than it is played.  The mixer used to cut the
+            // backlog down (trim), which chopped the narrator's car names.  Instead the game waits here until the device has
+            // played enough.  Races keep their own pacing.  RR_AUDIO_BACKPRESSURE_OFF=1 disables it.
+            static const bool backpressure = std::getenv("RR_AUDIO_BACKPRESSURE_OFF") == nullptr;
+            if (backpressure && !movie && g_hle_options.window && (gates::scene_frame == 0u || g_frames_presented - gates::scene_frame > 4u)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                while (audio_channel_queued(static_cast<int>(channel)) > audio_channel_soft_limit(static_cast<int>(channel)) && std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(40))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         };
         const auto audio_block = [](Runtime &rt, AllegrexContext &ctx, std::uint32_t channel) {
             const std::uint32_t samples = channel < 8u ? channels[channel].samples : 1024u;
@@ -9431,6 +9681,10 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         static const bool se_log = std::getenv("RR_SE_LOG") != nullptr;
         psprecomp::set_sas_keyon_observer([](int voice, const psprecomp::SasVoiceState &v) {
             if (se_runtime != nullptr) menu_sound_on_keyon(g_frames_presented, se_runtime->memory(), v);
+            {   // RR_MEMDUMP_NARR=path (research): at the first narrator voice (pitch 0x4EF), dump main RAM on the next 6 frames
+                static bool armed = std::getenv("RR_MEMDUMP_NARR") != nullptr;
+                if (armed && v.pitch == 0x4EF) { armed = false; g_memdump_burst_from = g_frames_presented + 1u; }
+            }
             static const bool aud_log = std::getenv("RR_AUDIOLOG") != nullptr;
             if (aud_log) {
                 // One line per sound the game starts.  Compare runs with tools/audiocmp.py.
@@ -9476,6 +9730,15 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                         std::snprintf(a, sizeof a, "AUDEV s=%u f=%llu %s v=%d val=%d ra=%08X", gates::game_step(),
                                       static_cast<unsigned long long>(g_frames_presented), name, voice, value, psprecomp::sas_last_call_ra());
                         log_line(category::kHle, a);
+                        if (std::getenv("RR_AUDIOLOG_STACK") != nullptr && n == "keyoff") {   // game code on the stack (who keyed the voice off)
+                            const std::uint32_t sp = psprecomp::runtime_watch_register(29);
+                            std::string chain = "AUDSTACK";
+                            for (std::uint32_t o = 0u; o < 0x200u; o += 4u) {
+                                const std::uint32_t w = gates::rt->memory().load32(sp + o);
+                                if (w >= 0x08804000u && w < 0x089A0000u && (w & 3u) == 0u) chain += " " + hex32(w);
+                            }
+                            log_line(category::kHle, chain);
+                        }
                     }
                     // Every 2 s of game time: which voices are sounding right now.
                     static unsigned last_dump = 0;
@@ -9521,6 +9784,30 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     install_utility_hle(runtime);
     utility_set_interactive(g_hle_options.window && !g_replay_active);
 
+    // A null-pointer access in game code (address below 0x10000) reads 0 / is dropped, as on PPSSPP, instead of stopping
+    // the game (beta 1.2: crash after the first World Tours unlock, read of 0x00000000 in the post-race scene draw).
+    // Logged (first 40) so it can still be found.  RR_NULL_STRICT=1 restores the stop.
+    psprecomp::set_null_access_tolerant(std::getenv("RR_NULL_STRICT") == nullptr);
+    psprecomp::set_null_access_sink([](std::uint32_t address, bool write) {
+        static int logged = 0;
+        if (logged >= 40) return;
+        ++logged;
+        log_line(category::kHle, std::string("NULLACCESS ") + (write ? "write" : "read") + " at " + hex32(address) + " pc=" + hex32(psprecomp::runtime_dispatch_pc()) +
+                                     " ra=" + hex32(psprecomp::runtime_watch_register(31)) + " frame " + std::to_string(g_frames_presented));
+    });
+
+    // A null-pointer access in game code (address below 0x10000) reads 0 / is dropped, as on PPSSPP, instead of stopping
+    // the game (beta 1.2: crash after the first World Tours unlock, read of 0x00000000 in the post-race scene draw).
+    // Logged (first 40) so it can still be found.  RR_NULL_STRICT=1 restores the stop.
+    psprecomp::set_null_access_tolerant(std::getenv("RR_NULL_STRICT") == nullptr);
+    psprecomp::set_null_access_sink([](std::uint32_t address, bool write) {
+        static int logged = 0;
+        if (logged >= 40) return;
+        ++logged;
+        log_line(category::kHle, std::string("NULLACCESS ") + (write ? "write" : "read") + " at " + hex32(address) + " pc=" + hex32(psprecomp::runtime_dispatch_pc()) +
+                                     " ra=" + hex32(psprecomp::runtime_watch_register(31)) + " frame " + std::to_string(g_frames_presented));
+    });
+
     // Save data folder: PSPRECOMP_RIDGERACER_SAVEDATA if set; otherwise a "savedata" folder next to the executable.
     // With --dev the old location (SAVEDATA two folders above the game files) is still used when it exists, so
     // developer setups keep their existing saves.
@@ -9541,6 +9828,9 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         std::filesystem::create_directories(save_root_path, mkdir_ec);
     }
     hle_line("savedata folder: " + save_root_path.string());
+    rr::savedata::set_root(save_root_path);
+    // HD car textures (not in the options yet: --car-textures hd only): read the cars' showroom textures from the disc
+    if (g_hle_options.tex_sharp == 3) rr::texhd::preload_disc(runtime.game_root() / "PSP_GAME" / "USRDIR" / "Data" / "RRP.DAT");
     psprecomp::install_savedata_hle(runtime,
         save_root_path,
         [&runtime](std::uint32_t parameter, std::uint32_t result) {

@@ -31,7 +31,7 @@ const Rgb kRedTop = rgb(236, 28, 36), kRedBot = rgb(190, 0, 10);
 const int kFpsValues[] = {0, 60, 90, 120, 144, 165, 180, 240};
 
 enum class Kind { Choice, Toggle, Slider, Action };
-enum class Act { None, Update, BugReport, Issues, Discord, Screenshots };
+enum class Act { None, Update, BugReport, Issues, Discord, Screenshots, ExportSave, ImportSave, SaveFolder };
 
 struct Row {
     const char *label;
@@ -51,7 +51,7 @@ struct Category {
     std::vector<Row> rows;
 };
 
-enum class Modal { None, Restart, ConfirmUpdate };
+enum class Modal { None, Restart, ConfirmUpdate, DrawDistance };
 
 struct State {
     bool active{false};
@@ -64,6 +64,7 @@ struct State {
     int hover_cat{-1}, hover_row{-1};
     Modal modal{Modal::None};
     int modal_btn{0};
+    int pending_dd{0};   // (draw distance waiting for the warning to be accepted)
     bool armed{false};
     std::uint32_t prev_pad{0};
     ui::NavRepeat repeat;
@@ -127,10 +128,11 @@ std::vector<Category> build(const OptionsContext &ctx) {
                           [](const PlayerSettings &s) { return std::clamp(s.sharpen, 0, 3); }, [](PlayerSettings &s, int v) { s.sharpen = v; }, false});
         q.rows.push_back({"HUD and text", "How the game's menus, text and HUD are enlarged.", Kind::Choice, {"Original (soft)", "Sharper", "Crispest"},
                           [](const PlayerSettings &s) { return std::clamp(s.ui_crisp, 0, 2); }, [](PlayerSettings &s, int v) { s.ui_crisp = v; }, false});
-        q.rows.push_back({"Draw distance", "Draws scenery further down the track (less pop-in). Further costs some speed.", Kind::Choice,
+        q.rows.push_back({"Draw distance", "EXPERIMENTAL: draws scenery further down the track, but some scenery may be drawn wrong. Further costs some speed.", Kind::Choice,
                           {"Original", "Far", "Farther", "Very far", "Farthest"},
                           [](const PlayerSettings &s) { return std::clamp((s.draw_distance + 1) / 2, 0, 4); },
                           [](PlayerSettings &s, int v) { s.draw_distance = std::clamp(v, 0, 4) * 2; }, true});
+        // (Car textures: Original / Sharp / Pixel / HD - work in progress, hidden for now: --car-textures on the command line)
         q.rows.push_back({"Smooth cut-out edges", "Smooths the edges of trees, fences and other cut-out art.", Kind::Toggle, {},
                           [](const PlayerSettings &s) { return s.smooth_cutouts ? 1 : 0; }, [](PlayerSettings &s, int v) { s.smooth_cutouts = v != 0; }, false});
         c.push_back(std::move(q));
@@ -171,6 +173,19 @@ std::vector<Category> build(const OptionsContext &ctx) {
         shots.act = Act::Screenshots;
         o.rows.push_back(shots);
         c.push_back(std::move(o));
+    }
+    {
+        Category sv{"SAVE DATA", "Back up your progress, move it to another PC or bring it over from another copy.", {}};
+        Row ex{"Export save", "Saves a copy of your progress to a file you choose (a backup, or to take to another PC).", Kind::Action, {}, {}, {}, false};
+        ex.act = Act::ExportSave;
+        sv.rows.push_back(ex);
+        Row im{"Import save", "Loads progress from an exported save or from DATA.BIN in another copy's savedata folder. Your current save is backed up first, then the game restarts.", Kind::Action, {}, {}, {}, false};
+        im.act = Act::ImportSave;
+        sv.rows.push_back(im);
+        Row fo{"Save folder", "Opens the folder that holds your save and its backups (savedata next to the game). Updates never touch it.", Kind::Action, {}, {}, {}, false};
+        fo.act = Act::SaveFolder;
+        sv.rows.push_back(fo);
+        c.push_back(std::move(sv));
     }
     {
         Category h{"UPDATES & HELP", "New versions, bug reports and the community.", {}};
@@ -216,6 +231,9 @@ std::string action_value(const Row &r) {
     case Act::Issues: return "Open page";
     case Act::Discord: return "Open invite";
     case Act::Screenshots: return "Open";
+    case Act::ExportSave: return "Save...";
+    case Act::ImportSave: return "Choose...";
+    case Act::SaveFolder: return "Open";
     default: return {};
     }
 }
@@ -235,12 +253,22 @@ void changed(const Row &r) {
     g.events |= kOskMove;
 }
 
+bool is_draw_distance(const Row &r) { return std::string(r.label) == "Draw distance"; }
+
 void step_value(Row &r, int dir) {
     switch (r.kind) {
     case Kind::Choice: {
         const int n = static_cast<int>(r.choices.size());
         if (n <= 1) return;
-        r.set(g.s, (r.get(g.s) + dir + n) % n);
+        const int v = (r.get(g.s) + dir + n) % n;
+        if (is_draw_distance(r) && v != 0 && !g.s.draw_distance_ack) {
+            // experimental: say so first (once; accepting is remembered in ridgeracer.ini)
+            PlayerSettings t = g.s; r.set(t, v); g.pending_dd = t.draw_distance;
+            g.modal = Modal::DrawDistance; g.modal_btn = 1;
+            g.events |= kOskMove;
+            return;
+        }
+        r.set(g.s, v);
         changed(r);
         break;
     }
@@ -268,6 +296,9 @@ void activate_row(Row &r) {
     case Act::Issues: g.out = OptionsRequest::OpenIssues; break;
     case Act::Discord: g.out = OptionsRequest::OpenDiscord; break;
     case Act::Screenshots: g.out = OptionsRequest::OpenScreenshots; break;
+    case Act::ExportSave: g.out = OptionsRequest::ExportSave; break;
+    case Act::ImportSave: g.out = OptionsRequest::ImportSave; break;
+    case Act::SaveFolder: g.out = OptionsRequest::OpenSaveFolder; break;
     default: break;
     }
 }
@@ -281,7 +312,7 @@ void try_close() {
 
 int modal_buttons() {
     if (g.modal == Modal::Restart) return g.ctx.can_restart ? 2 : 1;
-    if (g.modal == Modal::ConfirmUpdate) return 2;
+    if (g.modal == Modal::ConfirmUpdate || g.modal == Modal::DrawDistance) return 2;
     return 0;
 }
 void modal_press(int b) {
@@ -293,11 +324,15 @@ void modal_press(int b) {
         g.modal = Modal::None;
         if (b == 0) g.out = OptionsRequest::Update;
         g.events |= b == 0 ? kOskAccept : kOskCancel;
+    } else if (g.modal == Modal::DrawDistance) {
+        g.modal = Modal::None;
+        if (b == 0) { g.s.draw_distance = g.pending_dd; g.s.draw_distance_ack = true; g.events |= kOskAccept; }
+        else g.events |= kOskCancel;
     }
 }
 void modal_cancel() {
     if (g.modal == Modal::Restart) { g.modal = Modal::None; g.events |= kOskCancel; }   // (stay on the page)
-    else if (g.modal == Modal::ConfirmUpdate) modal_press(1);
+    else if (g.modal == Modal::ConfirmUpdate || g.modal == Modal::DrawDistance) modal_press(1);
 }
 
 // ---- layout (480x272 units) ----
@@ -511,6 +546,7 @@ void render_page(const Canvas &cv) {
     std::string help;
     if (g.modal == Modal::Restart) help = "Restarting now applies every change.";
     else if (g.modal == Modal::ConfirmUpdate) help = "The update comes from the project's GitHub page and is checked against its published SHA-256 hash.";
+    else if (g.modal == Modal::DrawDistance) help = "Original is the game's own draw distance. You can set it back at any time.";
     else if (on_back()) help = "Return to the Options screen.";
     else if (g.in_rows && !rows().empty()) {
         const Row &r = rows()[static_cast<std::size_t>(std::clamp(g.row, 0, static_cast<int>(rows().size()) - 1))];
@@ -543,12 +579,15 @@ void render_page(const Canvas &cv) {
         cv.solid(kMx + 2.0f, kMy + 3.0f, kMw, kMh, 8.0f, rgb(0, 0, 0), 0.25f);
         cv.vgrad(kMx, kMy, kMw, kMh, 8.0f, rgb(250, 250, 252), rgb(226, 226, 230));
         cv.solid(kMx, kMy, kMw, 3.0f, 1.5f, kRedTop);
-        const char *title = g.modal == Modal::Restart ? "RESTART NEEDED" : "INSTALL UPDATE";
+        const char *title = g.modal == Modal::Restart ? "RESTART NEEDED" : g.modal == Modal::DrawDistance ? "EXPERIMENTAL SETTING" : "INSTALL UPDATE";
         cv.text(kMx + 14.0f, kMy + 22.0f, title, 12.0f, kInk);
         std::string l1, l2;
         if (g.modal == Modal::Restart) {
             l1 = "Some changes take effect after the game restarts.";
             l2 = g.ctx.can_restart ? "Your settings are saved either way." : "Please restart the game to apply them.";
+        } else if (g.modal == Modal::DrawDistance) {
+            l1 = "A higher draw distance is experimental and has bugs:";
+            l2 = "some scenery may be drawn wrong or in the wrong place.";
         } else {
             l1 = "Download and install " + g.upd.tag + " now?";
             l2 = "The game restarts afterwards. Saves and settings stay.";
@@ -559,7 +598,7 @@ void render_page(const Canvas &cv) {
         for (int i = 0; i < n; ++i) {
             float x, y, w, h;
             modal_button_rect(i, n, x, y, w, h);
-            const char *lab = g.modal == Modal::Restart ? (n == 1 ? "OK" : (i == 0 ? "RESTART NOW" : "LATER")) : (i == 0 ? "UPDATE" : "CANCEL");
+            const char *lab = g.modal == Modal::Restart ? (n == 1 ? "OK" : (i == 0 ? "RESTART NOW" : "LATER")) : g.modal == Modal::DrawDistance ? (i == 0 ? "TURN ON" : "CANCEL") : (i == 0 ? "UPDATE" : "CANCEL");
             if (i == g.modal_btn) red_pill(cv, x, y, w, h);
             else cv.vgrad(x, y, w, h, h * 0.5f, rgb(102, 102, 106), rgb(60, 60, 64));
             cv.text_centered(x + w * 0.5f, y + 15.0f, lab, 11.0f, kWhite);

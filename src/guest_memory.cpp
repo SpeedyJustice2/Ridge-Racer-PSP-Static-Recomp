@@ -112,6 +112,17 @@ void log_read_watch(std::uint32_t address, std::size_t length, std::uint64_t val
 }
 
 void set_watch_sink(WatchSink sink) noexcept { g_watch_sink = sink; }
+namespace { NullAccessSink g_null_sink = nullptr; bool g_null_tolerant = true; }
+void set_null_access_sink(NullAccessSink sink) noexcept { g_null_sink = sink; }
+void set_null_access_tolerant(bool on) noexcept { g_null_tolerant = on; }
+namespace {
+// True (after telling the sink) when a game-code access to `address` hits the null page and should be ignored.
+bool null_page_access(std::uint32_t address, std::uint32_t canonical_address, bool write) {
+    if (!g_null_tolerant || canonical_address >= 0x00010000u) return false;
+    if (g_null_sink != nullptr) g_null_sink(address, write);
+    return true;
+}
+}
 
 void set_write_watch_range(std::uint32_t address, std::uint32_t size) noexcept {
     WriteWatch &w = write_watch_mut();
@@ -216,6 +227,7 @@ std::uint8_t GuestMemory::aot_load8_slow(std::uint32_t address) const {
         log_read_watch(address, 1u, value);
         return value;
     }
+    if (null_page_access(address, c, false)) return 0u;
     return load8(address);
 }
 
@@ -246,6 +258,7 @@ std::uint16_t GuestMemory::aot_load16_slow(std::uint32_t address) const {
             return value;
         }
     }
+    if (null_page_access(address, c, false)) return 0u;
     return load16(address);
 }
 
@@ -275,6 +288,7 @@ std::uint32_t GuestMemory::aot_load32_slow(std::uint32_t address) const {
         log_read_watch(address, 4u, value);
         return value;
     }
+    if (null_page_access(address, c, false)) return 0u;
     return load32(address);
 }
 
@@ -297,6 +311,7 @@ void GuestMemory::aot_store8_slow(std::uint32_t address, std::uint8_t value) {
         bytes_[static_cast<std::size_t>(c - kPhysicalBase)] = value;
         return;
     }
+    if (null_page_access(address, c, true)) return;
     store8(address, value);
 }
 void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
@@ -311,6 +326,7 @@ void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
         (*data)[offset + 1u] = static_cast<std::uint8_t>((value >> 8u) & 0xFFu);
         return;
     }
+    if (null_page_access(address, c, true)) return;
     store16(address, value);
 }
 void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
@@ -327,6 +343,7 @@ void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
         (*data)[offset + 3u] = static_cast<std::uint8_t>((value >> 24u) & 0xFFu);
         return;
     }
+    if (null_page_access(address, c, true)) return;
     store32(address, value);
 }
 void GuestMemory::aot_store_word_left(std::uint32_t address, std::uint32_t value) {

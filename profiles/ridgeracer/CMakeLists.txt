@@ -114,6 +114,8 @@ add_executable(RidgeRacerNative
     host/rr_updater_client.cpp
     host/rr_gen_loader.cpp
     host/rr_sysinfo.cpp
+    host/rr_savedata.cpp
+    host/rr_texhd.cpp
     ${RR_LAUNCHER_SOURCE}
     ${RR_PRESENT_SOURCE}
     $<$<NOT:$<BOOL:${RR_SPLIT_GAME}>>:${RIDGERACER_GENERATED}>

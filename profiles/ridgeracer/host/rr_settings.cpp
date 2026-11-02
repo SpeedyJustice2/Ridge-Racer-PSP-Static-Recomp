@@ -103,6 +103,7 @@ PlayerSettings load_settings(const fs::path &file) {
         else if (k == "sharpen") s.sharpen = to_int(v, s.sharpen, 0, 3);
         else if (k == "hud_sharpness") s.ui_crisp = to_int(v, s.ui_crisp, 0, 2);
         else if (k == "smooth_cutouts") s.smooth_cutouts = to_bool(v, s.smooth_cutouts);
+        else if (k == "car_textures") s.tex_sharp = 0;   // (not in the options yet: test builds wrote "hd" here; --car-textures still works)
         else if (k == "volume") s.volume = to_int(v, s.volume, 0, 150);
         else if (k == "menu_volume") s.menu_volume = to_int(v, s.menu_volume, 0, 200);
         else if (k == "button_prompts") s.button_prompts = v == "auto" ? 0 : v == "xbox" ? 1 : v == "playstation" ? 2 : v == "nintendo" ? 3 : v == "keyboard" ? 4 : to_int(v, s.button_prompts, 0, 4);
@@ -113,7 +114,11 @@ PlayerSettings load_settings(const fs::path &file) {
         else if (k == "performance_report") s.perf_report = to_bool(v, s.perf_report);
         else if (k == "performance_overlay") s.perf_overlay = to_int(v, s.perf_overlay, 0, 2);
         else if (k == "draw_distance") s.draw_distance = to_int(v, s.draw_distance, 0, 8);
+        else if (k == "draw_distance_experimental") s.draw_distance_ack = to_bool(v, s.draw_distance_ack);
     }
+    // Beta 1.3: a raised draw distance draws some scenery wrong, so it is experimental now: back to Original until the player turns it
+    // on again and accepts the warning.
+    if (!s.draw_distance_ack) s.draw_distance = 0;
     return s;
 }
 
@@ -143,6 +148,7 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
       << "sharpen=" << s.sharpen << "\n"
       << "hud_sharpness=" << s.ui_crisp << "\n"
       << "smooth_cutouts=" << (s.smooth_cutouts ? 1 : 0) << "\n"
+      << "car_textures=" << (s.tex_sharp == 1 ? "sharp" : s.tex_sharp == 2 ? "pixel" : s.tex_sharp == 3 ? "hd" : "smooth") << "\n"
       << "\n[audio]\n"
       << "volume=" << s.volume << "\n"
       << "menu_volume=" << s.menu_volume << "\n"
@@ -163,7 +169,8 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
       << "# frame-rate counter over the game picture: 0 off, 1 frame rate, 2 frame rate and details\n"
       << "performance_overlay=" << s.perf_overlay << "\n"
       << "# draw scenery this many track cells further (0 = the game's own distance; 2-8 = further, costs some speed)\n"
-      << "draw_distance=" << s.draw_distance << "\n";
+      << "draw_distance=" << s.draw_distance << "\n"
+      << "draw_distance_experimental=" << (s.draw_distance_ack ? 1 : 0) << "\n";
     return static_cast<bool>(o);
 }
 
@@ -297,6 +304,7 @@ std::vector<std::string> to_args(const PlayerSettings &s, int monitor_hz) {
         static const float crisp_levels[] = {0.0f, 0.8f, 1.0f};
         a.push_back("--ui-crisp"); a.push_back(fmt_float(crisp_levels[std::clamp(s.ui_crisp, 0, 2)]));
         if (s.smooth_cutouts) a.push_back("--smooth-cutouts");
+        if (s.tex_sharp > 0) { a.push_back("--car-textures"); a.push_back(s.tex_sharp == 3 ? "hd" : s.tex_sharp == 2 ? "pixel" : "sharp"); }
     }
     int fps = s.fps == 0 ? monitor_hz : s.fps;
     if (fps < 62) fps = 60;   // 59.94 / 60 Hz monitors: the game's own rate

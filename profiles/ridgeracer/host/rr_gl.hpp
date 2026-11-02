@@ -58,7 +58,7 @@ public:
     // filtering for 3D textures.  Call once after construction, with the GL context current.
     // The anti-aliasing post mode (none / FXAA / TAA / SSAA filter) lives in g_aa_mode (rr_tuning.hpp); `msaa` is the
     // requested MSAA sample count (0/1 = off), fixed for the run.
-    struct Enhance { bool fxaa{false}; float sharpen{0.0f}; bool mipmaps{true}; int aniso{8}; float ui_crisp{0.8f}; bool smooth_cutouts{false}; int msaa{0}; };
+    struct Enhance { bool fxaa{false}; float sharpen{0.0f}; bool mipmaps{true}; int aniso{8}; float ui_crisp{0.8f}; bool smooth_cutouts{false}; int msaa{0}; int tex_sharp{0}; };
     void set_enhance(const Enhance &e);
     [[nodiscard]] const Enhance &enhance() const { return enhance_; }
 
@@ -128,7 +128,7 @@ private:
         std::vector<std::uint8_t> row_hash_ok;
         [[nodiscard]] std::uint32_t bytes() const { return stride * rows * (format == 3u ? 4u : 2u); }
     };
-    struct CachedTexture { unsigned tex{}; std::uint64_t last_use{}; std::uint32_t bytes{}; };
+    struct CachedTexture { unsigned tex{}; std::uint64_t last_use{}; std::uint32_t bytes{}; bool hd_tried{}; bool hd_ok{}; int hd_gen{}; };
 
     [[nodiscard]] bool gl_target(const GpuDraw &d) const;
     [[nodiscard]] static std::uint32_t rows_for(std::uint32_t addr, std::uint32_t stride, std::uint32_t format);
@@ -181,6 +181,7 @@ private:
     std::unordered_map<std::uint64_t, CachedTexture> textures_;
     std::uint64_t texture_bytes_{};
     std::vector<std::uint32_t> decode_scratch_;
+    std::vector<std::uint32_t> hd_scratch_;   // HD car texture composite (rr_texhd)
     std::vector<GpuVertex> quad_scratch_;
     std::vector<std::uint8_t> readback_scratch_;
     Stats stats_;

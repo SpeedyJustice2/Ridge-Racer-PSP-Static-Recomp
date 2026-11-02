@@ -30,6 +30,9 @@ enum class OptionsRequest {
     OpenIssues,     // open the GitHub bug report page
     OpenDiscord,    // open the community Discord invite
     OpenScreenshots,   // open the screenshots folder
+    ExportSave,     // save a copy of the save file (asks where)
+    ImportSave,     // load a save file (asks which), then restart
+    OpenSaveFolder, // open the savedata folder
 };
 
 // What the updater is doing (shown on the Updates rows).

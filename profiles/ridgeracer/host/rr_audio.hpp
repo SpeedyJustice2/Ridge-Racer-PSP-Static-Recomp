@@ -28,6 +28,7 @@ void audio_channel_set_trim(int channel, bool on);
 void audio_set_time_stretch(bool on);
 void audio_channel_volume(int channel, int vol_left, int vol_right);
 [[nodiscard]] std::uint32_t audio_channel_queued(int channel);
+[[nodiscard]] std::uint32_t audio_channel_soft_limit(int channel);
 void audio_channel_clear(int channel);
 // Counters since the last call (diagnostics): underruns = a primed channel ran dry, drops = frames discarded because a
 // ring was full, pushed/played = sample frames in/out, device_starved = times the sound card had run out of queued buffers (the mixer thread was too late), device_gap_max_ms = longest wait

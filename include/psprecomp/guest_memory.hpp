@@ -16,6 +16,11 @@ namespace psprecomp {
 using WatchSink = void (*)(bool is_write, std::uint32_t address, std::size_t length, std::uint64_t old_value, std::uint64_t new_value);
 void set_watch_sink(WatchSink sink) noexcept;
 void set_write_watch_range(std::uint32_t address, std::uint32_t size) noexcept;   // size 0 = off
+// Game code that reads or writes the unmapped first 64 KiB (a null pointer): like PPSSPP, reads give 0 and writes are
+// dropped instead of stopping the game.  The sink (optional) is told about each such access.
+using NullAccessSink = void (*)(std::uint32_t address, bool write);
+void set_null_access_sink(NullAccessSink sink) noexcept;
+void set_null_access_tolerant(bool on) noexcept;
 
 // Each generated AOT unit is one enormous function, and MSVC stops inlining
 // into a caller that large -- measured: moving the fast paths into this header

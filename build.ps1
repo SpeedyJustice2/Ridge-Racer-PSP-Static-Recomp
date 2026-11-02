@@ -81,7 +81,8 @@ function Quote($a) { if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"
 # Runs the compiler for every item that is out of date, $Jobs at a time.  Item = @{src=..; obj=..; args=@(..)}
 # With -Soft the sources that failed are returned (instead of stopping the build).
 function Invoke-Compiles($items, $label, [switch]$Soft) {
-  $todo = @($items | Where-Object { $Rebuild -or -not (Test-Path -LiteralPath $_.obj) -or ((Get-Item -LiteralPath $_.obj).LastWriteTime -lt (Get-Item -LiteralPath $_.src).LastWriteTime) })
+  # An object is out of date when its source, or (for host and core code) the newest header it may include, is newer.
+  $todo = @($items | Where-Object { $Rebuild -or -not (Test-Path -LiteralPath $_.obj) -or ((Get-Item -LiteralPath $_.obj).LastWriteTime -lt (Get-Item -LiteralPath $_.src).LastWriteTime) -or ($_.dep -and (Get-Item -LiteralPath $_.obj).LastWriteTime -lt $_.dep) })
   Write-Host ("{0}: {1} to compile, {2} up to date" -f $label, $todo.Count, ($items.Count - $todo.Count))
   $running = New-Object System.Collections.ArrayList
   $done = 0; $failed = @()
@@ -113,9 +114,18 @@ function Invoke-Compiles($items, $label, [switch]$Soft) {
   if ($Soft) { return ,$failed }
   if ($failed.Count) { Fail ("{0} file(s) failed to compile." -f $failed.Count) }
 }
-function New-ItemList($files, $objdir, $compileArgs) {
+function New-ItemList($files, $objdir, $compileArgs, $dep = $null) {
   New-Item -ItemType Directory -Force $objdir | Out-Null
-  $files | ForEach-Object { @{ src = $_.FullName; obj = (Join-Path $objdir ($_.BaseName + ".o")); args = $compileArgs } }
+  $files | ForEach-Object { @{ src = $_.FullName; obj = (Join-Path $objdir ($_.BaseName + ".o")); args = $compileArgs; dep = $dep } }
+}
+# Newest header in the given folders (a changed header, e.g. rr_version.hpp, must rebuild the code that includes it).
+function Get-NewestHeader($dirs) {
+  $t = $null
+  foreach ($d in $dirs) {
+    if (-not (Test-Path -LiteralPath $d)) { continue }
+    foreach ($f in (Get-ChildItem -LiteralPath $d -Recurse -File | Where-Object { $_.Extension -in '.h', '.hpp', '.inc' })) { if (-not $t -or $f.LastWriteTime -gt $t) { $t = $f.LastWriteTime } }
+  }
+  return $t
 }
 
 $inc = @("-I", (Join-Path $root "include"))
@@ -126,7 +136,7 @@ $a3p = Join-Path $prof "third_party\atrac3plus"
 $cFlags = @("cc", "-target", "x86_64-windows-gnu", "-std=c11", "-O2", "-g0", "-DNDEBUG", "-mavx", "-fno-strict-aliasing", "-fwrapv", "-ffp-contract=off", "-Wno-everything")
 $libNames = "user32","gdi32","d3d11","dxgi","d3dcompiler_47","opengl32","mfplat","mfuuid","mf","mfreadwrite","ole32","winmm","comctl32","shell32","uuid","comdlg32","advapi32","shlwapi","ws2_32","winhttp"
 $hostNames = "main","rr_hle","rr_log","rr_ge","rr_raster","rr_gl","rr_png","rr_atrac","rr_mpeg","rr_pmf","rr_audio","rr_atrac_decoder",
-             "rr_video_win32","rr_osk_ui","rr_lobby_ui","rr_options_ui","rr_overlay","rr_pad","rr_glyph_patch","rr_report","rr_updater_client","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_launcher_win32","rr_present_win32","rr_gen_loader"
+             "rr_video_win32","rr_osk_ui","rr_lobby_ui","rr_options_ui","rr_overlay","rr_pad","rr_glyph_patch","rr_report","rr_updater_client","rr_menusound","rr_utility","rr_settings","rr_iso","rr_net","rr_http","rr_relay","rr_sysinfo","rr_savedata","rr_texhd","rr_launcher_win32","rr_present_win32","rr_gen_loader"
 $atracNames = "atrac","atrac3plus","atrac3plusdsp","atrac3plusdec","rr_compat"
 
 # The updater (RidgeRacerUpdater.exe): compiled from three source files, a few seconds.  Antivirus heuristics stopped an unsigned
@@ -144,7 +154,7 @@ $hostObjDir = Join-Path $build "obj-host"
 $atracObjDir = Join-Path $build "obj-atrac"
 $genExe = Join-Path $build "psp_recomp.exe"
 $core = Get-ChildItem -LiteralPath (Join-Path $root "src") -Filter *.cpp
-$coreObj = @(New-ItemList $core $coreObjDir ($cxx + $inc))
+$coreObj = @(New-ItemList $core $coreObjDir ($cxx + $inc) (Get-NewestHeader @((Join-Path $root "include"))))
 $toolObj = @(New-ItemList @(Get-Item -LiteralPath (Join-Path $root "tools\codegen_main.cpp")) $toolObjDir ($cxx + $inc + @("-I", (Join-Path $root "tools"))))
 # -I of the generated folder comes last; it does not exist yet (and the host files do not need it) while preparing a release
 $gen = Join-Path $build "generated"
@@ -152,7 +162,7 @@ $gameArgs = $cxx + $inc + @("-I", $hostDir, "-I", $a3p, "-I", $gen)
 $hostFiles = $hostNames | ForEach-Object { Get-Item -LiteralPath (Join-Path $hostDir ($_ + ".cpp")) }
 # The program is built apart from the converted game code (RidgeRacerGame.dll): see profiles\ridgeracer\gen\rr_gen_abi.hpp.
 $hostArgs = $gameArgs + @("-DRR_GAME_LIBRARY=1")
-$hostObj = @(New-ItemList $hostFiles $hostObjDir $hostArgs)
+$hostObj = @(New-ItemList $hostFiles $hostObjDir $hostArgs (Get-NewestHeader @((Join-Path $root "include"), $hostDir, (Join-Path $prof "gen"))))
 $cfiles = $atracNames | ForEach-Object { Get-Item -LiteralPath (Join-Path $a3p ($_ + ".c")) }
 $cArgs = $cFlags + @("-I", (Join-Path $a3p "compat"), "-I", $a3p)
 $atracObj = @(New-ItemList $cfiles $atracObjDir $cArgs)

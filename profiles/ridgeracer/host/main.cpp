@@ -190,6 +190,7 @@ int main(int argc, char **argv) {
         int aniso = 8;
         float ui_crisp = 0.8f;
         bool smooth_cutouts = false;
+        int tex_sharp = 0;
         int draw_cells = 0;
         int frame_skip = 0;   // automatic: pictures are skipped only while the PC cannot keep the game at full speed
         float volume = 1.0f, menu_volume = 1.0f;
@@ -317,6 +318,9 @@ int main(int argc, char **argv) {
                 { const std::string v = argv[++i]; frame_skip = (v == "auto") ? 0 : std::clamp(std::atoi(v.c_str()), 0, 4); }
             } else if (arg == "--smooth-cutouts") {
                 smooth_cutouts = true;
+            } else if (arg == "--car-textures") {
+                if (i + 1 >= argc) throw psprecomp::Error("--car-textures needs smooth, sharp, pixel or hd");
+                { const std::string v = argv[++i]; tex_sharp = v == "hd" ? 3 : v == "pixel" ? 2 : v == "sharp" ? 1 : v == "smooth" ? 0 : std::clamp(std::atoi(v.c_str()), 0, 3); }
             } else if (arg == "--perf-overlay") {
                 if (i + 1 >= argc) throw psprecomp::Error("--perf-overlay needs 0 (off), 1 (frame rate) or 2 (details)");
                 rr::overlay::set_mode(std::atoi(argv[++i]));
@@ -459,6 +463,7 @@ int main(int argc, char **argv) {
         hle_options.aniso = aniso;
         hle_options.ui_crisp = ui_crisp;
         hle_options.smooth_cutouts = smooth_cutouts;
+        hle_options.tex_sharp = tex_sharp;
         hle_options.draw_cells = draw_cells;
         hle_options.frame_skip = frame_skip;
         hle_options.volume = volume;
@@ -529,6 +534,22 @@ int main(int argc, char **argv) {
                 std::string regs;
                 for (int r = 2; r < 26; ++r) regs += " r" + std::to_string(r) + "=" + psprecomp::hex32(cpu.gpr[r]);
                 log("FAULT REGS" + regs);
+                // The guest's main RAM and VRAM at the fault, for research (a few seconds of a crash investigation instead of
+                // replaying a long play session): reports\fault-ram.bin (0x08800000-0x0A000000) and fault-vram.bin.
+                // Local only, never put into bug reports (it holds the game's own code and data).
+                try {
+                    std::error_code ec;
+                    const auto dir = rr::executable_dir() / "reports";
+                    std::filesystem::create_directories(dir, ec);
+                    const auto dump = [&](const char *name, std::uint32_t lo, std::uint32_t hi) {
+                        std::vector<std::uint8_t> buf(hi - lo);
+                        runtime.memory().copy_out(lo, buf);
+                        const auto path = dir / name;
+                        if (FILE *f = std::fopen(path.string().c_str(), "wb")) { std::fwrite(buf.data(), 1, buf.size(), f); std::fclose(f); log("fault memory saved: " + path.string()); }
+                    };
+                    dump("fault-ram.bin", 0x08800000u, 0x0A000000u);
+                    dump("fault-vram.bin", 0x04000000u, 0x04200000u);
+                } catch (const std::exception &) {}
             } catch (const std::exception &) {}
             exit_code = 4;
         }

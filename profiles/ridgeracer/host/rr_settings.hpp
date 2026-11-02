@@ -29,6 +29,7 @@ struct PlayerSettings {
     int sharpen = 0;              // 0 off, 1 mild, 2 medium, 3 strong
     int ui_crisp = 2;             // 0 off (the game's own soft HUD), 1 sharper, 2 crispest
     bool smooth_cutouts = true;   // smooth the edges of trees, fences and other cut-out art
+    int tex_sharp = 0;            // car textures: 0 smooth (the game's own), 1 sharp, 2 pixel (nearest-neighbour look), 3 HD (the showroom textures in races)
     int volume = 100;             // percent (0-150)
     int menu_volume = 100;        // percent (0-200)
     int button_prompts = 0;       // button pictures: 0 automatic (the controller or keyboard used last), 1 Xbox, 2 PlayStation, 3 Nintendo Switch, 4 keyboard
@@ -36,6 +37,7 @@ struct PlayerSettings {
     bool perf_report = true;      // write performance-report.txt next to the game (frame times, CPU/GPU, power) for troubleshooting
     int perf_overlay = 0;         // over the game picture: 0 off, 1 frame rate, 2 frame rate + frame times + renderer details
     int draw_distance = 0;        // scenery drawn this many track cells further ahead and behind (0 = the game's own distance)
+    bool draw_distance_ack = false;   // the player accepted the "experimental" warning (Beta 1.3); before that a raised draw distance is reset to Original
     bool online = true;           // Wireless Battle over the internet (talks to the room list service only when you open a room or a search)
     int room_visibility = 0;      // rooms you host: 0 anyone can join, 1 with a password, 2 only with the room code (set in game)
     std::string room_password;    // the password for room_visibility = 1

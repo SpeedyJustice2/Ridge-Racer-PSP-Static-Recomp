@@ -62,6 +62,7 @@ struct GpuDraw {
     std::uint32_t depth_func{};
     std::uint32_t mask_rgb{}, mask_alpha{};
     std::int32_t scissor_x0{}, scissor_y0{}, scissor_x1{479}, scissor_y1{271};
+    bool lit{};                 // GE lighting on (the cars; the scenery is pre-lit)
     std::uint32_t src_addr{};   // guest address the GE read this draw's vertices from (its index list when indexed): identifies a model piece
 };
 
