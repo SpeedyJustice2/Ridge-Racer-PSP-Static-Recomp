@@ -52,6 +52,7 @@ struct HleOptions {
     float menu_volume{1.0f}; // keyboard / menu click volume
     bool smooth_cutouts{false};   // bilinear filtering for alpha-tested cut-outs such as trees
     int tex_sharp{0};             // car textures magnified: 0 smooth, 1 sharp, 2 pixel
+    int car_lod{0};               // car detail: 0 the game's (opponents simplify with distance), 1 high (opponents keep their detailed model)
     float ui_crisp{0.8f};   // crisp magnification of text and icons (0 = off, 1 = crispest)
     std::filesystem::path shot_dir{"screenshots"};   // where F12 screenshots go
     int shot_mode{0};                                    // F12: 0 = the picture as shown (filters included), 1 = native 480x272, 2 = both, 3 = raw internal-resolution render without filters

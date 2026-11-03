@@ -103,6 +103,7 @@ PlayerSettings load_settings(const fs::path &file) {
         else if (k == "sharpen") s.sharpen = to_int(v, s.sharpen, 0, 3);
         else if (k == "hud_sharpness") s.ui_crisp = to_int(v, s.ui_crisp, 0, 2);
         else if (k == "smooth_cutouts") s.smooth_cutouts = to_bool(v, s.smooth_cutouts);
+        else if (k == "car_detail") s.car_lod = v == "original" ? 0 : v == "high" ? 1 : to_int(v, s.car_lod, 0, 1);
         else if (k == "car_textures") s.tex_sharp = 0;   // (not in the options yet: test builds wrote "hd" here; --car-textures still works)
         else if (k == "volume") s.volume = to_int(v, s.volume, 0, 150);
         else if (k == "menu_volume") s.menu_volume = to_int(v, s.menu_volume, 0, 200);
@@ -118,7 +119,7 @@ PlayerSettings load_settings(const fs::path &file) {
     }
     // Beta 1.3: a raised draw distance draws some scenery wrong, so it is experimental now: back to Original until the player turns it
     // on again and accepts the warning.
-    if (!s.draw_distance_ack) s.draw_distance = 0;
+    s.draw_distance = 0;   // (removed from the options: older ini files may still hold a raised value)
     return s;
 }
 
@@ -148,6 +149,8 @@ bool save_settings(const fs::path &file, const PlayerSettings &s) {
       << "sharpen=" << s.sharpen << "\n"
       << "hud_sharpness=" << s.ui_crisp << "\n"
       << "smooth_cutouts=" << (s.smooth_cutouts ? 1 : 0) << "\n"
+      << "# car_detail: high = opponents keep their detailed model at any distance; original = they simplify with distance like on the PSP\n"
+      << "car_detail=" << (s.car_lod > 0 ? "high" : "original") << "\n"
       << "car_textures=" << (s.tex_sharp == 1 ? "sharp" : s.tex_sharp == 2 ? "pixel" : s.tex_sharp == 3 ? "hd" : "smooth") << "\n"
       << "\n[audio]\n"
       << "volume=" << s.volume << "\n"
@@ -304,6 +307,7 @@ std::vector<std::string> to_args(const PlayerSettings &s, int monitor_hz) {
         static const float crisp_levels[] = {0.0f, 0.8f, 1.0f};
         a.push_back("--ui-crisp"); a.push_back(fmt_float(crisp_levels[std::clamp(s.ui_crisp, 0, 2)]));
         if (s.smooth_cutouts) a.push_back("--smooth-cutouts");
+        if (s.car_lod > 0) { a.push_back("--car-detail"); a.push_back("high"); }
         if (s.tex_sharp > 0) { a.push_back("--car-textures"); a.push_back(s.tex_sharp == 3 ? "hd" : s.tex_sharp == 2 ? "pixel" : "sharp"); }
     }
     int fps = s.fps == 0 ? monitor_hz : s.fps;

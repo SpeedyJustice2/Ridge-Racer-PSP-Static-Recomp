@@ -128,10 +128,11 @@ std::vector<Category> build(const OptionsContext &ctx) {
                           [](const PlayerSettings &s) { return std::clamp(s.sharpen, 0, 3); }, [](PlayerSettings &s, int v) { s.sharpen = v; }, false});
         q.rows.push_back({"HUD and text", "How the game's menus, text and HUD are enlarged.", Kind::Choice, {"Original (soft)", "Sharper", "Crispest"},
                           [](const PlayerSettings &s) { return std::clamp(s.ui_crisp, 0, 2); }, [](PlayerSettings &s, int v) { s.ui_crisp = v; }, false});
-        q.rows.push_back({"Draw distance", "EXPERIMENTAL: draws scenery further down the track, but some scenery may be drawn wrong. Further costs some speed.", Kind::Choice,
-                          {"Original", "Far", "Farther", "Very far", "Farthest"},
-                          [](const PlayerSettings &s) { return std::clamp((s.draw_distance + 1) / 2, 0, 4); },
-                          [](PlayerSettings &s, int v) { s.draw_distance = std::clamp(v, 0, 4) * 2; }, true});
+        // (Draw distance: removed. Merging the neighbouring cells' visibility lists drew scenery made for other viewpoints and did not
+        //  stop the pop-in; --draw-distance on the command line remains for tests.)
+        q.rows.push_back({"Car detail", "High keeps the other cars' detailed model at any distance (no switching from a simple model as they get closer). Original is the PSP's.", Kind::Choice,
+                          {"Original", "High"},
+                          [](const PlayerSettings &s) { return std::clamp(s.car_lod, 0, 1); }, [](PlayerSettings &s, int v) { s.car_lod = v; }, false});
         // (Car textures: Original / Sharp / Pixel / HD - work in progress, hidden for now: --car-textures on the command line)
         q.rows.push_back({"Smooth cut-out edges", "Smooths the edges of trees, fences and other cut-out art.", Kind::Toggle, {},
                           [](const PlayerSettings &s) { return s.smooth_cutouts ? 1 : 0; }, [](PlayerSettings &s, int v) { s.smooth_cutouts = v != 0; }, false});

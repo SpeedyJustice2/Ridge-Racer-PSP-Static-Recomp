@@ -191,6 +191,7 @@ int main(int argc, char **argv) {
         float ui_crisp = 0.8f;
         bool smooth_cutouts = false;
         int tex_sharp = 0;
+        int car_lod = 0;
         int draw_cells = 0;
         int frame_skip = 0;   // automatic: pictures are skipped only while the PC cannot keep the game at full speed
         float volume = 1.0f, menu_volume = 1.0f;
@@ -318,6 +319,9 @@ int main(int argc, char **argv) {
                 { const std::string v = argv[++i]; frame_skip = (v == "auto") ? 0 : std::clamp(std::atoi(v.c_str()), 0, 4); }
             } else if (arg == "--smooth-cutouts") {
                 smooth_cutouts = true;
+            } else if (arg == "--car-detail") {
+                if (i + 1 >= argc) throw psprecomp::Error("--car-detail needs original or high");
+                { const std::string v = argv[++i]; car_lod = v == "high" ? 1 : v == "original" ? 0 : std::clamp(std::atoi(v.c_str()), 0, 1); }
             } else if (arg == "--car-textures") {
                 if (i + 1 >= argc) throw psprecomp::Error("--car-textures needs smooth, sharp, pixel or hd");
                 { const std::string v = argv[++i]; tex_sharp = v == "hd" ? 3 : v == "pixel" ? 2 : v == "sharp" ? 1 : v == "smooth" ? 0 : std::clamp(std::atoi(v.c_str()), 0, 3); }
@@ -464,6 +468,7 @@ int main(int argc, char **argv) {
         hle_options.ui_crisp = ui_crisp;
         hle_options.smooth_cutouts = smooth_cutouts;
         hle_options.tex_sharp = tex_sharp;
+        hle_options.car_lod = car_lod;
         hle_options.draw_cells = draw_cells;
         hle_options.frame_skip = frame_skip;
         hle_options.volume = volume;

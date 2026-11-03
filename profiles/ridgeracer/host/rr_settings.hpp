@@ -29,6 +29,7 @@ struct PlayerSettings {
     int sharpen = 0;              // 0 off, 1 mild, 2 medium, 3 strong
     int ui_crisp = 2;             // 0 off (the game's own soft HUD), 1 sharper, 2 crispest
     bool smooth_cutouts = true;   // smooth the edges of trees, fences and other cut-out art
+    int car_lod = 1;              // car detail: 0 the game's (opponents switch to simpler models with distance), 1 high (opponents keep their detailed model)
     int tex_sharp = 0;            // car textures: 0 smooth (the game's own), 1 sharp, 2 pixel (nearest-neighbour look), 3 HD (the showroom textures in races)
     int volume = 100;             // percent (0-150)
     int menu_volume = 100;        // percent (0-200)

@@ -1241,7 +1241,8 @@ constexpr std::uint32_t kIdRow = 4001011u, kIdHelpA = 104001019u, kIdHelpB = 104
 std::uint32_t table = 0u;                  // the string table object, once seen
 std::map<std::uint32_t, std::uint32_t> patched;   // id -> offset we wrote
 std::map<std::uint32_t, std::string> wanted;      // id -> text
-std::uint64_t row_frame = 0u;              // last presented frame the row's help line was looked up
+std::uint64_t row_frame = 0u;              // last presented frame the row's help line was looked up (on the Options list)
+bool on_options_list = false;              // the help lines looked up lately are the Options list's (see on_lookup)
 bool page_open = false;
 std::uint32_t mask_buttons = 0u;           // buttons kept from the game until released (the press that opened / closed the page)
 PlayerSettings running;
@@ -1310,7 +1311,24 @@ void set_text(std::uint32_t id, const std::string &text) { wanted[id] = text; if
 void on_lookup(Runtime &r, psprecomp::AllegrexContext &ctx) {
     if (!enabled()) return;
     const std::uint32_t t = static_cast<std::uint32_t>(ctx.gpr[4]), id = static_cast<std::uint32_t>(ctx.gpr[5]);
-    if (id == kIdHelpA || id == kIdHelpB) row_frame = g_frames_presented;
+    // Which screen's help line is showing: the Options list's are 104001012..104001020.  Other screens can use the same BACK help
+    // line (Ian: BACK after a finished tour opened the page), and COptionModeJob stays set after leaving Options, so the page only
+    // opens while the help lines seen since the last screen change are the Options list's own.
+    if (id >= 100000000u) {
+        if (id >= 104001012u && id <= 104001018u) on_options_list = true;
+        else if (id != kIdHelpA && id != kIdHelpB) on_options_list = false;
+    }
+    if ((id == kIdHelpA || id == kIdHelpB) && on_options_list) row_frame = g_frames_presented;
+    if (static const bool slog = std::getenv("RR_STR_LOG") != nullptr; slog) {   // (research) string ids looked up, first time per screen visit
+        static std::map<std::uint32_t, std::uint64_t> last;
+        auto &l = last[id];
+        if (g_frames_presented > l + 30u) {
+            auto &m = r.memory();
+            char b[160]; std::snprintf(b, sizeof b, "STRLOOKUP id=%u frame=%llu job=%08X/%08X ra=%08X", id, static_cast<unsigned long long>(g_frames_presented), m.load32(kOptionJob), m.load32(kOptionJob + 8u), static_cast<std::uint32_t>(ctx.gpr[31]));
+            log_line(category::kHle, b);
+        }
+        l = g_frames_presented;
+    }
     if (wanted.count(id) == 0u) return;
     auto &m = r.memory();
     if (t != table) { table = t; patched.clear(); }
@@ -1383,6 +1401,7 @@ void apply_live(const PlayerSettings &s) {
     pad::set_prompts(pad::parse_prompts(prompt_names[std::clamp(s.button_prompts, 0, 4)], pad::Prompts::Auto));
     pad::set_triggers(s.trigger_buttons);
     overlay::set_mode(s.perf_overlay);
+    g_hle_options.car_lod = std::clamp(s.car_lod, 0, 1);   // (car detail: read by the hook on 0x088CF358 every frame)
     if (g_hle_options.window && present_fullscreen() != s.fullscreen) present_set_fullscreen(s.fullscreen);
     if (g_gl) {
         GlBackend::Enhance e = g_gl->enhance();
@@ -2186,6 +2205,16 @@ bool menu_sound_gate() {
     return !off && g_hle_options.fps_mult > 1.0 && fast_rate_active() && (scene_frame == 0u || g_frames_presented - scene_frame > 4u);
 }
 constexpr std::uint32_t kUnlockTeardown = 0x088e9a1cu;   // unlock screen teardown (see hook())
+// Car level of detail.  The car draw loop (0x088CEDxx) picks a model per car each frame: depth d = [car+0x168] / [view+0x1F0]
+// (negative ahead), opponents (draw-list type 1) get model 1 (detailed) nearer than 20000, model 2 to 30000, model 3 (a few boxes)
+// beyond, stored as a byte at car+0xAA6 (0x088CF034), and then calls 0x088CF358(car+0x120, distance colour) and the model draws,
+// which read that byte.  The player's car is model 0.  RCO header +8+4*n holds the models (an opponent's model 0 is empty).
+// Car detail "High" (RR_CAR_LOD=1): on entry of 0x088CF358 a model above 1 is set to 1, so opponents keep their detailed model.
+constexpr std::uint32_t kCarDistColor = 0x088cf358u;
+int car_lod_mode() {
+    static const int env = [] { const char *e = std::getenv("RR_CAR_LOD"); return e ? std::atoi(e) : -1; }();
+    return env >= 0 ? env : g_hle_options.car_lod;   // (the option changes live: Recomp Options > Graphics > Car detail)
+}
 constexpr std::uint32_t kStreamUpdate = 0x088d2aacu;   // course-object streaming update (see hook())
 // Course objects that come and go with the camera's course distance (MapManager items at scene+0x30A0: [+0x10] item pointers,
 // [+0x18] count; item +8 = window start, +0xC = window length in course-distance units, wrapping at the course length): the
@@ -2318,14 +2347,162 @@ void pvs_hook(psprecomp::AllegrexContext &ctx) {
     if (!anywhere && (scene_frame == 0u || g_frames_presented - scene_frame > 4u)) return;
     std::vector<std::vector<std::uint8_t>> vis(static_cast<std::size_t>(groups));
     if (!parse(m.load32(table + static_cast<std::uint32_t>(cell) * 4u), vis)) return;
-    for (std::int32_t c = cell - cells; c <= cell + cells; ++c) {
-        if (c < 0 || c == cell) continue;
+    // Level-of-detail alternates: the course has far and near versions of some scenery (hillsides, buildings) in the same place,
+    // and each cell's list names only one of them.  Merging lists drew both (the "scenery drawn wrong" at a high draw distance:
+    // a slanted strip of mountain behind the bridge, a hillside cut off).  Two objects whose bounding spheres overlap but that no
+    // cell ever lists together are alternates: an object from a neighbouring cell is left out while its alternate is drawn.
+    // RR_PVS_CONFLICT_OFF=1 merges everything (the 1.2 behaviour).
+    static const bool conflict_off_env = std::getenv("RR_PVS_CONFLICT_OFF") != nullptr;
+    static const bool conflict_ab = std::getenv("RR_PVS_AB") != nullptr;   // (tests) filter on even presented frames only, to compare neighbouring frames
+    const bool conflict_off = conflict_off_env || (conflict_ab && (g_frames_presented & 1u) != 0u);
+    struct ConflictInfo { std::vector<std::uint32_t> base; std::vector<std::vector<std::uint32_t>> partners; std::vector<float> radius, cx, cy, cz; bool ok{false}; };
+    static std::unordered_map<std::uint64_t, ConflictInfo> conflict_cache;
+    ConflictInfo *ci = nullptr;
+    if (!conflict_off) {
+        const std::uint64_t key = (static_cast<std::uint64_t>(table) << 32) ^ course;
+        auto it = conflict_cache.find(key);
+        if (it == conflict_cache.end()) {
+            if (conflict_cache.size() > 16u) conflict_cache.clear();
+            ConflictInfo info;
+            // every cell's list (until a string no longer parses)
+            std::vector<std::vector<std::vector<std::uint8_t>>> cellvis;
+            for (std::uint32_t c = 0; c < 4096u; ++c) {
+                std::vector<std::vector<std::uint8_t>> v(static_cast<std::size_t>(groups));
+                if (!parse(m.load32(table + c * 4u), v)) break;
+                cellvis.push_back(std::move(v));
+            }
+            std::vector<std::uint32_t> gsize(static_cast<std::size_t>(groups), 0u);
+            for (const auto &cv : cellvis) for (std::size_t gi = 0; gi < cv.size(); ++gi) gsize[gi] = std::max<std::uint32_t>(gsize[gi], static_cast<std::uint32_t>(cv[gi].size()));
+            info.base.resize(static_cast<std::size_t>(groups) + 1u, 0u);
+            for (std::size_t gi = 0; gi < gsize.size(); ++gi) info.base[gi + 1] = info.base[gi] + gsize[gi];
+            const std::uint32_t n = info.base.back();
+            const std::uint32_t models = m.load32(course + 4u), gtab = m.load32(course + 0x18u);
+            if (n > 0u && n < 20000u && ok(models) && ok(gtab) && !cellvis.empty()) {
+                // bounding spheres: model record = [course+4] + [[course+0x18] + group*8] * 64, spheres [model+0x18] + item*16 (x, y, z, r)
+                std::vector<float> sx(n), sy(n), sz(n), sr(n, -1.0f);
+                for (std::uint32_t gi = 0; gi < static_cast<std::uint32_t>(groups); ++gi) {
+                    const std::uint32_t model = models + m.load32(gtab + gi * 8u) * 64u;
+                    if (!ok(model)) continue;
+                    const std::uint32_t sph = m.load32(model + 0x18u), cnt = m.load32(model + 0x14u);
+                    if (!ok(sph)) continue;
+                    for (std::uint32_t k = 0; k < gsize[gi] && k < cnt; ++k) {
+                        const std::uint32_t a = sph + k * 16u, id = info.base[gi] + k;
+                        sx[id] = std::bit_cast<float>(m.load32(a)); sy[id] = std::bit_cast<float>(m.load32(a + 4u));
+                        sz[id] = std::bit_cast<float>(m.load32(a + 8u)); sr[id] = std::bit_cast<float>(m.load32(a + 12u));
+                        if (!(sr[id] > 0.0f && sr[id] < 1e7f)) sr[id] = -1.0f;
+                    }
+                }
+                // which cells list each object (bit sets)
+                const std::size_t nc = cellvis.size(), words = (nc + 63u) / 64u;
+                std::vector<std::uint64_t> bits(static_cast<std::size_t>(n) * words, 0u);
+                for (std::size_t c = 0; c < nc; ++c)
+                    for (std::size_t gi = 0; gi < cellvis[c].size(); ++gi)
+                        for (std::size_t k = 0; k < cellvis[c][gi].size(); ++k)
+                            if (cellvis[c][gi][k]) bits[(info.base[gi] + k) * words + c / 64u] |= 1ull << (c % 64u);
+                info.partners.assign(n, {});
+                std::size_t pairs = 0;
+                for (std::uint32_t a = 0; a < n; ++a) {
+                    if (sr[a] <= 0.0f) continue;
+                    for (std::uint32_t b = a + 1; b < n; ++b) {
+                        if (sr[b] <= 0.0f) continue;
+                        const float dx = sx[a] - sx[b], dy = sy[a] - sy[b], dz = sz[a] - sz[b];
+                        // the smaller sphere mostly inside the larger one (a near version of part of a far piece, or the same piece twice)
+                        const float rmin = std::min(sr[a], sr[b]), rmax = std::max(sr[a], sr[b]);
+                        const float lim = rmax - 0.5f * rmin;
+                        if (lim <= 0.0f || dx * dx + dy * dy + dz * dz > lim * lim) continue;
+                        bool together = false, a_any = false, b_any = false;
+                        for (std::size_t w = 0; w < words; ++w) {
+                            const std::uint64_t x = bits[a * words + w], y = bits[b * words + w];
+                            together |= (x & y) != 0u; a_any |= x != 0u; b_any |= y != 0u;
+                        }
+                        if (together || !a_any || !b_any) continue;
+                        info.partners[a].push_back(b); info.partners[b].push_back(a); ++pairs;
+                        if (std::getenv("RR_PVS_ALT_LOG") != nullptr) {
+                            const auto grp = [&](std::uint32_t id) { std::uint32_t g = 0; while (g + 1 < info.base.size() && info.base[g + 1] <= id) ++g; return g; };
+                            const auto ncells = [&](std::uint32_t id) { int c = 0; for (std::size_t w = 0; w < words; ++w) c += std::popcount(bits[id * words + w]); return c; };
+                            char lb[240];
+                            std::snprintf(lb, sizeof lb, "DRAWDIST pair g%u/%u r=%.0f cells=%d  <->  g%u/%u r=%.0f cells=%d  dist=%.0f", grp(a), a - info.base[grp(a)], static_cast<double>(sr[a]), ncells(a),
+                                          grp(b), b - info.base[grp(b)], static_cast<double>(sr[b]), ncells(b), static_cast<double>(std::sqrt(dx * dx + dy * dy + dz * dz)));
+                            log_line(category::kHle, lb);
+                        }
+                    }
+                }
+                info.radius = sr; info.cx = sx; info.cy = sy; info.cz = sz;
+                info.ok = true;
+                log_line(category::kHle, "DRAWDIST alternates: table " + hex32(table) + " cells=" + std::to_string(nc) + " objects=" + std::to_string(n) +
+                                             " alternate pairs=" + std::to_string(pairs));
+            }
+            it = conflict_cache.emplace(key, std::move(info)).first;
+        }
+        if (it->second.ok) ci = &it->second;
+    }
+    std::size_t skipped_alt = 0, swapped_far = 0, skipped_far = 0;
+    const std::vector<std::vector<std::uint8_t>> own = vis;   // the current cell's own list
+    for (std::int32_t d = 1; d <= cells; ++d)
+    for (const std::int32_t c : {cell + d, cell - d}) {
+        if (c < 0) continue;
         std::vector<std::vector<std::uint8_t>> extra(static_cast<std::size_t>(groups));
         if (!parse(m.load32(table + static_cast<std::uint32_t>(c) * 4u), extra)) continue;   // past the last cell: not a string
         for (std::size_t gi = 0; gi < extra.size(); ++gi) {
             if (vis[gi].size() < extra[gi].size()) vis[gi].resize(extra[gi].size(), 0u);
             for (std::size_t k = 0; k < extra[gi].size(); ++k) vis[gi][k] |= extra[gi][k];
         }
+    }
+    // Only objects near the camera are borrowed from the other cells' lists: pop-in is nearby scenery (trees, signs, the hills
+    // beside the road) that the current list leaves out.  Distant objects in another cell's list can be backdrops made to be seen
+    // from that spot only (a flat mountain card seen edge-on from here is a slanted strip; a hillside built without a back shows a
+    // cut), so they wait for the game's own list.  RR_PVS_NEAR=units sets the distance (surface of the bounding sphere).
+    if (ci != nullptr && !ci->cx.empty()) {
+        static const float near_lim = [] { const char *e = std::getenv("RR_PVS_NEAR"); return e ? static_cast<float>(std::atof(e)) : 60000.0f; }();
+        const std::uint32_t view = ctx.gpr[6];
+        if (ok(view)) {
+            const float px = std::bit_cast<float>(m.load32(view)), py = std::bit_cast<float>(m.load32(view + 4u)), pz = std::bit_cast<float>(m.load32(view + 8u));
+            static const bool dlog = std::getenv("RR_PVS_DIST_LOG") != nullptr;
+            static int dlogged = 0;
+            for (std::size_t gi = 0; gi < vis.size(); ++gi)
+                for (std::size_t k = 0; k < vis[gi].size(); ++k) {
+                    if (!vis[gi][k] || (k < own[gi].size() && own[gi][k])) continue;
+                    if (gi + 1 >= ci->base.size()) continue;
+                    const std::uint32_t id = ci->base[gi] + static_cast<std::uint32_t>(k);
+                    if (id >= ci->cx.size() || ci->radius[id] <= 0.0f) continue;
+                    const float dx = ci->cx[id] - px, dy = ci->cy[id] - py, dz = ci->cz[id] - pz;
+                    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz) - ci->radius[id];
+                    if (dlog && dlogged < 3000) { ++dlogged; char b[160]; std::snprintf(b, sizeof b, "PVSDIST frame=%llu cell=%d g%zu/%zu r=%.0f surface=%.0f", static_cast<unsigned long long>(g_frames_presented), cell, gi, k, static_cast<double>(ci->radius[id]), static_cast<double>(dist)); log_line(category::kHle, b); }
+                    if (dist > near_lim) { vis[gi][k] = 0u; ++skipped_far; }
+                }
+        }
+    }
+    // Alternates in the merged list: never both.  A far version (the larger sphere of a pair) is replaced by its near versions as
+    // soon as all of them are in the list (the detail arrives early, while far away, instead of popping in at the game's own
+    // switch); until then the near versions that are already in it wait (else they would clip into the far one).
+    if (ci != nullptr) {
+        const auto at = [&](std::uint32_t id, std::size_t &g, std::size_t &k) {
+            g = static_cast<std::size_t>(std::upper_bound(ci->base.begin(), ci->base.end(), id) - ci->base.begin()) - 1u;
+            k = id - ci->base[g];
+            return g < vis.size();
+        };
+        const auto is_on = [&](std::uint32_t id) { std::size_t g, k; return at(id, g, k) && k < vis[g].size() && vis[g][k] != 0u; };
+        const auto set_off = [&](std::uint32_t id) { std::size_t g, k; if (at(id, g, k) && k < vis[g].size()) vis[g][k] = 0u; };
+        std::vector<std::uint32_t> drop_far, drop_near;
+        for (std::uint32_t id = 0; id < static_cast<std::uint32_t>(ci->partners.size()); ++id) {
+            if (ci->partners[id].empty() || !is_on(id)) continue;
+            // the near versions of this object (partners with a smaller sphere)
+            bool any_near = false, all_near = true;
+            for (const std::uint32_t o : ci->partners[id]) {
+                if (ci->radius[o] >= ci->radius[id]) continue;
+                any_near = true;
+                if (!is_on(o)) all_near = false;
+            }
+            if (!any_near) continue;
+            if (all_near) drop_far.push_back(id);
+            else for (const std::uint32_t o : ci->partners[id]) if (ci->radius[o] < ci->radius[id] && is_on(o)) drop_near.push_back(o);
+        }
+        for (const std::uint32_t id : drop_near) { if (is_on(id)) { set_off(id); ++skipped_alt; } }
+        for (const std::uint32_t id : drop_far) { if (is_on(id)) { set_off(id); ++swapped_far; } }
+    }
+    if (std::getenv("RR_PVS_ALT_LOG") != nullptr && (skipped_alt > 0u || swapped_far > 0u || skipped_far > 0u)) {
+        static int n = 0;
+        if (n++ < 400) log_line(category::kHle, "DRAWDIST frame=" + std::to_string(g_frames_presented) + " cell=" + std::to_string(cell) + " near versions waiting=" + std::to_string(skipped_alt) + " far versions replaced=" + std::to_string(swapped_far) + " distant left out=" + std::to_string(skipped_far));
     }
     {   // the builder writes one halfword per object into a fixed buffer (scene + 0x14 .. + 0xFC4, ~2000 entries) without a bound
         // check, so a merged list must stay well below that
@@ -2707,6 +2884,15 @@ bool hook(std::uint32_t address, psprecomp::AllegrexContext &ctx) {
         else if (address == 0x08805570u) std::snprintf(b, sizeof b, "IOREAD fd=%d buf=%08X size=%u frame=%llu", static_cast<int>(ctx.gpr[4]), ctx.gpr[5], ctx.gpr[6], static_cast<unsigned long long>(g_frames_presented));
         else std::snprintf(b, sizeof b, "DECOMP state=%08X in=%08X..%08X out=%08X a1=%08X ra=%08X frame=%llu", ctx.gpr[4], m.load32(ctx.gpr[4] + 4u), m.load32(ctx.gpr[4]), m.load32(ctx.gpr[4] + 12u), ctx.gpr[5], ctx.gpr[31], static_cast<unsigned long long>(g_frames_presented));
         log_line(category::kHle, b);
+    }
+    if (address == kCarDistColor && car_lod_mode() > 0) {
+        auto &m = rt->memory();
+        const std::uint32_t lod_at = static_cast<std::uint32_t>(ctx.gpr[4]) + 0x986u;   // car+0xAA6 (a0 = car+0x120)
+        if (lod_at >= 0x08800000u && lod_at < 0x0a000000u) {
+            const std::uint8_t lod = m.load8(lod_at);
+            if (lod > 1u && lod <= 3u) m.store8(lod_at, 1u);
+        }
+        return false;
     }
     if (address == kUnlockTeardown) {
         // 0x088E9A1C: the unlock screen's teardown (MapManager::Delete of the course scene, then frees).  It must run once; a
@@ -4080,6 +4266,7 @@ void refresh_table() {
     table[(kStreamUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kCourseSceneDraw - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kUnlockTeardown - psprecomp::kFunctionGateBase) >> 2u] = 1u;
+    table[(kCarDistColor - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     if (std::getenv("RR_IO_LOG") != nullptr) for (const std::uint32_t a : {0x088055acu, 0x08805570u, 0x08806edcu}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     table[(kSoundUpdate - psprecomp::kFunctionGateBase) >> 2u] = 1u;
     if (std::getenv("RR_NOCULL") != nullptr) for (const std::uint32_t a : {0x088d08c8u, 0x088d0940u, 0x088d09b8u}) table[(a - psprecomp::kFunctionGateBase) >> 2u] = 1u;
